@@ -247,8 +247,7 @@ def run_cycle():
 def home():
     return "Bot is running! Ping received."
 
+app = Flask(__name__)
+...
 if __name__ == "__main__":
-    notify("🚀 Bot started successfully!")
-    while True:
-        run_bot_cycle()
-        time.sleep(600)   # kila dakika 10
+    app.run(host="0.0.0.0", port=10000)
