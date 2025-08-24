@@ -246,7 +246,7 @@ def run_bot_cycle():
     try:
         notify("🤖 Bot Cycle Started")
         sell_other_assets()
-        buy_cheap_coins()
+        cheap_coins()
         monitor_coins_pro(trailing_percent=3, partial_profit_percent=5, stop_loss=-10)
         if auto_detect_usdt_topup(prev_usdt):
             sell_other_assets()
@@ -266,7 +266,3 @@ def run_cycle():
 @app.route("/")
 def home():
     return "Bot is running! Ping received."
-
-# ======== START FLASK ========
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
