@@ -1,8 +1,9 @@
 import time
 import threading
+import os
+from flask import Flask
 import requests
 import hmac, hashlib, urllib.parse, json, os
-from flask import Flask
 from binance.client import Client
 from binance.enums import *
 
@@ -245,7 +246,7 @@ def run_bot_cycle():
     try:
         notify("🤖 Bot Cycle Started")
         sell_other_assets()
-        cheap_coins()
+        buy_cheap_coins()
         monitor_coins_pro(trailing_percent=3, partial_profit_percent=5, stop_loss=-10)
         if auto_detect_usdt_topup(prev_usdt):
             sell_other_assets()
@@ -267,4 +268,7 @@ def home():
     return "Bot is running! Ping received."
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    notify("🚀 Bot started successfully!")
+    while True:
+        run_bot_cycle()
+        time.sleep(600)   # kila dakika 10
