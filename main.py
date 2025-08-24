@@ -130,51 +130,31 @@ def sell_other_assets():
         notify(f"❌ Sell Process Error: {e}")
         time.sleep(ERROR_DELAY)
 
-def buy_cheap_coins():
-    global daily_trades, CHEAP_COINS
+def fetch_cheap_coins(max_price=0.1):
+    """
+    Fetch cheap coins suitable for micro trading.
+    Includes trending + high-volume, avoids expensive memes.
+    """
+    CHEAP_COINS = []
     try:
-        if not is_market_stable():
-            notify("📉 Market unstable. Skipping buys.")
-            return
-        usdt = get_usdt_balance()
-        if usdt < MIN_TRADE_USD:
-            return
-        trending = fetch_trending_memecoins()
+        trending = fetch_trending_memecoins()  # trending list
         high_volume = [c["symbol"] for c in fetch_high_volume_coins(limit=20, min_buy_ratio=0.6)]
-        CHEAP_COINS = list(set(trending + high_volume))
-        coin_scores = []
-        for symbol in CHEAP_COINS:
+        all_coins = list(set(trending + high_volume))
+        
+        for symbol in all_coins:
             try:
-                change = abs(float(client.get_ticker_24hr(symbol=symbol)['priceChangePercent']))
-                coin_scores.append((symbol, change))
+                price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                if price > max_price:
+                    continue  # skip coins we can't afford
+                if symbol.upper() in ['DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT']:
+                    continue  # skip popular memes
+                CHEAP_COINS.append(symbol)
             except:
                 continue
-        total_score = sum(score for _, score in coin_scores)
-        for symbol, score in coin_scores:
-            if daily_trades >= MAX_DAILY_TRADES:
-                notify("⚠️ Daily trade limit reached.")
-                break
-            try:
-                portion = (score / total_score) * usdt
-                price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-                info = client.get_symbol_info(symbol)
-                step_size = float([f for f in info['filters'] if f['filterType']=='LOT_SIZE'][0]['stepSize'])
-                qty = portion / price
-                qty = qty - (qty % step_size)
-                qty = round(qty, 6)
-                change_percent = float(client.get_ticker_24hr(symbol=symbol)['priceChangePercent'])
-                if change_percent < -10 and qty > 0:
-                    client.order_market_buy(symbol=symbol, quantity=qty)
-                    notify(f"✅ Bought {qty} of {symbol} | Dynamic Allocation")
-                    log_trade(symbol, qty, price, 'buy')
-                    daily_trades += 1
-                    time.sleep(TRADE_DELAY)
-            except Exception as e:
-                notify(f"❌ Buy Error on {symbol}: {e}")
-                time.sleep(ERROR_DELAY)
     except Exception as e:
-        notify(f"❌ Buy Process Error: {e}")
-        time.sleep(ERROR_DELAY)
+        notify(f"❌ Fetch Cheap Coins Error: {e}")
+    
+    return CHEAP_COINS
 
 def monitor_coins_pro(trailing_percent=3, partial_profit_percent=5, stop_loss=-10):
     log = get_trade_log()
