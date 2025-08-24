@@ -1,6 +1,5 @@
 import time
 import threading
-import os
 import requests
 import hmac, hashlib, urllib.parse, json, os
 from flask import Flask
@@ -266,3 +265,6 @@ def run_cycle():
 @app.route("/")
 def home():
     return "Bot is running! Ping received."
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
