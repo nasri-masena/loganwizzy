@@ -3,25 +3,27 @@ import threading
 import os
 from flask import Flask
 import requests
-import hmac, hashlib, urllib.parse, json, os
+import hmac, hashlib, urllib.parse, json
 from binance.client import Client
 from binance.enums import *
 
 # ======== CONFIG ========
-API_KEY = os.getenv("API_KEY")  # Weka API Key yako
-API_SECRET = os.getenv("API_SECRET")    # Weka Secret Key yako
-BOT_TOKEN = os.getenv("BOT_TOKEN") # Telegram bot token
-CHAT_ID = os.getenv("CHAT_ID")       # Telegram chat ID
-TRADE_DELAY = 20   # Delay between trades in seconds
-ERROR_DELAY = 300  # Delay on error
-MIN_TRADE_USD = 0.001
-MAX_DAILY_TRADES = 10
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+TRADE_DELAY = 20
+ERROR_DELAY = 300
+MIN_TRADE_USD = 1
+MAX_DAILY_TRADES = 3
 TRADE_LOG_FILE = "trade_log.json"
 # ======================
 
 client = Client(API_KEY, API_SECRET)
 CHEAP_COINS = []
 daily_trades = 0
+
+# ======== FLASK APP ========
 app = Flask(__name__)
 
 # ======== UTILITY FUNCTIONS ========
@@ -62,6 +64,7 @@ def is_market_stable():
     except:
         return True
 
+# ======== FETCH COINS ========
 def fetch_trending_memecoins():
     try:
         res = requests.get("https://api.coingecko.com/api/v3/search/trending")
@@ -99,6 +102,26 @@ def fetch_high_volume_coins(limit=10, min_buy_ratio=0.6):
         notify(f"❌ High Volume Fetch Error: {e}")
         return []
 
+def fetch_cheap_coins(max_price=0.1):
+    CHEAP_COINS = []
+    try:
+        trending = fetch_trending_memecoins()
+        high_volume = [c["symbol"] for c in fetch_high_volume_coins(limit=20, min_buy_ratio=0.6)]
+        all_coins = list(set(trending + high_volume))
+        for symbol in all_coins:
+            try:
+                price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                if price > max_price:
+                    continue
+                if symbol.upper() in ['DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT']:
+                    continue
+                CHEAP_COINS.append(symbol)
+            except:
+                continue
+    except Exception as e:
+        notify(f"❌ Fetch Cheap Coins Error: {e}")
+    return CHEAP_COINS
+
 # ======== TRADING FUNCTIONS ========
 def sell_other_assets():
     global daily_trades
@@ -131,27 +154,20 @@ def sell_other_assets():
         time.sleep(ERROR_DELAY)
 
 def buy_cheap_coins():
-    """
-    Buy cheap coins suitable for micro trading.
-    Optimized for low balance ($6).
-    """
     global daily_trades, CHEAP_COINS
     try:
         if not is_market_stable():
             notify("📉 Market unstable. Skipping buys.")
             return
-
         usdt = get_usdt_balance()
-        if usdt < 1:  # Skip if balance too low
+        if usdt < 1:
             notify("⚠️ Balance too low for trading.")
             return
-
         CHEAP_COINS = fetch_cheap_coins(max_price=0.1)
         if not CHEAP_COINS:
             notify("⚠️ No cheap coins found for trading.")
             return
 
-        # Score coins based on 24hr % change (volatility)
         coin_scores = []
         for symbol in CHEAP_COINS:
             try:
@@ -159,7 +175,6 @@ def buy_cheap_coins():
                 coin_scores.append((symbol, change))
             except:
                 continue
-
         total_score = sum(score for _, score in coin_scores)
         if total_score == 0:
             notify("⚠️ Total score is 0, skipping buys.")
@@ -169,17 +184,14 @@ def buy_cheap_coins():
             if daily_trades >= MAX_DAILY_TRADES:
                 notify("⚠️ Daily trade limit reached.")
                 break
-
             try:
-                portion = (score / total_score) * usdt * 0.8  # 20% buffer for fees
+                portion = (score / total_score) * usdt * 0.8
                 price = float(client.get_symbol_ticker(symbol=symbol)['price'])
                 info = client.get_symbol_info(symbol)
                 step_size = float([f for f in info['filters'] if f['filterType']=='LOT_SIZE'][0]['stepSize'])
-
                 qty = portion / price
                 qty = qty - (qty % step_size)
                 qty = round(qty, 6)
-
                 change_percent = float(client.get_ticker_24hr(symbol=symbol)['priceChangePercent'])
                 if change_percent < -10 and qty > 0:
                     client.order_market_buy(symbol=symbol, quantity=qty)
@@ -258,7 +270,7 @@ def transfer_profit_to_funding():
     except:
         return False
 
-# ======== SINGLE-CYCLE FUNCTION ========
+# ======== BOT CYCLE ========
 def run_bot_cycle():
     prev_usdt = get_usdt_balance()
     try:
@@ -275,17 +287,16 @@ def run_bot_cycle():
     except Exception as e:
         notify(f"❌ Unexpected Error: {e}")
 
-# ======== FLASK ROUTE ========
+# ======== FLASK ROUTES ========
 @app.route("/run_cycle")
 def run_cycle():
-    threading.Thread(target=run_bot_cycle).start()  # run cycle in background
+    threading.Thread(target=run_bot_cycle).start()
     return "Cycle triggered!"
 
 @app.route("/")
 def home():
     return "Bot is running! Ping received."
 
-app = Flask(__name__)
-...
+# ======== RUN SERVER ========
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
