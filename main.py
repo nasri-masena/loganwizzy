@@ -233,7 +233,7 @@ def check_daily_target_and_pause():
 # =========================
 # ACTIVE TRADES TRACKER
 # =========================
-MAX_ACTIVE_TRADES = 2
+MAX_ACTIVE_TRADES = 1
 active_trades = []
 
 # =========================
@@ -242,78 +242,67 @@ active_trades = []
 def trade_cycle():
     global start_balance_usdt, paused_until, active_trades
 
-    # Set start baseline at launch
     if start_balance_usdt is None:
         start_balance_usdt = get_current_total_balance()
         notify(f"🔰 Start balance recorded: ${start_balance_usdt:.6f}")
 
-    # Check if paused
     now = datetime.now(LOCAL_TZ)
     if paused_until and now < paused_until:
         notify(f"⏸️ Bot paused until {paused_until.isoformat()}, sleeping 60s.")
         time.sleep(60)
         return
 
-    # Reset after pause
     if paused_until and now >= paused_until:
         paused_until = None
         start_balance_usdt = get_current_total_balance()
         notify(f"🔁 New day: baseline reset to ${start_balance_usdt:.6f}")
 
-    # Pick candidates
+    # Usiruhusu zaidi ya trade moja
+    if len(active_trades) > 0:
+        notify("⏳ Trade in progress, skipping new buys.")
+        return
+
+    # Chagua coin moja tu (ile ya juu kwenye list)
     candidates = pick_symbols_multi(top_n=3)
     if not candidates:
         notify("⚠️ No coins meet filters. Sleeping 10s.")
         time.sleep(10)
         return
 
-    for sym_entry in candidates:
-        symbol, price, qvol, chg, score = sym_entry
+    symbol, price, qvol, chg, score = candidates[0]
+    notify(f"🎯 Selected {symbol} (price {price:.6f}, 24h change {chg:.2f}%, qVol≈{qvol:.0f})")
 
-        # --- CHECK ACTIVE TRADES LIMIT ---
+    trade_usd = max(get_current_total_balance() - 1.0, 0)
+    if trade_usd < 1.0:
+        notify("⚠️ Trade USD computed < $1. Skipping.")
+        return
+
+    try:
+        qty, entry_price, f = place_market_buy(symbol, trade_usd)
+        active_trades.append(symbol)
+    except Exception as e:
+        notify(f"❌ Buy failed for {symbol}: {e}")
+        return
+
+    try:
+        closed, exit_price, profit_usd = monitor_and_roll(symbol, qty, entry_price, f)
+    except Exception as e:
+        notify(f"❌ Monitoring/rolling error for {symbol}: {e}")
+        closed, exit_price, profit_usd = False, None, 0.0
+
+    if closed:
+        notify(f"✅ Trade closed: {symbol}, profit ≈ ${profit_usd:.6f}")
+        active_trades.remove(symbol)
+    else:
+        notify(f"⚠️ Trade ended unexpectedly for {symbol}.")
         if symbol in active_trades:
-            notify(f"⚠️ {symbol} already active. Skipping.")
-            continue
-        if len(active_trades) >= MAX_ACTIVE_TRADES:
-            notify(f"⚠️ Max active trades reached ({MAX_ACTIVE_TRADES}). Skipping {symbol}.")
-            continue
-        # ---------------------------------
+            active_trades.remove(symbol)
 
-        notify(f"🎯 Selected {symbol} (price {price:.6f}, 24h change {chg:.2f}%, qVol≈{qvol:.0f})")
+    if check_daily_target_and_pause():
+        return
 
-        trade_usd = compute_trade_amount()
-        if trade_usd < 1.0:
-            notify("⚠️ Trade USD computed < $1. Skipping.")
-            continue
-
-        try:
-            qty, entry_price, f = place_market_buy(symbol, trade_usd)
-            active_trades.append(symbol)  # Add to active trades
-        except Exception as e:
-            notify(f"❌ Buy failed for {symbol}: {e}")
-            continue
-
-        # Initial OCO + rolling
-        try:
-            closed, exit_price, profit_usd = monitor_and_roll(symbol, qty, entry_price, f)
-        except Exception as e:
-            notify(f"❌ Monitoring/rolling error for {symbol}: {e}")
-            closed, exit_price, profit_usd = False, None, 0.0
-
-        if closed:
-            notify(f"✅ Trade closed: {symbol}, profit ≈ ${profit_usd:.6f}")
-            active_trades.remove(symbol)  # Remove from active trades
-        else:
-            notify(f"⚠️ Trade ended unexpectedly for {symbol}.")
-            # Remove anyway if trade failed completely
-            if symbol in active_trades:
-                active_trades.remove(symbol)
-
-        if check_daily_target_and_pause():
-            break
-
-        time.sleep(COOLDOWN_AFTER_EXIT)
-        
+    time.sleep(COOLDOWN_AFTER_EXIT)
+    
 # =========================
 # RUN FOREVER WITH THREADING
 # =========================
