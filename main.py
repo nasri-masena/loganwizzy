@@ -27,7 +27,7 @@ MOVEMENT_MIN_PCT = float(os.getenv("MOVEMENT_MIN_PCT", "3.0"))
 
 INITIAL_TP_PCT = float(os.getenv("INITIAL_TP_PCT", "0.20"))
 INITIAL_SL_PCT = float(os.getenv("INITIAL_SL_PCT", "0.05"))
-STEP_INCREMENT_PCT = float(os.getenv("STEP_INCREMENT_PCT", "0.20"))
+STEP_INCREMENT_PCT = float(os.getenv("STEP_INCREMENT_PCT", "0.03"))
 TRIGGER_PROXIMITY = float(os.getenv("TRIGGER_PROXIMITY", "0.04"))
 
 MIN_QUOTE_VOLUME_USD = float(os.getenv("MIN_QUOTE_VOLUME_USD", "5000000"))
