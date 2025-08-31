@@ -231,10 +231,17 @@ def check_daily_target_and_pause():
     return False
 
 # =========================
-# MAIN CYCLE
+# ACTIVE TRADES TRACKER
+# =========================
+MAX_ACTIVE_TRADES = 2
+active_trades = []
+
+# =========================
+# MAIN CYCLE (update)
 # =========================
 def trade_cycle():
-    global start_balance_usdt, paused_until
+    global start_balance_usdt, paused_until, active_trades
+
     # Set start baseline at launch
     if start_balance_usdt is None:
         start_balance_usdt = get_current_total_balance()
@@ -262,6 +269,16 @@ def trade_cycle():
 
     for sym_entry in candidates:
         symbol, price, qvol, chg, score = sym_entry
+
+        # --- CHECK ACTIVE TRADES LIMIT ---
+        if symbol in active_trades:
+            notify(f"⚠️ {symbol} already active. Skipping.")
+            continue
+        if len(active_trades) >= MAX_ACTIVE_TRADES:
+            notify(f"⚠️ Max active trades reached ({MAX_ACTIVE_TRADES}). Skipping {symbol}.")
+            continue
+        # ---------------------------------
+
         notify(f"🎯 Selected {symbol} (price {price:.6f}, 24h change {chg:.2f}%, qVol≈{qvol:.0f})")
 
         trade_usd = compute_trade_amount()
@@ -271,6 +288,7 @@ def trade_cycle():
 
         try:
             qty, entry_price, f = place_market_buy(symbol, trade_usd)
+            active_trades.append(symbol)  # Add to active trades
         except Exception as e:
             notify(f"❌ Buy failed for {symbol}: {e}")
             continue
@@ -284,14 +302,18 @@ def trade_cycle():
 
         if closed:
             notify(f"✅ Trade closed: {symbol}, profit ≈ ${profit_usd:.6f}")
+            active_trades.remove(symbol)  # Remove from active trades
         else:
             notify(f"⚠️ Trade ended unexpectedly for {symbol}.")
+            # Remove anyway if trade failed completely
+            if symbol in active_trades:
+                active_trades.remove(symbol)
 
         if check_daily_target_and_pause():
             break
 
         time.sleep(COOLDOWN_AFTER_EXIT)
-
+        
 # =========================
 # RUN FOREVER WITH THREADING
 # =========================
