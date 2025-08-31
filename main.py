@@ -46,7 +46,15 @@ paused_until = None
 # =========================
 # UTILITIES
 # =========================
+LAST_NOTIFY = 0
+
 def notify(msg: str):
+    global LAST_NOTIFY
+    now_ts = time.time()
+    if now_ts - LAST_NOTIFY < 15:  # Throttle: send only if 10s passed
+        return
+    LAST_NOTIFY = now_ts
+
     t = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
     text = f"[{t}] {msg}"
     print(text)
@@ -56,7 +64,7 @@ def notify(msg: str):
             requests.post(url, data={"chat_id": CHAT_ID, "text": text})
         except Exception as e:
             print("Telegram notify error:", e)
-
+            
 def get_free_usdt():
     try:
         bal = client.get_asset_balance(asset=QUOTE)
