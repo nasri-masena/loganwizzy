@@ -19,7 +19,6 @@ CHAT_ID = os.getenv("CHAT_ID")
 PRICE_MIN = float(os.getenv("PRICE_MIN", "1.0"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "3.0"))
 QUOTE = os.getenv("QUOTE", "USDT")
-WHITELIST_COINS = os.getenv("WHITELIST_COINS", "XRP,TIA,JTO,NEXO,VIRTUAL,LDO,AERO,MNT,EPIC,FIL").split(",")
 
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
 DAILY_TARGET_PCT = float(os.getenv("DAILY_TARGET_PCT", "0.20"))
@@ -111,29 +110,30 @@ def cancel_all_open_orders(symbol):
 # =========================
 # SYMBOL PICKER
 # =========================
-def get_whitelist_pairs():
-    return [f"{c.strip().upper()}{QUOTE}" for c in WHITELIST_COINS if c.strip()]
-
-def pick_symbols_multi(top_n=3):
-    pairs = get_whitelist_pairs()
+def pick_symbols_multi(top_n=3, price_min=PRICE_MIN, price_max=PRICE_MAX,
+                       min_volume=MIN_QUOTE_VOLUME_USD, movement_min_pct=MOVEMENT_MIN_PCT):
+    tickers = client.get_ticker()  # inatoa 24h tickers zote
     candidates = []
-    tickers = {t['symbol']: t for t in client.get_ticker()}  # 24h tickers
-    for sym in pairs:
-        try:
-            if sym not in tickers:
-                continue
-            t = tickers[sym]
-            price = float(t.get('lastPrice', t.get('price', 0)))
-            qvol = float(t['quoteVolume'])
-            chg = abs(float(t['priceChangePercent']))
-            if PRICE_MIN <= price <= PRICE_MAX and qvol >= MIN_QUOTE_VOLUME_USD and chg >= MOVEMENT_MIN_PCT:
-                score = chg * qvol
-                candidates.append((sym, price, qvol, chg, score))
-        except Exception:
+
+    for t in tickers:
+        sym = t['symbol']
+        if not sym.endswith(QUOTE):  # tuangalie tu USDT pairs
             continue
+        try:
+            price = float(t['lastPrice'])
+            volume = float(t['quoteVolume'])
+            change = abs(float(t['priceChangePercent']))
+
+            if price_min <= price <= price_max and volume >= min_volume and change >= movement_min_pct:
+                score = change * volume
+                candidates.append((sym, price, volume, change, score))
+        except:
+            continue
+
+    # Sort kwa score (highest first)
     candidates.sort(key=lambda x: x[-1], reverse=True)
     return candidates[:top_n]
-
+    
 # =========================
 # TRADING FUNCTIONS
 # =========================
@@ -250,7 +250,7 @@ def trade_cycle():
     # Pick candidates
     candidates = pick_symbols_multi(top_n=3)
     if not candidates:
-        notify("⚠️ No good pairs found in whitelist that meet filters. Sleeping 10s.")
+        notify("⚠️ No coins meet filters. Sleeping 10s.")
         time.sleep(10)
         return
 
