@@ -78,9 +78,10 @@ def next_midnight_local():
     return tomorrow
 
 def compute_trade_amount():
+    usd_amount = 10.0
     free = get_free_usdt()
-    usd_amount = max(free * RISK_PER_TRADE, 1.0)
-    usd_amount = min(usd_amount, free * 0.98)
+    if usd_amount > free:
+        usd_amount = free
     return round(usd_amount, 6)
 
 def round_step(n, step):
