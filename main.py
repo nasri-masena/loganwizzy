@@ -1,302 +1,321 @@
-import time
-import threading
 import os
-from flask import Flask
+import time
+import math
+import threading
 import requests
-import hmac, hashlib, urllib.parse, json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from flask import Flask
 from binance.client import Client
-from binance.enums import *
 
-# ======== CONFIG ========
+# =========================
+# CONFIG
+# =========================
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-TRADE_DELAY = 20
-ERROR_DELAY = 300
-MIN_TRADE_USD = 1
-MAX_DAILY_TRADES = 3
-TRADE_LOG_FILE = "trade_log.json"
-# ======================
 
+PRICE_MIN = float(os.getenv("PRICE_MIN", "1.0"))
+PRICE_MAX = float(os.getenv("PRICE_MAX", "3.0"))
+QUOTE = os.getenv("QUOTE", "USDT")
+WHITELIST_COINS = os.getenv("WHITELIST_COINS", "XRP,TIA,JTO,NEXO,VIRTUAL,LDO,AERO,MNT,EPIC,FIL").split(",")
+
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
+DAILY_TARGET_PCT = float(os.getenv("DAILY_TARGET_PCT", "0.20"))
+MOVEMENT_MIN_PCT = float(os.getenv("MOVEMENT_MIN_PCT", "3.0"))
+
+INITIAL_TP_PCT = float(os.getenv("INITIAL_TP_PCT", "0.20"))
+INITIAL_SL_PCT = float(os.getenv("INITIAL_SL_PCT", "0.05"))
+STEP_INCREMENT_PCT = float(os.getenv("STEP_INCREMENT_PCT", "0.20"))
+TRIGGER_PROXIMITY = float(os.getenv("TRIGGER_PROXIMITY", "0.04"))
+
+MIN_QUOTE_VOLUME_USD = float(os.getenv("MIN_QUOTE_VOLUME_USD", "5000000"))
+
+SLEEP_BETWEEN_CHECKS = int(os.getenv("SLEEP_BETWEEN_CHECKS", "3"))
+COOLDOWN_AFTER_EXIT = int(os.getenv("COOLDOWN_AFTER_EXIT", "5"))
+
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Africa/Dar_es_Salaam"))
+
+# =========================
+# INIT
+# =========================
 client = Client(API_KEY, API_SECRET)
-CHEAP_COINS = []
-daily_trades = 0
+start_balance_usdt = None
+paused_until = None
 
-# ======== FLASK APP ========
-app = Flask(__name__)
-
-# ======== UTILITY FUNCTIONS ========
-def notify(msg):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-    except Exception as e:
-        print("Telegram Error:", e)
-
-def get_trade_log():
-    if os.path.exists(TRADE_LOG_FILE):
-        with open(TRADE_LOG_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_trade_log(log):
-    with open(TRADE_LOG_FILE, 'w') as f:
-        json.dump(log, f, indent=2)
-
-def log_trade(symbol, qty, price, action):
-    log = get_trade_log()
-    if symbol not in log:
-        log[symbol] = {"buy": [], "sell": []}
-    log[symbol][action].append({"qty": qty, "price": price, "timestamp": time.time()})
-    save_trade_log(log)
-
-def get_usdt_balance():
-    try:
-        return float(client.get_asset_balance(asset='USDT')['free'])
-    except:
-        return 0
-
-def is_market_stable():
-    try:
-        btc_change = float(client.get_ticker_24hr(symbol='BTCUSDT')['priceChangePercent'])
-        return btc_change > -3
-    except:
-        return True
-
-# ======== FETCH COINS ========
-def fetch_trending_memecoins():
-    try:
-        res = requests.get("https://api.coingecko.com/api/v3/search/trending")
-        data = res.json()
-        return [coin['item']['symbol'].upper() + 'USDT' for coin in data['coins']]
-    except:
-        return []
-
-def fetch_high_volume_coins(limit=10, min_buy_ratio=0.6):
-    try:
-        tickers = client.get_ticker()
-        high_volume = []
-        for t in tickers[:limit]:
-            symbol = t['symbol']
-            if not symbol.endswith("USDT"):
-                continue
-            try:
-                trades = client.get_recent_trades(symbol=symbol, limit=500)
-                buy_count = sum(1 for tr in trades if not tr['isBuyerMaker'])
-                total = len(trades)
-                if total == 0:
-                    continue
-                buy_ratio = buy_count / total
-                if buy_ratio >= min_buy_ratio:
-                    high_volume.append({
-                        "symbol": symbol,
-                        "buy_ratio": round(buy_ratio*100,2),
-                        "volume": float(t['quoteVolume'])
-                    })
-            except Exception:
-                continue
-        high_volume.sort(key=lambda x: x["volume"], reverse=True)
-        return high_volume
-    except Exception as e:
-        notify(f"❌ High Volume Fetch Error: {e}")
-        return []
-
-def fetch_cheap_coins(max_price=0.1):
-    CHEAP_COINS = []
-    try:
-        trending = fetch_trending_memecoins()
-        high_volume = [c["symbol"] for c in fetch_high_volume_coins(limit=20, min_buy_ratio=0.6)]
-        all_coins = list(set(trending + high_volume))
-        for symbol in all_coins:
-            try:
-                price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-                if price > max_price:
-                    continue
-                if symbol.upper() in ['DOGEUSDT', 'SHIBUSDT', 'PEPEUSDT']:
-                    continue
-                CHEAP_COINS.append(symbol)
-            except:
-                continue
-    except Exception as e:
-        notify(f"❌ Fetch Cheap Coins Error: {e}")
-    return CHEAP_COINS
-
-# ======== TRADING FUNCTIONS ========
-def sell_other_assets():
-    global daily_trades
-    try:
-        account = client.get_account()
-        for balance in account['balances']:
-            asset = balance['asset']
-            free = float(balance['free'])
-            if free > 0 and asset != 'USDT':
-                symbol = asset + 'USDT'
-                try:
-                    price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-                    value = price * free
-                    if value >= MIN_TRADE_USD:
-                        info = client.get_symbol_info(symbol)
-                        step_size = float([f for f in info['filters'] if f['filterType']=='LOT_SIZE'][0]['stepSize'])
-                        qty = free - (free % step_size)
-                        qty = round(qty, 6)
-                        if qty > 0:
-                            client.order_market_sell(symbol=symbol, quantity=qty)
-                            notify(f"✅ Sold {qty} {asset} (~${value:.5f})")
-                            log_trade(symbol, qty, price, 'sell')
-                            daily_trades += 1
-                            time.sleep(TRADE_DELAY)
-                except Exception as e:
-                    notify(f"❌ Sell Error on {symbol}: {e}")
-                    time.sleep(ERROR_DELAY)
-    except Exception as e:
-        notify(f"❌ Sell Process Error: {e}")
-        time.sleep(ERROR_DELAY)
-
-def buy_cheap_coins():
-    global daily_trades, CHEAP_COINS
-    try:
-        if not is_market_stable():
-            notify("📉 Market unstable. Skipping buys.")
-            return
-        usdt = get_usdt_balance()
-        if usdt < 1:
-            notify("⚠️ Balance too low for trading.")
-            return
-        CHEAP_COINS = fetch_cheap_coins(max_price=0.1)
-        if not CHEAP_COINS:
-            notify("⚠️ No cheap coins found for trading.")
-            return
-
-        coin_scores = []
-        for symbol in CHEAP_COINS:
-            try:
-                change = abs(float(client.get_ticker_24hr(symbol=symbol)['priceChangePercent']))
-                coin_scores.append((symbol, change))
-            except:
-                continue
-        total_score = sum(score for _, score in coin_scores)
-        if total_score == 0:
-            notify("⚠️ Total score is 0, skipping buys.")
-            return
-
-        for symbol, score in coin_scores:
-            if daily_trades >= MAX_DAILY_TRADES:
-                notify("⚠️ Daily trade limit reached.")
-                break
-            try:
-                portion = (score / total_score) * usdt * 0.8
-                price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-                info = client.get_symbol_info(symbol)
-                step_size = float([f for f in info['filters'] if f['filterType']=='LOT_SIZE'][0]['stepSize'])
-                qty = portion / price
-                qty = qty - (qty % step_size)
-                qty = round(qty, 6)
-                change_percent = float(client.get_ticker_24hr(symbol=symbol)['priceChangePercent'])
-                if change_percent < -10 and qty > 0:
-                    client.order_market_buy(symbol=symbol, quantity=qty)
-                    notify(f"✅ Bought {qty} of {symbol} | Micro Allocation")
-                    log_trade(symbol, qty, price, 'buy')
-                    daily_trades += 1
-                    time.sleep(TRADE_DELAY)
-            except Exception as e:
-                notify(f"❌ Buy Error on {symbol}: {e}")
-                time.sleep(ERROR_DELAY)
-    except Exception as e:
-        notify(f"❌ Buy Process Error: {e}")
-        time.sleep(ERROR_DELAY)
-
-def monitor_coins_pro(trailing_percent=3, partial_profit_percent=5, stop_loss=-10):
-    log = get_trade_log()
-    for symbol, trades in log.items():
-        if not trades['buy']:
-            continue
-        last_trade = trades['buy'][-1]
-        bought_price = last_trade['price']
-        qty = last_trade['qty']
-        if 'trailing_stop' not in last_trade:
-            last_trade['trailing_stop'] = bought_price * (1 - trailing_percent/100)
+# =========================
+# UTILITIES
+# =========================
+def notify(msg: str):
+    t = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    text = f"[{t}] {msg}"
+    print(text)
+    if BOT_TOKEN and CHAT_ID:
         try:
-            current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-            change_percent = (current_price - bought_price)/bought_price*100
-            if change_percent >= partial_profit_percent and last_trade.get('partial_sold') is None:
-                sell_qty = round(qty * 0.5, 6)
-                if sell_qty > 0:
-                    client.order_market_sell(symbol=symbol, quantity=sell_qty)
-                    notify(f"✅ Partial sold {sell_qty} {symbol} at +{change_percent:.2f}%")
-                    log_trade(symbol, sell_qty, current_price, 'sell')
-                    last_trade['partial_sold'] = True
-            if current_price > last_trade['trailing_stop']*(1+trailing_percent/100):
-                last_trade['trailing_stop'] = current_price*(1-trailing_percent/100)
-            if current_price <= last_trade['trailing_stop']:
-                client.order_market_sell(symbol=symbol, quantity=qty)
-                notify(f"⚠️ Trailing stop sold {symbol} at {current_price}")
-                log_trade(symbol, qty, current_price, 'sell')
-            elif change_percent <= stop_loss:
-                client.order_market_sell(symbol=symbol, quantity=qty)
-                notify(f"❌ Stop-loss sold {symbol} at {current_price} ({change_percent:.2f}%)")
-                log_trade(symbol, qty, current_price, 'sell')
-            save_trade_log(log)
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": CHAT_ID, "text": text})
         except Exception as e:
-            notify(f"❌ Pro Monitor Error on {symbol}: {e}")
+            print("Telegram notify error:", e)
 
-def auto_detect_usdt_topup(prev_usdt):
-    current = get_usdt_balance()
-    if current > prev_usdt + 0.5:
-        notify(f"💰 New Capital Detected: +${current - prev_usdt:.2f}")
+def get_free_usdt():
+    try:
+        bal = client.get_asset_balance(asset=QUOTE)
+        return float(bal['free'])
+    except Exception:
+        return 0.0
+
+def get_free_asset(asset):
+    try:
+        bal = client.get_asset_balance(asset=asset)
+        return float(bal['free'])
+    except Exception:
+        return 0.0
+
+def next_midnight_local():
+    now = datetime.now(LOCAL_TZ)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return tomorrow
+
+def compute_trade_amount():
+    free = get_free_usdt()
+    usd_amount = max(free * RISK_PER_TRADE, 1.0)
+    usd_amount = min(usd_amount, free * 0.98)
+    return round(usd_amount, 6)
+
+def round_step(n, step):
+    return math.floor(n / step) * step if step else n
+
+def round_price(p, tick):
+    return math.floor(p / tick) * tick if tick else p
+
+def get_filters(symbol_info):
+    fs = {f['filterType']: f for f in symbol_info['filters']}
+    lot = fs['LOT_SIZE']
+    pricef = fs['PRICE_FILTER']
+    min_notional = fs.get('MIN_NOTIONAL', {}).get('minNotional', None)
+    return {
+        'stepSize': float(lot['stepSize']),
+        'minQty': float(lot['minQty']),
+        'tickSize': float(pricef['tickSize']),
+        'minNotional': float(min_notional) if min_notional else None
+    }
+
+def cancel_all_open_orders(symbol):
+    try:
+        client.cancel_open_orders(symbol=symbol)
+    except Exception as e:
+        notify(f"Cancel open orders error on {symbol}: {e}")
+
+# =========================
+# SYMBOL PICKER
+# =========================
+def get_whitelist_pairs():
+    return [f"{c.strip().upper()}{QUOTE}" for c in WHITELIST_COINS if c.strip()]
+
+def pick_symbols_multi(top_n=3):
+    pairs = get_whitelist_pairs()
+    candidates = []
+    tickers = {t['symbol']: t for t in client.get_ticker()}  # 24h tickers
+    for sym in pairs:
+        try:
+            if sym not in tickers:
+                continue
+            t = tickers[sym]
+            price = float(t.get('lastPrice', t.get('price', 0)))
+            qvol = float(t['quoteVolume'])
+            chg = abs(float(t['priceChangePercent']))
+            if PRICE_MIN <= price <= PRICE_MAX and qvol >= MIN_QUOTE_VOLUME_USD and chg >= MOVEMENT_MIN_PCT:
+                score = chg * qvol
+                candidates.append((sym, price, qvol, chg, score))
+        except Exception:
+            continue
+    candidates.sort(key=lambda x: x[-1], reverse=True)
+    return candidates[:top_n]
+
+# =========================
+# TRADING FUNCTIONS
+# =========================
+def place_market_buy(symbol, usd_amount):
+    info = client.get_symbol_info(symbol)
+    f = get_filters(info)
+    price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+    qty = usd_amount / price
+    qty = max(qty, f['minQty'])
+    qty = round_step(qty, f['stepSize'])
+    qty = float(f"{qty:.8f}")
+    if qty <= 0:
+        raise RuntimeError("Computed quantity <= 0")
+    if f['minNotional']:
+        notional = qty * price
+        if notional < f['minNotional']:
+            needed_qty = round_step(f['minNotional'] / price, f['stepSize'])
+            if needed_qty > qty:
+                qty = needed_qty
+    order = client.order_market_buy(symbol=symbol, quantity=qty)
+    notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
+    return qty, price, f
+
+def place_oco_sell(symbol, qty, sl_price, tp_price, f):
+    sl_price = round_price(sl_price, f['tickSize'])
+    tp_price = round_price(tp_price, f['tickSize'])
+    stop_limit_price = sl_price
+    oco = client.create_oco_order(
+        symbol=symbol,
+        side='SELL',
+        quantity=round_step(qty, f['stepSize']),
+        price=str(tp_price),
+        stopPrice=str(sl_price),
+        stopLimitPrice=str(stop_limit_price),
+        stopLimitTimeInForce='GTC'
+    )
+    notify(f"📌 OCO set for {symbol} SL={sl_price:.8f}, TP={tp_price:.8f}")
+    return {'tp': tp_price, 'sl': sl_price, 'orderListId': oco.get('orderListId') if isinstance(oco, dict) else None}
+
+def monitor_and_roll(symbol, qty, entry_price, f):
+    tp = entry_price * (1 + INITIAL_TP_PCT)
+    sl = entry_price * (1 - INITIAL_SL_PCT)
+    state = place_oco_sell(symbol, qty, sl, tp, f)
+    last_tp = None
+    active = True
+
+    while active:
+        time.sleep(SLEEP_BETWEEN_CHECKS)
+        asset = symbol[:-len(QUOTE)]
+        free_qty = get_free_asset(asset)
+        open_orders = client.get_open_orders(symbol=symbol)
+
+        if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
+            exit_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+            profit_usd = (exit_price - entry_price) * qty
+            notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
+            return True, exit_price, profit_usd
+
+        price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
+        near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
+
+        if near_trigger:
+            cancel_all_open_orders(symbol)
+            if last_tp is None:
+                new_sl = entry_price
+            else:
+                new_sl = last_tp
+            new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
+            last_tp = state['tp']
+            state = place_oco_sell(symbol, qty=free_qty, sl_price=new_sl, tp_price=new_tp, f=f)
+            notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (px≈{price_now:.8f})")
+
+# =========================
+# DAILY TARGET
+# =========================
+def get_current_total_balance():
+    return get_free_usdt()
+
+def check_daily_target_and_pause():
+    global paused_until, start_balance_usdt
+    if start_balance_usdt is None:
+        return False
+    current = get_current_total_balance()
+    profit_pct = (current - start_balance_usdt) / start_balance_usdt
+    if profit_pct >= DAILY_TARGET_PCT:
+        paused_until = next_midnight_local()
+        notify(f"🚀 Daily Target Achieved: {profit_pct*100:.2f}%. Pausing until {paused_until.isoformat()}")
         return True
     return False
 
-def transfer_profit_to_funding():
-    try:
-        usdt = get_usdt_balance()
-        if usdt > 5:
-            url = "https://api.binance.com/sapi/v1/asset/transfer"
-            headers = {'X-MBX-APIKEY': API_KEY}
-            params = {
-                'type': 2,
-                'asset': 'USDT',
-                'amount': usdt,
-                'timestamp': int(time.time()*1000)
-            }
-            query_string = urllib.parse.urlencode(params)
-            signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
-            full_url = f"{url}?{query_string}&signature={signature}"
-            res = requests.post(full_url, headers=headers)
-            if res.status_code == 200:
-                notify(f"✅ Transferred ${usdt} USDT profit to Funding wallet")
-                return True
-        return False
-    except:
-        return False
+# =========================
+# MAIN CYCLE
+# =========================
+def trade_cycle():
+    global start_balance_usdt, paused_until
+    # Set start baseline at launch
+    if start_balance_usdt is None:
+        start_balance_usdt = get_current_total_balance()
+        notify(f"🔰 Start balance recorded: ${start_balance_usdt:.6f}")
 
-# ======== BOT CYCLE ========
-def run_bot_cycle():
-    prev_usdt = get_usdt_balance()
-    try:
-        notify("🤖 Bot Cycle Started")
-        sell_other_assets()
-        buy_cheap_coins()
-        monitor_coins_pro(trailing_percent=3, partial_profit_percent=5, stop_loss=-10)
-        if auto_detect_usdt_topup(prev_usdt):
-            sell_other_assets()
-            buy_cheap_coins()
-            monitor_coins_pro(trailing_percent=3, partial_profit_percent=5, stop_loss=-10)
-        transfer_profit_to_funding()
-        notify("✅ Cycle Completed")
-    except Exception as e:
-        notify(f"❌ Unexpected Error: {e}")
+    # Check if paused
+    now = datetime.now(LOCAL_TZ)
+    if paused_until and now < paused_until:
+        notify(f"⏸️ Bot paused until {paused_until.isoformat()}, sleeping 60s.")
+        time.sleep(60)
+        return
 
-# ======== FLASK ROUTES ========
-@app.route("/run_cycle")
-def run_cycle():
-    threading.Thread(target=run_bot_cycle).start()
-    return "Cycle triggered!"
+    # Reset after pause
+    if paused_until and now >= paused_until:
+        paused_until = None
+        start_balance_usdt = get_current_total_balance()
+        notify(f"🔁 New day: baseline reset to ${start_balance_usdt:.6f}")
+
+    # Pick candidates
+    candidates = pick_symbols_multi(top_n=3)
+    if not candidates:
+        notify("⚠️ No good pairs found in whitelist that meet filters. Sleeping 10s.")
+        time.sleep(10)
+        return
+
+    for sym_entry in candidates:
+        symbol, price, qvol, chg, score = sym_entry
+        notify(f"🎯 Selected {symbol} (price {price:.6f}, 24h change {chg:.2f}%, qVol≈{qvol:.0f})")
+
+        trade_usd = compute_trade_amount()
+        if trade_usd < 1.0:
+            notify("⚠️ Trade USD computed < $1. Skipping.")
+            continue
+
+        try:
+            qty, entry_price, f = place_market_buy(symbol, trade_usd)
+        except Exception as e:
+            notify(f"❌ Buy failed for {symbol}: {e}")
+            continue
+
+        # Initial OCO + rolling
+        try:
+            closed, exit_price, profit_usd = monitor_and_roll(symbol, qty, entry_price, f)
+        except Exception as e:
+            notify(f"❌ Monitoring/rolling error for {symbol}: {e}")
+            closed, exit_price, profit_usd = False, None, 0.0
+
+        if closed:
+            notify(f"✅ Trade closed: {symbol}, profit ≈ ${profit_usd:.6f}")
+        else:
+            notify(f"⚠️ Trade ended unexpectedly for {symbol}.")
+
+        if check_daily_target_and_pause():
+            break
+
+        time.sleep(COOLDOWN_AFTER_EXIT)
+
+# =========================
+# RUN FOREVER WITH THREADING
+# =========================
+def run_forever():
+    notify("🤖 Scalper OCO bot started.")
+    while True:
+        try:
+            trade_cycle()
+        except Exception as e:
+            notify(f"❌ Cycle error: {e}")
+            time.sleep(5)
+
+# =========================
+# FLASK KEEPALIVE FOR RENDER
+# =========================
+app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running! Ping received."
+    return "Bot is running! ✅"
 
-# ======== RUN SERVER ========
+def start_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
+# =========================
+# START BOTH THREADS
+# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    # Run bot in a separate thread
+    bot_thread = threading.Thread(target=run_forever, daemon=True)
+    bot_thread.start()
+    
+    # Run Flask server (main thread)
+    start_flask()
