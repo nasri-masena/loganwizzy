@@ -77,11 +77,9 @@ def next_midnight_local():
     return tomorrow
 
 def compute_trade_amount():
-    usd_amount = 10.0
     free = get_free_usdt()
-    if usd_amount > free:
-        usd_amount = free
-    return round(usd_amount, 6)
+    usd_amount = min(10.0, free)
+    return max(usd_amount, 1.0)
 
 def round_step(n, step):
     return math.floor(n / step) * step if step else n
@@ -160,7 +158,7 @@ def place_market_buy(symbol, usd_amount):
 def place_oco_sell(symbol, qty, sl_price, tp_price, f):
     sl_price = round_price(sl_price, f['tickSize'])
     tp_price = round_price(tp_price, f['tickSize'])
-    stop_limit_price = sl_price
+    stop_limit_price = round_price(sl_price * 0.999, f['tickSize'])  # adjust slightly below stopPrice
     oco = client.create_oco_order(
         symbol=symbol,
         side='SELL',
@@ -172,7 +170,7 @@ def place_oco_sell(symbol, qty, sl_price, tp_price, f):
     )
     notify(f"📌 OCO set for {symbol} SL={sl_price:.8f}, TP={tp_price:.8f}")
     return {'tp': tp_price, 'sl': sl_price, 'orderListId': oco.get('orderListId') if isinstance(oco, dict) else None}
-
+    
 def monitor_and_roll(symbol, qty, entry_price, f):
     tp = entry_price * (1 + INITIAL_TP_PCT)
     sl = entry_price * (1 - INITIAL_SL_PCT)
