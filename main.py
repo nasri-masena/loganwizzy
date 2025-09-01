@@ -51,10 +51,9 @@ LAST_NOTIFY = 0
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
-    if now_ts - LAST_NOTIFY < 15:  # Throttle: send only if 10s passed
+    if now_ts - LAST_NOTIFY < 15:
         return
     LAST_NOTIFY = now_ts
-
     t = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
     text = f"[{t}] {msg}"
     print(text)
@@ -64,7 +63,7 @@ def notify(msg: str):
             requests.post(url, data={"chat_id": CHAT_ID, "text": text})
         except Exception as e:
             print("Telegram notify error:", e)
-            
+
 def get_free_usdt():
     try:
         bal = client.get_asset_balance(asset=QUOTE)
@@ -84,11 +83,6 @@ def next_midnight_local():
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return tomorrow
 
-def compute_trade_amount():
-    free = get_free_usdt()
-    usd_amount = min(10.0, free)
-    return max(usd_amount, 1.0)
-
 def round_step(n, step):
     return math.floor(n / step) * step if step else n
 
@@ -106,13 +100,13 @@ def get_filters(symbol_info):
         'tickSize': float(pricef['tickSize']),
         'minNotional': float(min_notional) if min_notional else None
     }
-# ===== REST load-shedding / caching =====
+
+# ===== REST caching =====
 TICKER_CACHE = None
 LAST_TICKER_FETCH = 0.0
-TICKER_TTL = 60.0  # sekunde; update mara 1 kwa dakika
+TICKER_TTL = 60.0
 
 def get_tickers_cached():
-    """Rudisha 24h tickers kwa cache ili kupunguza weight."""
     global TICKER_CACHE, LAST_TICKER_FETCH
     now = time.time()
     if TICKER_CACHE is None or (now - LAST_TICKER_FETCH) > TICKER_TTL:
@@ -136,88 +130,56 @@ def pick_symbols_multi(top_n=1, price_min=PRICE_MIN, price_max=PRICE_MAX,
 
     for t in tickers:
         sym = t['symbol']
-        if not sym.endswith(QUOTE):  # tuangalie tu USDT pairs
+        if not sym.endswith(QUOTE):
             continue
         try:
             price = float(t['lastPrice'])
             volume = float(t['quoteVolume'])
             change = abs(float(t['priceChangePercent']))
-
             if price_min <= price <= price_max and volume >= min_volume and change >= movement_min_pct:
                 score = change * volume
                 candidates.append((sym, price, volume, change, score))
         except:
             continue
 
-    # Sort kwa score (highest first)
     candidates.sort(key=lambda x: x[-1], reverse=True)
     return candidates[:top_n]
-    
+
 # =========================
 # TRADING FUNCTIONS
 # =========================
-def place_market_buy(symbol, usd_amount):
+def place_safe_market_buy(symbol, usd_amount):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
     price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-
     qty = usd_amount / price
     qty = max(qty, f['minQty'])
     qty = round_step(qty, f['stepSize'])
     qty = float(f"{qty:.8f}")
-    if qty <= 0:
-        raise RuntimeError("Computed quantity <= 0")
-
-    # Lazima tufikie MIN_NOTIONAL kama ipo
     if f['minNotional']:
         notional = qty * price
         if notional < f['minNotional']:
             needed_qty = round_step(f['minNotional'] / price, f['stepSize'])
-            # Hakikisha tuna salio la kuweza kufikia minNotional
             free_usdt = get_free_usdt()
             if needed_qty * price > free_usdt + 1e-8:
-                raise RuntimeError(
-                    f"Not enough funds to meet MIN_NOTIONAL (${f['minNotional']:.2f}). "
-                    f"Free=${free_usdt:.2f}, need≈${needed_qty*price:.2f}"
-                )
+                raise RuntimeError(f"Not enough funds to meet MIN_NOTIONAL (${f['minNotional']:.2f})")
             qty = needed_qty
-
     order = client.order_market_buy(symbol=symbol, quantity=qty)
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
     return qty, price, f
 
-def place_oco_order(symbol, qty, entry_price, f):
-    """
-    Place an OCO (Stop Loss + Take Profit) order safely.
-    Adjusts qty and prices according to Binance filters.
-    """
-    # Compute initial TP & SL
-    tp_price = entry_price * (1 + INITIAL_TP_PCT)
-    sl_price = entry_price * (1 - INITIAL_SL_PCT)
-
-    # Adjust to tick size
-    tp_price = round_price(tp_price, f['tickSize'])
-    sl_price = round_price(sl_price, f['tickSize'])
-
-    # Slightly reduce stop limit price under SL
+def place_safe_oco(symbol, intended_qty, entry_price, f):
+    free_qty = get_free_asset(symbol[:-len(QUOTE)])
+    qty = min(intended_qty, free_qty)
+    qty = max(round_step(qty, f['stepSize']), f['minQty'])
+    tp_price = round_price(entry_price * (1 + INITIAL_TP_PCT), f['tickSize'])
+    sl_price = round_price(entry_price * (1 - INITIAL_SL_PCT), f['tickSize'])
     stop_limit_price = round_price(sl_price * 0.999, f['tickSize'])
-
-    # Adjust qty to stepSize and minQty
-    qty = round_step(qty, f['stepSize'])
-    qty = max(qty, f['minQty'])
-
-    # Check minNotional
-    notional = qty * entry_price
-    if f['minNotional'] and notional < f['minNotional']:
-        needed_qty = round_step(f['minNotional'] / entry_price, f['stepSize'])
-        free_usdt = get_free_usdt()
-        if needed_qty * entry_price > free_usdt + 1e-8:
-            raise RuntimeError(
-                f"Not enough funds to meet MIN_NOTIONAL (${f['minNotional']:.2f}). "
-                f"Free=${free_usdt:.2f}, need≈${needed_qty*entry_price:.2f}"
-            )
-        qty = needed_qty
-
+    if f['minNotional']:
+        notional = qty * tp_price
+        if notional < f['minNotional']:
+            needed_qty = round_step(f['minNotional'] / tp_price, f['stepSize'])
+            qty = min(needed_qty, free_qty)
     try:
         oco = client.create_oco_order(
             symbol=symbol,
@@ -228,42 +190,12 @@ def place_oco_order(symbol, qty, entry_price, f):
             stopLimitPrice=str(stop_limit_price),
             stopLimitTimeInForce='GTC'
         )
-        notify(f"📌 OCO set for {symbol}: SL={sl_price:.8f}, TP={tp_price:.8f}, qty={qty}")
-        return {'tp': tp_price, 'sl': sl_price, 'orderListId': oco.get('orderListId') if isinstance(oco, dict) else None}
+        notify(f"📌 OCO set for {symbol}: SL={sl_price}, TP={tp_price}, qty={qty}")
+        return {'tp': tp_price, 'sl': sl_price, 'orderListId': oco.get('orderListId')}
     except Exception as e:
         notify(f"❌ Failed to place OCO for {symbol}: {e}")
-        raise
+        return None
 
-def monitor_and_roll(symbol, qty, entry_price, f):
-    # Set initial OCO
-    state = place_oco_order(symbol, qty, entry_price, f)
-    last_tp = None
-    active = True
-
-    while active:
-        time.sleep(SLEEP_BETWEEN_CHECKS)
-        asset = symbol[:-len(QUOTE)]
-        free_qty = get_free_asset(asset)
-        open_orders = client.get_open_orders(symbol=symbol)
-        price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
-
-        # Check kama position imefungwa
-        if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
-            exit_price = price_now
-            profit_usd = (exit_price - entry_price) * qty
-            notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
-            return True, exit_price, profit_usd
-
-        # Roll TP/SL kama price iko karibu na TP
-        near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
-        if near_trigger:
-            cancel_all_open_orders(symbol)
-            new_sl = entry_price if last_tp is None else last_tp
-            new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
-            last_tp = state['tp']
-            state = place_oco_order(symbol, free_qty, new_tp, f)
-            notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (price≈{price_now:.8f})")
-            
 # =========================
 # DAILY TARGET
 # =========================
@@ -287,12 +219,11 @@ def check_daily_target_and_pause():
 # =========================
 MAX_ACTIVE_TRADES = 1
 active_trades = []
-
-# =========================
-# MAIN CYCLE (update)
-# =========================
 LOCKED_SYMBOL = None
 
+# =========================
+# TRADE CYCLE
+# =========================
 def trade_cycle():
     global start_balance_usdt, paused_until, active_trades, LOCKED_SYMBOL
 
@@ -305,18 +236,15 @@ def trade_cycle():
         notify(f"⏸️ Bot paused until {paused_until.isoformat()}, sleeping 60s.")
         time.sleep(60)
         return
-
     if paused_until and now >= paused_until:
         paused_until = None
         start_balance_usdt = get_current_total_balance()
         notify(f"🔁 New day: baseline reset to ${start_balance_usdt:.6f}")
 
-    # Usiruhusu zaidi ya trade moja
     if len(active_trades) > 0:
         notify("⏳ Trade in progress, skipping new buys.")
         return
 
-    # Chagua coin moja tu (ile ya juu kwenye list) na lock
     if LOCKED_SYMBOL is None:
         candidates = pick_symbols_multi(top_n=1)
         if not candidates:
@@ -329,37 +257,30 @@ def trade_cycle():
         symbol = LOCKED_SYMBOL
 
     notify(f"🎯 Selected {symbol}")
-
-    # Trade amount: ignore low balance warning
     trade_usd = max(min(19.0, get_current_total_balance()), 0.01)
 
-    # === Step 1: Market Buy ===
     try:
-        qty, entry_price, f = place_market_buy(symbol, trade_usd)
-        active_trades.append({
-            'symbol': symbol,
-            'qty': qty,
-            'entry_price': entry_price,
-            'filters': f
-        })
+        qty, entry_price, f = place_safe_market_buy(symbol, trade_usd)
+        active_trades.append({'symbol': symbol, 'qty': qty, 'entry_price': entry_price, 'filters': f})
         notify(f"✅ Buy success: {symbol}, qty={qty}, entry={entry_price:.8f}")
-        time.sleep(2)  # 🕒 delay kidogo kabla ya OCO
+        time.sleep(2)
     except Exception as e:
         notify(f"❌ Buy failed for {symbol}: {e}")
-        LOCKED_SYMBOL = None  # unlock coin ili next cycle ijaribu nyingine
+        LOCKED_SYMBOL = None
         return
 
-    # === Step 2: Place OCO ===
     try:
-        state = place_oco_order(symbol, qty, entry_price, f)
-        notify(f"✅ OCO order placed for {symbol}")
+        state = place_safe_oco(symbol, qty, entry_price, f)
+        if not state:
+            active_trades = [t for t in active_trades if t['symbol'] != symbol]
+            LOCKED_SYMBOL = None
+            return
     except Exception as e:
         notify(f"❌ OCO failed for {symbol}: {e}")
         active_trades = [t for t in active_trades if t['symbol'] != symbol]
         LOCKED_SYMBOL = None
         return
 
-    # === Step 3: Monitoring & Rolling ===
     last_tp = None
     active = True
     while active:
@@ -368,63 +289,58 @@ def trade_cycle():
         free_qty = get_free_asset(asset)
         open_orders = client.get_open_orders(symbol=symbol)
         price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
-
-        # Check kama position imefungwa
         if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
             exit_price = price_now
             profit_usd = (exit_price - entry_price) * qty
             notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
             active = False
             break
-
-        # Roll TP/SL kama price iko karibu na TP
         near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
         if near_trigger:
             cancel_all_open_orders(symbol)
             new_sl = entry_price if last_tp is None else last_tp
             new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
             last_tp = state['tp']
-            state = place_oco_order(symbol, free_qty, new_tp, f)
-            notify(
-                f"🔁 Rolled OCO for {symbol}: "
-                f"new SL={state['sl']:.8f}, new TP={state['tp']:.8f} "
-                f"(price≈{price_now:.8f})"
-            )
+            state = place_safe_oco(symbol, free_qty, new_tp, f)
+            notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (price≈{price_now:.8f})")
 
-    # === Step 4: Safisha trade list na unlock ===
     active_trades = [t for t in active_trades if t['symbol'] != symbol]
-    LOCKED_SYMBOL = None  # unlock coin baada ya OCO ifikie
+    LOCKED_SYMBOL = None
     check_daily_target_and_pause()
     time.sleep(COOLDOWN_AFTER_EXIT)
-    
+
 # =========================
-# RUN FOREVER WITH THREADING
+# RUN FOREVER
 # =========================
 def run_forever():
     notify("🤖 Scalper OCO bot started.")
-    soft_backoff = 90    # sekunde ukipigwa "Too much request weight"
-    hard_backoff = 600   # sekunde ukipigwa "IP banned"
+    soft_backoff = 90
+    hard_backoff = 600
     while True:
         try:
             trade_cycle()
         except Exception as e:
             msg = str(e)
-            if "-1003" in msg:
-                if "IP banned" in msg:
-                    notify("⛔ IP banned (weight). Pausing few minutes to cool down.")
+            if "-1003" in msg or "Too many requests" in msg:
+                if "IP banned" in msg or "too many requests" in msg.lower():
+                    notify("⛔ IP banned (weight). Pausing hard to cool down.")
                     time.sleep(hard_backoff)
                 else:
                     notify("⚠️ Weight limit hit. Cooling down briefly.")
                     time.sleep(soft_backoff)
+                continue
+            elif "MIN_NOTIONAL" in msg or "quantity" in msg or "lot size" in msg:
+                notify(f"⚠️ Trade calculation/API error: {msg}. Skipping cycle.")
+                time.sleep(10)
+                continue
             else:
-                notify(f"❌ Cycle error: {e}")
+                notify(f"❌ Cycle error: {msg}. Retrying in 5s.")
                 time.sleep(5)
 
 # =========================
-# FLASK KEEPALIVE FOR RENDER
+# FLASK KEEPALIVE
 # =========================
 app = Flask(__name__)
-
 @app.route("/")
 def home():
     return "Bot is running! ✅"
@@ -436,9 +352,5 @@ def start_flask():
 # START BOTH THREADS
 # =========================
 if __name__ == "__main__":
-    # Run bot in a separate thread
     bot_thread = threading.Thread(target=run_forever, daemon=True)
-    bot_thread.start()
-    
-    # Run Flask server (main thread)
-    start_flask()
+    bot_thread.start
