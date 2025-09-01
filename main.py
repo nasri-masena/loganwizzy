@@ -329,6 +329,7 @@ def trade_cycle():
         notify("⚠️ Trade USD computed < $1. Skipping.")
         return
 
+    # === Step 1: Market Buy ===
     try:
         qty, entry_price, f = place_market_buy(symbol, trade_usd)
         active_trades.append({
@@ -337,16 +338,33 @@ def trade_cycle():
             'entry_price': entry_price,
             'filters': f
         })
+        notify(f"✅ Buy success: {symbol}, qty={qty}, entry={entry_price:.8f}")
+        time.sleep(2)  # 🕒 delay kidogo kabla ya OCO
     except Exception as e:
         notify(f"❌ Buy failed for {symbol}: {e}")
         return
 
+    # === Step 2: Retry logic kwa OCO Order ===
+    state = None
+    for attempt in range(1, 4):  # Jaribu mara 3
+        try:
+            state = place_oco_order(symbol, qty, entry_price, f)
+            notify(f"✅ OCO order placed for {symbol} (attempt {attempt})")
+            break
+        except Exception as e:
+            notify(f"⚠️ OCO attempt {attempt} failed for {symbol}: {e}")
+            if attempt < 3:
+                time.sleep(3)  # 🕒 subiri kabla ya kujaribu tena
+            else:
+                notify(f"❌ OCO failed completely for {symbol} after 3 attempts.")
+                # Ondoa trade kutoka active_trades
+                active_trades = [t for t in active_trades if t['symbol'] != symbol]
+                return
+
+    # === Step 3: Monitoring & Rolling ===
     try:
-        # Set OCO safely na kisha monitor/roll ndani ya while loop
-        state = place_oco_order(symbol, qty, entry_price, f)
         last_tp = None
         active = True
-
         while active:
             time.sleep(SLEEP_BETWEEN_CHECKS)
             asset = symbol[:-len(QUOTE)]
@@ -370,14 +388,17 @@ def trade_cycle():
                 new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
                 last_tp = state['tp']
                 state = place_oco_order(symbol, free_qty, new_tp, f)
-                notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (price≈{price_now:.8f})")
+                notify(
+                    f"🔁 Rolled OCO for {symbol}: "
+                    f"new SL={state['sl']:.8f}, new TP={state['tp']:.8f} "
+                    f"(price≈{price_now:.8f})"
+                )
 
     except Exception as e:
         notify(f"❌ Monitoring/rolling error for {symbol}: {e}")
 
-    # Ondoa trade kutoka active_trades
+    # === Step 4: Safisha trade list na pause ===
     active_trades = [t for t in active_trades if t['symbol'] != symbol]
-
     check_daily_target_and_pause()
     time.sleep(COOLDOWN_AFTER_EXIT)
     
@@ -386,7 +407,7 @@ def trade_cycle():
 # =========================
 def run_forever():
     notify("🤖 Scalper OCO bot started.")
-    soft_backoff = 100    # sekunde ukipigwa "Too much request weight"
+    soft_backoff = 90    # sekunde ukipigwa "Too much request weight"
     hard_backoff = 600   # sekunde ukipigwa "IP banned"
     while True:
         try:
