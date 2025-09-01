@@ -291,8 +291,10 @@ active_trades = []
 # =========================
 # MAIN CYCLE (update)
 # =========================
+LOCKED_SYMBOL = None
+
 def trade_cycle():
-    global start_balance_usdt, paused_until, active_trades
+    global start_balance_usdt, paused_until, active_trades, LOCKED_SYMBOL
 
     if start_balance_usdt is None:
         start_balance_usdt = get_current_total_balance()
@@ -314,20 +316,22 @@ def trade_cycle():
         notify("⏳ Trade in progress, skipping new buys.")
         return
 
-    # Chagua coin moja tu (ile ya juu kwenye list)
-    candidates = pick_symbols_multi(top_n=1)
-    if not candidates:
-        notify("⚠️ No coins meet filters. Sleeping 10s.")
-        time.sleep(10)
-        return
+    # Chagua coin moja tu (ile ya juu kwenye list) na lock
+    if LOCKED_SYMBOL is None:
+        candidates = pick_symbols_multi(top_n=1)
+        if not candidates:
+            notify("⚠️ No coins meet filters. Sleeping 10s.")
+            time.sleep(10)
+            return
+        symbol, price, qvol, chg, score = candidates[0]
+        LOCKED_SYMBOL = symbol
+    else:
+        symbol = LOCKED_SYMBOL
 
-    symbol, price, qvol, chg, score = candidates[0]
-    notify(f"🎯 Selected {symbol} (price {price:.6f}, 24h change {chg:.2f}%, qVol≈{qvol:.0f})")
+    notify(f"🎯 Selected {symbol}")
 
-    trade_usd = min(19.0, get_current_total_balance())
-    if trade_usd < 1.0:
-        notify("⚠️ Trade USD computed < $1. Skipping.")
-        return
+    # Trade amount: ignore low balance warning
+    trade_usd = max(min(19.0, get_current_total_balance()), 0.01)
 
     # === Step 1: Market Buy ===
     try:
@@ -342,63 +346,54 @@ def trade_cycle():
         time.sleep(2)  # 🕒 delay kidogo kabla ya OCO
     except Exception as e:
         notify(f"❌ Buy failed for {symbol}: {e}")
+        LOCKED_SYMBOL = None  # unlock coin ili next cycle ijaribu nyingine
         return
 
-    # === Step 2: Retry logic kwa OCO Order ===
-    state = None
-    for attempt in range(1, 4):  # Jaribu mara 3
-        try:
-            state = place_oco_order(symbol, qty, entry_price, f)
-            notify(f"✅ OCO order placed for {symbol} (attempt {attempt})")
-            break
-        except Exception as e:
-            notify(f"⚠️ OCO attempt {attempt} failed for {symbol}: {e}")
-            if attempt < 3:
-                time.sleep(3)  # 🕒 subiri kabla ya kujaribu tena
-            else:
-                notify(f"❌ OCO failed completely for {symbol} after 3 attempts.")
-                # Ondoa trade kutoka active_trades
-                active_trades = [t for t in active_trades if t['symbol'] != symbol]
-                return
+    # === Step 2: Place OCO ===
+    try:
+        state = place_oco_order(symbol, qty, entry_price, f)
+        notify(f"✅ OCO order placed for {symbol}")
+    except Exception as e:
+        notify(f"❌ OCO failed for {symbol}: {e}")
+        active_trades = [t for t in active_trades if t['symbol'] != symbol]
+        LOCKED_SYMBOL = None
+        return
 
     # === Step 3: Monitoring & Rolling ===
-    try:
-        last_tp = None
-        active = True
-        while active:
-            time.sleep(SLEEP_BETWEEN_CHECKS)
-            asset = symbol[:-len(QUOTE)]
-            free_qty = get_free_asset(asset)
-            open_orders = client.get_open_orders(symbol=symbol)
-            price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
+    last_tp = None
+    active = True
+    while active:
+        time.sleep(SLEEP_BETWEEN_CHECKS)
+        asset = symbol[:-len(QUOTE)]
+        free_qty = get_free_asset(asset)
+        open_orders = client.get_open_orders(symbol=symbol)
+        price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
 
-            # Angalia kama position imefungwa
-            if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
-                exit_price = price_now
-                profit_usd = (exit_price - entry_price) * qty
-                notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
-                active = False
-                break
+        # Check kama position imefungwa
+        if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
+            exit_price = price_now
+            profit_usd = (exit_price - entry_price) * qty
+            notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
+            active = False
+            break
 
-            # Roll TP/SL kama price iko karibu na TP
-            near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
-            if near_trigger:
-                cancel_all_open_orders(symbol)
-                new_sl = entry_price if last_tp is None else last_tp
-                new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
-                last_tp = state['tp']
-                state = place_oco_order(symbol, free_qty, new_tp, f)
-                notify(
-                    f"🔁 Rolled OCO for {symbol}: "
-                    f"new SL={state['sl']:.8f}, new TP={state['tp']:.8f} "
-                    f"(price≈{price_now:.8f})"
-                )
+        # Roll TP/SL kama price iko karibu na TP
+        near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
+        if near_trigger:
+            cancel_all_open_orders(symbol)
+            new_sl = entry_price if last_tp is None else last_tp
+            new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
+            last_tp = state['tp']
+            state = place_oco_order(symbol, free_qty, new_tp, f)
+            notify(
+                f"🔁 Rolled OCO for {symbol}: "
+                f"new SL={state['sl']:.8f}, new TP={state['tp']:.8f} "
+                f"(price≈{price_now:.8f})"
+            )
 
-    except Exception as e:
-        notify(f"❌ Monitoring/rolling error for {symbol}: {e}")
-
-    # === Step 4: Safisha trade list na pause ===
+    # === Step 4: Safisha trade list na unlock ===
     active_trades = [t for t in active_trades if t['symbol'] != symbol]
+    LOCKED_SYMBOL = None  # unlock coin baada ya OCO ifikie
     check_daily_target_and_pause()
     time.sleep(COOLDOWN_AFTER_EXIT)
     
