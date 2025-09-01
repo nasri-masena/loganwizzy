@@ -186,26 +186,57 @@ def place_market_buy(symbol, usd_amount):
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
     return qty, price, f
 
-def place_oco_sell(symbol, qty, sl_price, tp_price, f):
-    sl_price = round_price(sl_price, f['tickSize'])
+def place_oco_order(symbol, qty, entry_price, f):
+    """
+    Place an OCO (Stop Loss + Take Profit) order safely.
+    Adjusts qty and prices according to Binance filters.
+    """
+    # Compute initial TP & SL
+    tp_price = entry_price * (1 + INITIAL_TP_PCT)
+    sl_price = entry_price * (1 - INITIAL_SL_PCT)
+
+    # Adjust to tick size
     tp_price = round_price(tp_price, f['tickSize'])
-    stop_limit_price = round_price(sl_price * 0.999, f['tickSize'])  # adjust slightly below stopPrice
-    oco = client.create_oco_order(
-        symbol=symbol,
-        side='SELL',
-        quantity=round_step(qty, f['stepSize']),
-        price=str(tp_price),
-        stopPrice=str(sl_price),
-        stopLimitPrice=str(stop_limit_price),
-        stopLimitTimeInForce='GTC'
-    )
-    notify(f"📌 OCO set for {symbol} SL={sl_price:.8f}, TP={tp_price:.8f}")
-    return {'tp': tp_price, 'sl': sl_price, 'orderListId': oco.get('orderListId') if isinstance(oco, dict) else None}
-    
+    sl_price = round_price(sl_price, f['tickSize'])
+
+    # Slightly reduce stop limit price under SL
+    stop_limit_price = round_price(sl_price * 0.999, f['tickSize'])
+
+    # Adjust qty to stepSize and minQty
+    qty = round_step(qty, f['stepSize'])
+    qty = max(qty, f['minQty'])
+
+    # Check minNotional
+    notional = qty * entry_price
+    if f['minNotional'] and notional < f['minNotional']:
+        needed_qty = round_step(f['minNotional'] / entry_price, f['stepSize'])
+        free_usdt = get_free_usdt()
+        if needed_qty * entry_price > free_usdt + 1e-8:
+            raise RuntimeError(
+                f"Not enough funds to meet MIN_NOTIONAL (${f['minNotional']:.2f}). "
+                f"Free=${free_usdt:.2f}, need≈${needed_qty*entry_price:.2f}"
+            )
+        qty = needed_qty
+
+    try:
+        oco = client.create_oco_order(
+            symbol=symbol,
+            side='SELL',
+            quantity=qty,
+            price=str(tp_price),
+            stopPrice=str(sl_price),
+            stopLimitPrice=str(stop_limit_price),
+            stopLimitTimeInForce='GTC'
+        )
+        notify(f"📌 OCO set for {symbol}: SL={sl_price:.8f}, TP={tp_price:.8f}, qty={qty}")
+        return {'tp': tp_price, 'sl': sl_price, 'orderListId': oco.get('orderListId') if isinstance(oco, dict) else None}
+    except Exception as e:
+        notify(f"❌ Failed to place OCO for {symbol}: {e}")
+        raise
+
 def monitor_and_roll(symbol, qty, entry_price, f):
-    tp = entry_price * (1 + INITIAL_TP_PCT)
-    sl = entry_price * (1 - INITIAL_SL_PCT)
-    state = place_oco_sell(symbol, qty, sl, tp, f)
+    # Set initial OCO
+    state = place_oco_order(symbol, qty, entry_price, f)
     last_tp = None
     active = True
 
@@ -214,27 +245,25 @@ def monitor_and_roll(symbol, qty, entry_price, f):
         asset = symbol[:-len(QUOTE)]
         free_qty = get_free_asset(asset)
         open_orders = client.get_open_orders(symbol=symbol)
+        price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
 
+        # Check kama position imefungwa
         if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
-            exit_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+            exit_price = price_now
             profit_usd = (exit_price - entry_price) * qty
             notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
             return True, exit_price, profit_usd
 
-        price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
+        # Roll TP/SL kama price iko karibu na TP
         near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
-
         if near_trigger:
             cancel_all_open_orders(symbol)
-            if last_tp is None:
-                new_sl = entry_price
-            else:
-                new_sl = last_tp
+            new_sl = entry_price if last_tp is None else last_tp
             new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
             last_tp = state['tp']
-            state = place_oco_sell(symbol, qty=free_qty, sl_price=new_sl, tp_price=new_tp, f=f)
-            notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (px≈{price_now:.8f})")
-
+            state = place_oco_order(symbol, free_qty, new_tp, f)
+            notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (price≈{price_now:.8f})")
+            
 # =========================
 # DAILY TARGET
 # =========================
@@ -313,18 +342,41 @@ def trade_cycle():
         return
 
     try:
-        closed, exit_price, profit_usd = monitor_and_roll(symbol, qty, entry_price, f)
+        # Set OCO safely na kisha monitor/roll ndani ya while loop
+        state = place_oco_order(symbol, qty, entry_price, f)
+        last_tp = None
+        active = True
+
+        while active:
+            time.sleep(SLEEP_BETWEEN_CHECKS)
+            asset = symbol[:-len(QUOTE)]
+            free_qty = get_free_asset(asset)
+            open_orders = client.get_open_orders(symbol=symbol)
+            price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
+
+            # Angalia kama position imefungwa
+            if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
+                exit_price = price_now
+                profit_usd = (exit_price - entry_price) * qty
+                notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
+                active = False
+                break
+
+            # Roll TP/SL kama price iko karibu na TP
+            near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
+            if near_trigger:
+                cancel_all_open_orders(symbol)
+                new_sl = entry_price if last_tp is None else last_tp
+                new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
+                last_tp = state['tp']
+                state = place_oco_order(symbol, free_qty, new_tp, f)
+                notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (price≈{price_now:.8f})")
+
     except Exception as e:
         notify(f"❌ Monitoring/rolling error for {symbol}: {e}")
-        closed, exit_price, profit_usd = False, None, 0.0
 
-    # Ondoa trade kutoka active_trades kwa dictionary logic
+    # Ondoa trade kutoka active_trades
     active_trades = [t for t in active_trades if t['symbol'] != symbol]
-
-    if closed:
-        notify(f"✅ Trade closed: {symbol}, profit ≈ ${profit_usd:.6f}")
-    else:
-        notify(f"⚠️ Trade ended unexpectedly for {symbol}.")
 
     check_daily_target_and_pause()
     time.sleep(COOLDOWN_AFTER_EXIT)
@@ -334,8 +386,8 @@ def trade_cycle():
 # =========================
 def run_forever():
     notify("🤖 Scalper OCO bot started.")
-    soft_backoff = 90    # sekunde ukipigwa "Too much request weight"
-    hard_backoff = 300   # sekunde ukipigwa "IP banned"
+    soft_backoff = 100    # sekunde ukipigwa "Too much request weight"
+    hard_backoff = 600   # sekunde ukipigwa "IP banned"
     while True:
         try:
             trade_cycle()
