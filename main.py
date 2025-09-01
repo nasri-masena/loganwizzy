@@ -31,8 +31,8 @@ TRIGGER_PROXIMITY = float(os.getenv("TRIGGER_PROXIMITY", "0.04"))
 
 MIN_QUOTE_VOLUME_USD = float(os.getenv("MIN_QUOTE_VOLUME_USD", "5000000"))
 
-SLEEP_BETWEEN_CHECKS = int(os.getenv("SLEEP_BETWEEN_CHECKS", "3"))
-COOLDOWN_AFTER_EXIT = int(os.getenv("COOLDOWN_AFTER_EXIT", "5"))
+SLEEP_BETWEEN_CHECKS = int(os.getenv("SLEEP_BETWEEN_CHECKS", "15"))
+COOLDOWN_AFTER_EXIT = int(os.getenv("COOLDOWN_AFTER_EXIT", "30"))
 
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Africa/Dar_es_Salaam"))
 
@@ -106,6 +106,19 @@ def get_filters(symbol_info):
         'tickSize': float(pricef['tickSize']),
         'minNotional': float(min_notional) if min_notional else None
     }
+# ===== REST load-shedding / caching =====
+TICKER_CACHE = None
+LAST_TICKER_FETCH = 0.0
+TICKER_TTL = 60.0  # sekunde; update mara 1 kwa dakika
+
+def get_tickers_cached():
+    """Rudisha 24h tickers kwa cache ili kupunguza weight."""
+    global TICKER_CACHE, LAST_TICKER_FETCH
+    now = time.time()
+    if TICKER_CACHE is None or (now - LAST_TICKER_FETCH) > TICKER_TTL:
+        TICKER_CACHE = client.get_ticker()
+        LAST_TICKER_FETCH = now
+    return TICKER_CACHE
 
 def cancel_all_open_orders(symbol):
     try:
@@ -116,9 +129,9 @@ def cancel_all_open_orders(symbol):
 # =========================
 # SYMBOL PICKER
 # =========================
-def pick_symbols_multi(top_n=3, price_min=PRICE_MIN, price_max=PRICE_MAX,
+def pick_symbols_multi(top_n=1, price_min=PRICE_MIN, price_max=PRICE_MAX,
                        min_volume=MIN_QUOTE_VOLUME_USD, movement_min_pct=MOVEMENT_MIN_PCT):
-    tickers = client.get_ticker()  # inatoa 24h tickers zote
+    tickers = get_tickers_cached()
     candidates = []
 
     for t in tickers:
@@ -147,18 +160,28 @@ def place_market_buy(symbol, usd_amount):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
     price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+
     qty = usd_amount / price
     qty = max(qty, f['minQty'])
     qty = round_step(qty, f['stepSize'])
     qty = float(f"{qty:.8f}")
     if qty <= 0:
         raise RuntimeError("Computed quantity <= 0")
+
+    # Lazima tufikie MIN_NOTIONAL kama ipo
     if f['minNotional']:
         notional = qty * price
         if notional < f['minNotional']:
             needed_qty = round_step(f['minNotional'] / price, f['stepSize'])
-            if needed_qty > qty:
-                qty = needed_qty
+            # Hakikisha tuna salio la kuweza kufikia minNotional
+            free_usdt = get_free_usdt()
+            if needed_qty * price > free_usdt + 1e-8:
+                raise RuntimeError(
+                    f"Not enough funds to meet MIN_NOTIONAL (${f['minNotional']:.2f}). "
+                    f"Free=${free_usdt:.2f}, need≈${needed_qty*price:.2f}"
+                )
+            qty = needed_qty
+
     order = client.order_market_buy(symbol=symbol, quantity=qty)
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
     return qty, price, f
@@ -263,7 +286,7 @@ def trade_cycle():
         return
 
     # Chagua coin moja tu (ile ya juu kwenye list)
-    candidates = pick_symbols_multi(top_n=3)
+    candidates = pick_symbols_multi(top_n=1)
     if not candidates:
         notify("⚠️ No coins meet filters. Sleeping 10s.")
         time.sleep(10)
@@ -272,14 +295,19 @@ def trade_cycle():
     symbol, price, qvol, chg, score = candidates[0]
     notify(f"🎯 Selected {symbol} (price {price:.6f}, 24h change {chg:.2f}%, qVol≈{qvol:.0f})")
 
-    trade_usd = max(get_current_total_balance() - 1.0, 0)
+    trade_usd = min(19.0, get_current_total_balance())
     if trade_usd < 1.0:
         notify("⚠️ Trade USD computed < $1. Skipping.")
         return
 
     try:
         qty, entry_price, f = place_market_buy(symbol, trade_usd)
-        active_trades.append(symbol)
+        active_trades.append({
+            'symbol': symbol,
+            'qty': qty,
+            'entry_price': entry_price,
+            'filters': f
+        })
     except Exception as e:
         notify(f"❌ Buy failed for {symbol}: {e}")
         return
@@ -290,17 +318,15 @@ def trade_cycle():
         notify(f"❌ Monitoring/rolling error for {symbol}: {e}")
         closed, exit_price, profit_usd = False, None, 0.0
 
+    # Ondoa trade kutoka active_trades kwa dictionary logic
+    active_trades = [t for t in active_trades if t['symbol'] != symbol]
+
     if closed:
         notify(f"✅ Trade closed: {symbol}, profit ≈ ${profit_usd:.6f}")
-        active_trades.remove(symbol)
     else:
         notify(f"⚠️ Trade ended unexpectedly for {symbol}.")
-        if symbol in active_trades:
-            active_trades.remove(symbol)
 
-    if check_daily_target_and_pause():
-        return
-
+    check_daily_target_and_pause()
     time.sleep(COOLDOWN_AFTER_EXIT)
     
 # =========================
@@ -308,12 +334,23 @@ def trade_cycle():
 # =========================
 def run_forever():
     notify("🤖 Scalper OCO bot started.")
+    soft_backoff = 90    # sekunde ukipigwa "Too much request weight"
+    hard_backoff = 300   # sekunde ukipigwa "IP banned"
     while True:
         try:
             trade_cycle()
         except Exception as e:
-            notify(f"❌ Cycle error: {e}")
-            time.sleep(5)
+            msg = str(e)
+            if "-1003" in msg:
+                if "IP banned" in msg:
+                    notify("⛔ IP banned (weight). Pausing few minutes to cool down.")
+                    time.sleep(hard_backoff)
+                else:
+                    notify("⚠️ Weight limit hit. Cooling down briefly.")
+                    time.sleep(soft_backoff)
+            else:
+                notify(f"❌ Cycle error: {e}")
+                time.sleep(5)
 
 # =========================
 # FLASK KEEPALIVE FOR RENDER
