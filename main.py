@@ -3,7 +3,7 @@ import time
 import math
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask
 from binance.client import Client
@@ -17,125 +17,154 @@ API_SECRET = os.getenv("API_SECRET")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-QUOTE = "USDT"
-PRICE_MIN = 0.3
-PRICE_MAX = 6.0
-MIN_VOLUME_USD = 500_000
-MOVEMENT_MIN_PCT = 0.5
-CANDIDATES_PER_CYCLE = 1
-TRADE_USD = 10.0
+PRICE_MIN = float(os.getenv("PRICE_MIN", "0.5"))
+PRICE_MAX = float(os.getenv("PRICE_MAX", "5.0"))
+QUOTE = os.getenv("QUOTE", "USDT")
 
-SLEEP_BETWEEN_CHECKS = 10
-LOCAL_TZ = ZoneInfo("Africa/Dar_es_Salaam")
+MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "1000000"))  # 1M USD
+MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "1.0"))     # 1%
+
+SLEEP_BETWEEN_CHECKS = int(os.getenv("SLEEP_BETWEEN_CHECKS", "10"))
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Africa/Dar_es_Salaam"))
 
 # =========================
 # INIT
 # =========================
 client = Client(API_KEY, API_SECRET)
 LAST_NOTIFY = 0
-LOCKED_COINS = set()
+LOCKED_SYMBOL = None
+CANDIDATES = {}
+TICKERS = {}
 
+# =========================
+# UTILITIES
+# =========================
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
-    if now_ts - LAST_NOTIFY < 10:
+    if now_ts - LAST_NOTIFY < 5:
         return
     LAST_NOTIFY = now_ts
+
     t = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
     text = f"[{t}] {msg}"
     print(text)
     if BOT_TOKEN and CHAT_ID:
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={"chat_id": CHAT_ID, "text": text}
-            )
-        except:
-            pass
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+        except Exception as e:
+            print("Telegram notify error:", e)
 
 def get_free_usdt():
     try:
-        return float(client.get_asset_balance(asset=QUOTE)['free'])
+        bal = client.get_asset_balance(asset=QUOTE)
+        return float(bal['free'])
     except:
         return 0.0
 
 def round_step(n, step):
     return math.floor(n / step) * step if step else n
 
-# =========================
-# CANDIDATE FILTER
-# =========================
-candidates = {}
+def get_filters(symbol_info):
+    fs = {f['filterType']: f for f in symbol_info['filters']}
+    lot = fs['LOT_SIZE']
+    pricef = fs['PRICE_FILTER']
+    min_notional = fs.get('MIN_NOTIONAL', {}).get('minNotional', None)
+    return {
+        'stepSize': float(lot['stepSize']),
+        'minQty': float(lot['minQty']),
+        'tickSize': float(pricef['tickSize']),
+        'minNotional': float(min_notional) if min_notional else None
+    }
 
+# =========================
+# WEBSOCKET CALLBACK
+# =========================
 def handle_ticker(msg):
-    """
-    Real-time ticker from WebSocket
-    """
-    if 's' not in msg or 'c' not in msg or 'v' not in msg or 'P' not in msg:
-        return
-    sym = msg['s']
-    price = float(msg['c'])
-    volume = float(msg['v'])
-    change_pct = abs(float(msg['P']))
+    global TICKERS
+    if 'data' in msg and isinstance(msg['data'], list):
+        for t in msg['data']:
+            sym = t['s']
+            price = float(t['c'])
+            change_pct = abs(float(t['P']))
+            volume = float(t['q']) * price  # approximate quote volume
+            TICKERS[sym] = {
+                'price': price,
+                'change_pct': change_pct,
+                'volume': volume
+            }
 
-    if not sym.endswith(QUOTE):
-        return
-    if PRICE_MIN <= price <= PRICE_MAX and volume >= MIN_VOLUME_USD and change_pct >= MOVEMENT_MIN_PCT:
-        candidates[sym] = {'price': price, 'volume': volume, 'change': change_pct}
-
-def pick_candidates():
-    # Pick top N coins by change * volume
-    sorted_coins = sorted(
-        candidates.items(),
-        key=lambda x: x[1]['change'] * x[1]['volume'],
-        reverse=True
-    )
-    picked = []
-    for sym, data in sorted_coins:
-        if sym in LOCKED_COINS:
+# =========================
+# SYMBOL PICKER
+# =========================
+def pick_candidate():
+    global TICKERS, LOCKED_SYMBOL
+    candidates = []
+    for sym, data in TICKERS.items():
+        if not sym.endswith(QUOTE):
             continue
-        picked.append((sym, data['price']))
-        if len(picked) >= CANDIDATES_PER_CYCLE:
-            break
-    return picked
+        if PRICE_MIN <= data['price'] <= PRICE_MAX \
+            and data['volume'] >= MIN_VOLUME_USD \
+            and data['change_pct'] >= MIN_CHANGE_PCT:
+            candidates.append((sym, data['price'], data['change_pct'], data['volume']))
+
+    # Sort by change*volume descending
+    candidates.sort(key=lambda x: x[2]*x[3], reverse=True)
+    if candidates:
+        LOCKED_SYMBOL = candidates[0][0]
+        return candidates[0][0], candidates[0][1]
+    return None, None
 
 # =========================
-# TRADING FUNCTION
+# TRADE FUNCTION
 # =========================
-def buy_coin(symbol, price):
-    free_usdt = get_free_usdt()
-    qty = round_step(min(TRADE_USD, free_usdt) / price, 0.0001)
-    if qty <= 0:
-        notify(f"❌ Not enough USDT to buy {symbol}")
-        return False
+def place_market_buy(symbol, usd_amount):
+    info = client.get_symbol_info(symbol)
+    f = get_filters(info)
+    price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+    qty = usd_amount / price
+    qty = max(qty, f['minQty'])
+    qty = round_step(qty, f['stepSize'])
+    qty = float(f"{qty:.8f}")
+    # Ensure minNotional
+    if f['minNotional'] and qty*price < f['minNotional']:
+        needed_qty = round_step(f['minNotional']/price, f['stepSize'])
+        free_usdt = get_free_usdt()
+        if needed_qty*price > free_usdt:
+            notify(f"❌ Not enough USDT for {symbol}, need ${needed_qty*price:.2f}")
+            return False
+        qty = needed_qty
     try:
         client.order_market_buy(symbol=symbol, quantity=qty)
-        notify(f"✅ Bought {symbol} qty={qty} at price≈{price}")
-        LOCKED_COINS.add(symbol)
+        notify(f"✅ Bought {symbol}: qty={qty} at price≈{price:.8f}")
         return True
     except Exception as e:
-        notify(f"❌ Failed to buy {symbol}: {e}")
+        notify(f"❌ Market buy failed {symbol}: {e}")
         return False
 
 # =========================
 # MAIN BOT LOOP
 # =========================
 def trade_cycle():
-    picked = pick_candidates()
-    if not picked:
-        notify("⚠️ No eligible coins at this moment.")
+    free_usdt = get_free_usdt()
+    if free_usdt < 1.0:
+        notify("⚠️ Low USDT balance")
         return
-    for sym, price in picked:
-        buy_coin(sym, price)
+    sym, price = pick_candidate()
+    if sym:
+        place_market_buy(sym, min(19, free_usdt))
+    else:
+        notify("⚠️ No eligible coins at this moment.")
 
 # =========================
 # RUN WEBSOCKET
 # =========================
 def start_ws():
-    ws_client = WsClient()
-    ws_client.start()
-    ws_client.ticker_socket(handle_ticker)
-    return ws_client
+    ws = WsClient()
+    ws.start()
+    ws.ticker(symbol="!ticker@arr", callback=handle_ticker)
+    return ws
 
 # =========================
 # FLASK KEEPALIVE
@@ -149,13 +178,23 @@ def start_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 # =========================
-# RUN BOTH THREADS
+# RUN FOREVER
+# =========================
+def run_forever():
+    ws = start_ws()
+    notify("🤖 Bot started with real-time tickers")
+    while True:
+        try:
+            trade_cycle()
+            time.sleep(SLEEP_BETWEEN_CHECKS)
+        except Exception as e:
+            notify(f"❌ Cycle error: {e}")
+            time.sleep(5)
+
+# =========================
+# START BOTH THREADS
 # =========================
 if __name__ == "__main__":
-    ws_thread = threading.Thread(target=start_ws, daemon=True)
-    ws_thread.start()
-
-    bot_thread = threading.Thread(target=lambda: [trade_cycle() or time.sleep(SLEEP_BETWEEN_CHECKS) for _ in iter(int, 1)], daemon=True)
+    bot_thread = threading.Thread(target=run_forever, daemon=True)
     bot_thread.start()
-
     start_flask()
