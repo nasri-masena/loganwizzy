@@ -21,7 +21,7 @@ PRICE_MAX = 3.0
 MIN_VOLUME = 5_000_000
 MOVEMENT_MIN_PCT = 3.0
 
-TRADE_USD = 10  # ⚡ test amount
+TRADE_USD = 8  # ⚡ test amount
 SLEEP_BETWEEN_CHECKS = 60
 COOLDOWN_AFTER_EXIT = 30
 
@@ -128,29 +128,26 @@ def place_safe_market_buy(symbol, usd_amount):
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
     return qty, price
     
-def place_fixed_stop_market_sell(symbol, qty, buy_price, sl_cents=0.005):
+def place_stop_loss_limit_sell(symbol, qty, stop_price, limit_price):
     """
-    Place stop market sell order at fixed price below buy price.
-    sl_cents = 0.005 means 0.005 USD below buy price (5 cents)
+    Places a stop-limit sell order (Spot) - executes a limit sell after stop trigger.
     """
-    f = get_filters(client.get_symbol_info(symbol))
-    stop_price = buy_price - sl_cents
-    stop_price = round_step(stop_price, f['tickSize'])
-
     try:
         order = client.create_order(
             symbol=symbol,
             side='SELL',
-            type='STOP_MARKET',
+            type='STOP_LOSS_LIMIT',
+            timeInForce='GTC',
             quantity=qty,
-            stopPrice=str(stop_price)
+            price=f"{limit_price:.8f}",
+            stopPrice=f"{stop_price:.8f}"
         )
-        notify(f"📌 STOP MARKET SELL set for {symbol}: stopPrice={stop_price}, qty={qty}")
+        notify(f"📌 STOP-LOSS-LIMIT set for {symbol}: stop={stop_price}, limit={limit_price}, qty={qty}")
         return order
     except Exception as e:
-        notify(f"❌ Failed to place stop market sell for {symbol}: {e}")
+        notify(f"❌ Failed to place stop-loss-limit sell for {symbol}: {e}")
         return None
-
+        
 # =========================
 # MAIN LOOP (updated with STOP SELL notify)
 # =========================
@@ -163,7 +160,7 @@ def trade_cycle():
             continue
 
         symbol, price, volume, change = coin
-        notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, volume≈{volume})")
+        notify(f"🎯 Selected {symbol} for market buy (24h change={change:.2f}%, volume≈{volume})")
 
         usd_to_buy = min(TRADE_USD, get_free_usdt())
         if usd_to_buy < 1.0:
@@ -176,15 +173,19 @@ def trade_cycle():
             qty, buy_price = place_safe_market_buy(symbol, usd_to_buy)
             notify(f"💰 Market buy executed for {symbol}: qty={qty}, price={buy_price:.8f}")
 
-            # Step 2: Stop market sell order (SL 5 cents below buy)
-            stop_order = place_fixed_stop_market_sell(symbol, qty, buy_price, sl_cents=0.005)
+            # Step 2: Stop-loss-limit order (SL 0.5% below buy price, limit 1% below)
+            stop_price = buy_price * 0.995   # -0.5%
+            limit_price = buy_price * 0.990  # -1.0%
+            stop_order = place_stop_loss_limit_sell(symbol, qty, stop_price, limit_price)
+
             if stop_order:
-                notify(f"📌 Stop market SELL order placed for {symbol} at ~{buy_price-0.005:.8f}")
+                notify(f"📌 Stop-loss-limit SELL order placed for {symbol} "
+                       f"(stop={stop_price:.8f}, limit={limit_price:.8f})")
 
         except Exception as e:
-            notify(f"❌ Market buy or stop sell failed: {e}")
+            notify(f"❌ Trade cycle failed for {symbol}: {e}")
 
-        # Step 3: Cooldown before next trade
+        # Step 3: Cooldown before next iteration
         time.sleep(COOLDOWN_AFTER_EXIT)
         
 # =========================
