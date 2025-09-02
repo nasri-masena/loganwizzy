@@ -127,9 +127,32 @@ def place_safe_market_buy(symbol, usd_amount):
     order = client.order_market_buy(symbol=symbol, quantity=qty)
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
     return qty, price
+    
+def place_fixed_stop_market_sell(symbol, qty, buy_price, sl_cents=0.005):
+    """
+    Place stop market sell order at fixed price below buy price.
+    sl_cents = 0.005 means 0.005 USD below buy price (5 cents)
+    """
+    f = get_filters(client.get_symbol_info(symbol))
+    stop_price = buy_price - sl_cents
+    stop_price = round_step(stop_price, f['tickSize'])
+
+    try:
+        order = client.create_order(
+            symbol=symbol,
+            side='SELL',
+            type='STOP_MARKET',
+            quantity=qty,
+            stopPrice=str(stop_price)
+        )
+        notify(f"📌 STOP MARKET SELL set for {symbol}: stopPrice={stop_price}, qty={qty}")
+        return order
+    except Exception as e:
+        notify(f"❌ Failed to place stop market sell for {symbol}: {e}")
+        return None
 
 # =========================
-# MAIN LOOP
+# MAIN LOOP (updated with STOP SELL notify)
 # =========================
 def trade_cycle():
     while True:
@@ -138,19 +161,32 @@ def trade_cycle():
             notify("⚠️ No coins meet criteria. Waiting 60s...")
             time.sleep(SLEEP_BETWEEN_CHECKS)
             continue
+
         symbol, price, volume, change = coin
         notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, volume≈{volume})")
+
         usd_to_buy = min(TRADE_USD, get_free_usdt())
         if usd_to_buy < 1.0:
             notify("⚠️ Not enough USDT to buy. Waiting 60s...")
             time.sleep(SLEEP_BETWEEN_CHECKS)
             continue
-        try:
-            place_safe_market_buy(symbol, usd_to_buy)
-        except Exception as e:
-            notify(f"❌ Market buy failed: {e}")
-        time.sleep(COOLDOWN_AFTER_EXIT)
 
+        try:
+            # Step 1: Market buy
+            qty, buy_price = place_safe_market_buy(symbol, usd_to_buy)
+            notify(f"💰 Market buy executed for {symbol}: qty={qty}, price={buy_price:.8f}")
+
+            # Step 2: Stop market sell order (SL 5 cents below buy)
+            stop_order = place_fixed_stop_market_sell(symbol, qty, buy_price, sl_cents=0.005)
+            if stop_order:
+                notify(f"📌 Stop market SELL order placed for {symbol} at ~{buy_price-0.005:.8f}")
+
+        except Exception as e:
+            notify(f"❌ Market buy or stop sell failed: {e}")
+
+        # Step 3: Cooldown before next trade
+        time.sleep(COOLDOWN_AFTER_EXIT)
+        
 # =========================
 # FLASK KEEPALIVE
 # =========================
