@@ -16,12 +16,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
-PRICE_MIN = 1.0
-PRICE_MAX = 3.0
-MIN_VOLUME = 5_000_000
-MOVEMENT_MIN_PCT = 3.0
+# ===== MICRO COINS RANGE =====
+PRICE_MIN = 0.0001
+PRICE_MAX = 0.001
+MIN_VOLUME = 50_000    # lower for small coins
+MOVEMENT_MIN_PCT = 0.5 # allow smaller movement
 
-TRADE_USD = 10 # ⚡ test amount
+TRADE_USD = 5  # ⚡ test amount
 SLEEP_BETWEEN_CHECKS = 60
 COOLDOWN_AFTER_EXIT = 30
 
@@ -34,7 +35,7 @@ LAST_NOTIFY = 0
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
-    if now_ts - LAST_NOTIFY < 2:  # short throttle for testing
+    if now_ts - LAST_NOTIFY < 2:  
         return
     LAST_NOTIFY = now_ts
     text = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -70,7 +71,7 @@ def get_filters(symbol_info):
 # =========================
 TICKER_CACHE = None
 LAST_FETCH = 0
-CACHE_TTL = 30  # seconds
+CACHE_TTL = 30
 
 def get_tickers_cached():
     global TICKER_CACHE, LAST_FETCH
@@ -106,6 +107,22 @@ def pick_coin():
 def round_step(n, step):
     return math.floor(n / step) * step if step else n
 
+def adjust_quantity(symbol, qty):
+    """
+    Adjust quantity to match Binance lot size precision
+    """
+    info = client.get_symbol_info(symbol)
+    step_size = None
+    for f in info['filters']:
+        if f['filterType'] == 'LOT_SIZE':
+            step_size = float(f['stepSize'])
+            break
+
+    if step_size:
+        precision = int(round(-math.log(step_size, 10), 0))
+        return float(f"{qty:.{precision}f}")
+    return qty
+
 def place_safe_market_buy(symbol, usd_amount):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
@@ -114,6 +131,7 @@ def place_safe_market_buy(symbol, usd_amount):
     qty = usd_amount / price
     qty = max(qty, f['minQty'])
     qty = round_step(qty, f['stepSize'])
+    qty = adjust_quantity(symbol, qty)
 
     if f['minNotional']:
         notional = qty * price
@@ -123,33 +141,35 @@ def place_safe_market_buy(symbol, usd_amount):
             if needed_qty*price > free_usdt + 1e-8:
                 raise RuntimeError(f"Not enough funds: need≈${needed_qty*price:.2f}, free=${free_usdt:.2f}")
             qty = needed_qty
+            qty = adjust_quantity(symbol, qty)
 
     order = client.order_market_buy(symbol=symbol, quantity=qty)
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
     return qty, price
-    
-def place_stop_loss_limit_sell(symbol, qty, stop_price, limit_price):
+
+def place_stop_market_sell(symbol, qty, stop_price):
     """
-    Places a stop-limit sell order (Spot) - executes a limit sell after stop trigger.
+    Place stop market sell order
     """
+    f = get_filters(client.get_symbol_info(symbol))
+    stop_price = round_step(stop_price, f['tickSize'])
+    qty = adjust_quantity(symbol, qty)
     try:
         order = client.create_order(
             symbol=symbol,
             side='SELL',
-            type='STOP_LOSS_LIMIT',
-            timeInForce='GTC',
+            type='STOP_MARKET',
             quantity=qty,
-            price=f"{limit_price:.8f}",
-            stopPrice=f"{stop_price:.8f}"
+            stopPrice=str(stop_price)
         )
-        notify(f"📌 STOP-LOSS-LIMIT set for {symbol}: stop={stop_price}, limit={limit_price}, qty={qty}")
+        notify(f"📌 STOP MARKET SELL set for {symbol}: stopPrice={stop_price}, qty={qty}")
         return order
     except Exception as e:
-        notify(f"❌ Failed to place stop-loss-limit sell for {symbol}: {e}")
+        notify(f"❌ Failed to place stop market sell for {symbol}: {e}")
         return None
-        
+
 # =========================
-# MAIN LOOP (updated with STOP SELL notify)
+# MAIN LOOP
 # =========================
 def trade_cycle():
     while True:
@@ -169,25 +189,20 @@ def trade_cycle():
             continue
 
         try:
-            # Step 1: Market buy
             qty, buy_price = place_safe_market_buy(symbol, usd_to_buy)
             notify(f"💰 Market buy executed for {symbol}: qty={qty}, price={buy_price:.8f}")
 
-            # Step 2: Stop-loss-limit order (SL 0.5% below buy price, limit 1% below)
-            stop_price = buy_price * 0.995   # -0.5%
-            limit_price = buy_price * 0.990  # -1.0%
-            stop_order = place_stop_loss_limit_sell(symbol, qty, stop_price, limit_price)
-
+            # Stop market sell 0.5% below buy price
+            stop_price = buy_price * 0.995
+            stop_order = place_stop_market_sell(symbol, qty, stop_price)
             if stop_order:
-                notify(f"📌 Stop-loss-limit SELL order placed for {symbol} "
-                       f"(stop={stop_price:.8f}, limit={limit_price:.8f})")
+                notify(f"📌 Stop market SELL order placed for {symbol} at ~{stop_price:.8f}")
 
         except Exception as e:
             notify(f"❌ Trade cycle failed for {symbol}: {e}")
 
-        # Step 3: Cooldown before next iteration
         time.sleep(COOLDOWN_AFTER_EXIT)
-        
+
 # =========================
 # FLASK KEEPALIVE
 # =========================
