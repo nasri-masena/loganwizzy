@@ -21,7 +21,8 @@ PRICE_MAX = 3.0
 MIN_VOLUME = 5_000_000
 MOVEMENT_MIN_PCT = 3.0
 
-SLEEP_BETWEEN_CHECKS = 60   # 1 min real-time check
+TRADE_USD = 5.0  # ⚡ test amount
+SLEEP_BETWEEN_CHECKS = 60
 COOLDOWN_AFTER_EXIT = 30
 
 # =========================
@@ -33,7 +34,7 @@ LAST_NOTIFY = 0
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
-    if now_ts - LAST_NOTIFY < 10:
+    if now_ts - LAST_NOTIFY < 2:  # short throttle for testing
         return
     LAST_NOTIFY = now_ts
     text = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -80,12 +81,6 @@ def get_tickers_cached():
     return TICKER_CACHE
 
 def pick_coin():
-    """
-    Pick top coin with:
-      - Positive momentum (>MOVEMENT_MIN_PCT)
-      - Price in range
-      - Sufficient 24h volume
-    """
     tickers = get_tickers_cached()
     candidates = []
     for t in tickers:
@@ -145,7 +140,7 @@ def trade_cycle():
             continue
         symbol, price, volume, change = coin
         notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, volume≈{volume})")
-        usd_to_buy = min(10.0, get_free_usdt())
+        usd_to_buy = min(TRADE_USD, get_free_usdt())
         if usd_to_buy < 1.0:
             notify("⚠️ Not enough USDT to buy. Waiting 60s...")
             time.sleep(SLEEP_BETWEEN_CHECKS)
@@ -166,7 +161,7 @@ def home():
     return "Bot running! ✅"
 
 def start_flask():
-    app.run(host="0.0.0.0", port=5000)  # dummy port
+    app.run(host="0.0.0.0", port=5000)
 
 # =========================
 # RUN THREADS
