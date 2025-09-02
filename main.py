@@ -16,13 +16,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
-# ===== MICRO COINS RANGE =====
-PRICE_MIN = 0.0001
-PRICE_MAX = 0.001
-MIN_VOLUME = 50_000    # lower for small coins
-MOVEMENT_MIN_PCT = 0.5 # allow smaller movement
+PRICE_MIN = 0.0001   # Updated for low-value coins
+PRICE_MAX = 0.001    # Updated for low-value coins
+MIN_VOLUME = 5_000_000
+MOVEMENT_MIN_PCT = 1.0   # Lowered to capture small coin movements
 
-TRADE_USD = 5  # ⚡ test amount
+TRADE_USD = 5  # Test amount
 SLEEP_BETWEEN_CHECKS = 60
 COOLDOWN_AFTER_EXIT = 30
 
@@ -35,7 +34,7 @@ LAST_NOTIFY = 0
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
-    if now_ts - LAST_NOTIFY < 2:  
+    if now_ts - LAST_NOTIFY < 2:
         return
     LAST_NOTIFY = now_ts
     text = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -66,6 +65,21 @@ def get_filters(symbol_info):
         'minNotional': float(min_notional) if min_notional else None
     }
 
+def round_step(n, step):
+    return math.floor(n / step) * step if step else n
+
+def adjust_quantity(symbol, qty):
+    info = client.get_symbol_info(symbol)
+    step_size = None
+    for f in info['filters']:
+        if f['filterType'] == 'LOT_SIZE':
+            step_size = float(f['stepSize'])
+            break
+    if step_size:
+        precision = int(round(-math.log(step_size, 10), 0))
+        return float(f"{qty:.{precision}f}")
+    return qty
+
 # =========================
 # SYMBOL SELECTION
 # =========================
@@ -89,6 +103,9 @@ def pick_coin():
         if not sym.endswith(QUOTE):
             continue
         try:
+            info = client.get_symbol_info(sym)
+            if info['status'] != 'TRADING':
+                continue
             price = float(t['lastPrice'])
             volume = float(t['quoteVolume'])
             change_pct = float(t['priceChangePercent'])
@@ -104,25 +121,6 @@ def pick_coin():
 # =========================
 # MARKET BUY
 # =========================
-def round_step(n, step):
-    return math.floor(n / step) * step if step else n
-
-def adjust_quantity(symbol, qty):
-    """
-    Adjust quantity to match Binance lot size precision
-    """
-    info = client.get_symbol_info(symbol)
-    step_size = None
-    for f in info['filters']:
-        if f['filterType'] == 'LOT_SIZE':
-            step_size = float(f['stepSize'])
-            break
-
-    if step_size:
-        precision = int(round(-math.log(step_size, 10), 0))
-        return float(f"{qty:.{precision}f}")
-    return qty
-
 def place_safe_market_buy(symbol, usd_amount):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
@@ -131,7 +129,6 @@ def place_safe_market_buy(symbol, usd_amount):
     qty = usd_amount / price
     qty = max(qty, f['minQty'])
     qty = round_step(qty, f['stepSize'])
-    qty = adjust_quantity(symbol, qty)
 
     if f['minNotional']:
         notional = qty * price
@@ -141,19 +138,21 @@ def place_safe_market_buy(symbol, usd_amount):
             if needed_qty*price > free_usdt + 1e-8:
                 raise RuntimeError(f"Not enough funds: need≈${needed_qty*price:.2f}, free=${free_usdt:.2f}")
             qty = needed_qty
-            qty = adjust_quantity(symbol, qty)
 
+    qty = adjust_quantity(symbol, qty)
     order = client.order_market_buy(symbol=symbol, quantity=qty)
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
     return qty, price
 
-def place_stop_market_sell(symbol, qty, stop_price):
-    """
-    Place stop market sell order
-    """
+# =========================
+# STOP MARKET SELL
+# =========================
+def place_fixed_stop_market_sell(symbol, qty, buy_price, sl_cents=0.00001):
     f = get_filters(client.get_symbol_info(symbol))
+    stop_price = buy_price - sl_cents
     stop_price = round_step(stop_price, f['tickSize'])
     qty = adjust_quantity(symbol, qty)
+
     try:
         order = client.create_order(
             symbol=symbol,
@@ -169,13 +168,13 @@ def place_stop_market_sell(symbol, qty, stop_price):
         return None
 
 # =========================
-# MAIN LOOP
+# MAIN TRADE CYCLE
 # =========================
 def trade_cycle():
     while True:
         coin = pick_coin()
         if not coin:
-            notify("⚠️ No coins meet criteria. Waiting 60s...")
+            notify("⚠️ No coins meet criteria or market closed. Waiting 60s...")
             time.sleep(SLEEP_BETWEEN_CHECKS)
             continue
 
@@ -192,11 +191,12 @@ def trade_cycle():
             qty, buy_price = place_safe_market_buy(symbol, usd_to_buy)
             notify(f"💰 Market buy executed for {symbol}: qty={qty}, price={buy_price:.8f}")
 
-            # Stop market sell 0.5% below buy price
-            stop_price = buy_price * 0.995
-            stop_order = place_stop_market_sell(symbol, qty, stop_price)
+            # Small price coins: set sl_cents lower
+            sl_cents = 0.00005 if buy_price < 0.01 else 0.005
+            stop_order = place_fixed_stop_market_sell(symbol, qty, buy_price, sl_cents=sl_cents)
+
             if stop_order:
-                notify(f"📌 Stop market SELL order placed for {symbol} at ~{stop_price:.8f}")
+                notify(f"📌 Stop market SELL order placed for {symbol} at ~{buy_price-sl_cents:.8f}")
 
         except Exception as e:
             notify(f"❌ Trade cycle failed for {symbol}: {e}")
