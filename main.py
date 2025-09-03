@@ -91,13 +91,19 @@ def round_price(p, tick):
 # =========================
 # FUNDING WALLET TRANSFER
 # =========================
-def send_profit_to_funding(amount):
+def send_profit_to_funding(amount, asset='USDT'):
     try:
-        client.transfer_spot_to_funding(asset="USDT", amount=amount)
-        notify(f"💸 Transferred ${amount:.2f} to funding wallet")
+        result = client.universal_transfer(
+            type='SPOT_TO_FUNDING',
+            asset=asset,
+            amount=amount
+        )
+        notify(f"💸 Profit ${amount:.6f} transferred to funding wallet.")
+        return result
     except Exception as e:
         notify(f"❌ Failed to transfer profit: {e}")
-
+        return None
+        
 def handle_daily_profit():
     global start_balance_usdt
     current_balance = get_free_usdt()
@@ -242,39 +248,63 @@ def monitor_and_roll(symbol, qty, entry_price, f):
 # MAIN LOOP
 # =========================
 def trade_cycle():
-    global start_balance_usdt
+    global LOCKED_SYMBOL, start_balance_usdt, active_trades
 
     if start_balance_usdt is None:
         start_balance_usdt = get_free_usdt()
-        notify(f"🔰 Start balance recorded: ${start_balance_usdt:.2f}")
+        notify(f"🔰 Start balance recorded: ${start_balance_usdt:.6f}")
 
     while True:
-        handle_daily_profit()
-
-        if len(active_trades) >= MAX_ACTIVE_TRADES:
-            notify("⏳ Max active trades reached. Waiting...")
-            time.sleep(SLEEP_BETWEEN_CHECKS)
-            continue
-
-        active_symbols = [t['symbol'] for t in active_trades]
-        candidates = [c for c in pick_symbols_multi() if c[0] not in active_symbols]
-        if not candidates:
-            notify("⚠️ No eligible coins. Sleeping...")
-            time.sleep(SLEEP_BETWEEN_CHECKS)
-            continue
-
-        symbol, price, volume, change, score = candidates[0]
-        notify(f"🎯 Selected {symbol} for trading.")
-
-        trade_usd = max(min(TRADE_USD, get_free_usdt()), 1.0)
         try:
-            qty, entry_price, f = place_market_buy(symbol, trade_usd)
-            active_trades.append({'symbol': symbol, 'qty': qty, 'entry_price': entry_price, 'filters': f})
-            time.sleep(2)
-            monitor_and_roll(symbol, qty, entry_price, f)
-        except Exception as e:
-            notify(f"❌ Trade failed: {e}")
+            # Haitaongeza trade mpya ikiwa kuna active trade
+            if len(active_trades) >= MAX_ACTIVE_TRADES:
+                time.sleep(5)
+                continue
 
+            # Chagua coin 1 tu
+            candidates = pick_symbols_multi(top_n=1)
+            if not candidates:
+                notify("⚠️ No eligible coins to buy. Sleeping 10s.")
+                time.sleep(10)
+                continue
+
+            symbol, price, volume, change, score = candidates[0]
+            if symbol in [t['symbol'] for t in active_trades]:
+                time.sleep(5)
+                continue
+
+            LOCKED_SYMBOL = symbol
+            notify(f"🎯 Selected {symbol} for trading.")
+
+            trade_usd = max(min(TRADE_USD, get_free_usdt()), 1.0)
+
+            # === Step 1: Market Buy ===
+            try:
+                qty, entry_price, f = place_market_buy(symbol, trade_usd)
+                active_trades.append({'symbol': symbol, 'qty': qty, 'entry_price': entry_price, 'filters': f})
+            except Exception as e:
+                notify(f"❌ Buy failed: {e}")
+                LOCKED_SYMBOL = None
+                time.sleep(5)
+                continue
+
+            # === Step 2 & 3: Monitor OCO & Roll ===
+            success, exit_price, profit_usd = monitor_and_roll(symbol, qty, entry_price, f)
+
+            # === Step 4: Transfer profit to funding wallet ===
+            if success and profit_usd > 0:
+                send_profit_to_funding(profit_usd)
+
+            # Remove from active trades & unlock
+            active_trades[:] = [t for t in active_trades if t['symbol'] != symbol]
+            LOCKED_SYMBOL = None
+
+            time.sleep(COOLDOWN_AFTER_EXIT)
+
+        except Exception as e:
+            notify(f"❌ Trade cycle error: {e}")
+            time.sleep(5)
+            
 # =========================
 # FLASK KEEPALIVE
 # =========================
