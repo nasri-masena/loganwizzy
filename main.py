@@ -144,7 +144,7 @@ def format_price(value, tick_size):
         precision = 0
     return f"{value:.{precision}f}"
 
-def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
+def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0, retries=3, delay=2):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
 
@@ -165,32 +165,38 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
     if qty <= 0:
         raise RuntimeError("❌ Quantity too small for OCO order")
 
-    # format values kwa decimal sahihi
+    # format values sahihi
     tp_str = format_price(tp, f['tickSize'])
     sp_str = format_price(sp, f['tickSize'])
     sl_str = format_price(sl, f['tickSize'])
 
-    try:
-        order = client.create_oco_order(
-            symbol=symbol,
-            side="SELL",
-            quantity=str(qty),
+    # Retry loop
+    for attempt in range(1, retries+1):
+        try:
+            order = client.create_oco_order(
+                symbol=symbol,
+                side="SELL",
+                quantity=str(qty),
 
-            # --- ABOVE (take profit) ---
-            aboveType="LIMIT_MAKER",
-            abovePrice=tp_str,
+                # --- ABOVE (take profit) ---
+                aboveType="LIMIT_MAKER",
+                abovePrice=tp_str,
 
-            # --- BELOW (stop loss) ---
-            belowType="STOP_LOSS_LIMIT",
-            belowStopPrice=sp_str,
-            belowPrice=sl_str,
-            belowTimeInForce="GTC"
-        )
-        notify(f"📌 OCO SELL placed: TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty}")
-        return order
-    except Exception as e:
-        notify(f"❌ OCO SELL failed: {e}")
-        return None
+                # --- BELOW (stop loss) ---
+                belowType="STOP_LOSS_LIMIT",
+                belowStopPrice=sp_str,
+                belowPrice=sl_str,
+                belowTimeInForce="GTC"
+            )
+            notify(f"📌 OCO SELL placed ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty}")
+            return order
+        except Exception as e:
+            notify(f"⚠️ OCO SELL attempt {attempt} failed: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                notify("❌ OCO SELL failed after retries.")
+                return None
         
 # =========================
 # MAIN LOOP
