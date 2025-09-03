@@ -16,12 +16,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
-PRICE_MIN = 0.0001   # Updated for low-value coins
-PRICE_MAX = 0.001    # Updated for low-value coins
+PRICE_MIN = 1.0
+PRICE_MAX = 3.0
 MIN_VOLUME = 5_000_000
-MOVEMENT_MIN_PCT = 1.0   # Lowered to capture small coin movements
+MOVEMENT_MIN_PCT = 3.0
 
-TRADE_USD = 5  # Test amount
+TRADE_USD = 8.0  # ⚡ test amount
 SLEEP_BETWEEN_CHECKS = 60
 COOLDOWN_AFTER_EXIT = 30
 
@@ -34,7 +34,7 @@ LAST_NOTIFY = 0
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
-    if now_ts - LAST_NOTIFY < 2:
+    if now_ts - LAST_NOTIFY < 2:  # short throttle for testing
         return
     LAST_NOTIFY = now_ts
     text = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -65,27 +65,12 @@ def get_filters(symbol_info):
         'minNotional': float(min_notional) if min_notional else None
     }
 
-def round_step(n, step):
-    return math.floor(n / step) * step if step else n
-
-def adjust_quantity(symbol, qty):
-    info = client.get_symbol_info(symbol)
-    step_size = None
-    for f in info['filters']:
-        if f['filterType'] == 'LOT_SIZE':
-            step_size = float(f['stepSize'])
-            break
-    if step_size:
-        precision = int(round(-math.log(step_size, 10), 0))
-        return float(f"{qty:.{precision}f}")
-    return qty
-
 # =========================
 # SYMBOL SELECTION
 # =========================
 TICKER_CACHE = None
 LAST_FETCH = 0
-CACHE_TTL = 30
+CACHE_TTL = 30  # seconds
 
 def get_tickers_cached():
     global TICKER_CACHE, LAST_FETCH
@@ -103,9 +88,6 @@ def pick_coin():
         if not sym.endswith(QUOTE):
             continue
         try:
-            info = client.get_symbol_info(sym)
-            if info['status'] != 'TRADING':
-                continue
             price = float(t['lastPrice'])
             volume = float(t['quoteVolume'])
             change_pct = float(t['priceChangePercent'])
@@ -121,6 +103,9 @@ def pick_coin():
 # =========================
 # MARKET BUY
 # =========================
+def round_step(n, step):
+    return math.floor(n / step) * step if step else n
+
 def place_safe_market_buy(symbol, usd_amount):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
@@ -139,68 +124,75 @@ def place_safe_market_buy(symbol, usd_amount):
                 raise RuntimeError(f"Not enough funds: need≈${needed_qty*price:.2f}, free=${free_usdt:.2f}")
             qty = needed_qty
 
-    qty = adjust_quantity(symbol, qty)
     order = client.order_market_buy(symbol=symbol, quantity=qty)
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
+
+    # 🔥 Immediately place OCO SELL (TP +3%, SL -1%)
+    place_oco_sell(symbol, qty, price, tp_pct=3.0, sl_pct=1.0)
+
     return qty, price
 
 # =========================
-# STOP MARKET SELL
+# OCO SELL
 # =========================
-def place_fixed_stop_market_sell(symbol, qty, buy_price, sl_cents=0.00001):
-    f = get_filters(client.get_symbol_info(symbol))
-    stop_price = buy_price - sl_cents
-    stop_price = round_step(stop_price, f['tickSize'])
-    qty = adjust_quantity(symbol, qty)
+def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
+    info = client.get_symbol_info(symbol)
+    f = get_filters(info)
+
+    # Calculate TP and SL prices
+    take_profit = buy_price * (1 + tp_pct/100.0)
+    stop_price   = buy_price * (1 - sl_pct/100.0)
+    stop_limit   = stop_price * (1 - 0.002)  # 0.2% below stop for safety
+
+    # Round helper
+    def clip(v, step):
+        return math.floor(v / step) * step
+
+    qty = clip(qty, f['stepSize'])
+    tp  = clip(take_profit, f['tickSize'])
+    sp  = clip(stop_price, f['tickSize'])
+    sl  = clip(stop_limit, f['tickSize'])
+
+    if qty <= 0:
+        raise RuntimeError("❌ Quantity too small for OCO order")
 
     try:
-        order = client.create_order(
+        order = client.create_oco_order(
             symbol=symbol,
-            side='SELL',
-            type='STOP_MARKET',
-            quantity=qty,
-            stopPrice=str(stop_price)
+            side="SELL",
+            quantity=str(qty),
+            price=str(tp),              # Take-Profit
+            stopPrice=str(sp),          # Stop trigger
+            stopLimitPrice=str(sl),     # Stop-Limit
+            stopLimitTimeInForce="GTC"
         )
-        notify(f"📌 STOP MARKET SELL set for {symbol}: stopPrice={stop_price}, qty={qty}")
+        notify(f"📌 OCO SELL placed: TP={tp}, SL={sp}/{sl}, qty={qty}")
         return order
     except Exception as e:
-        notify(f"❌ Failed to place stop market sell for {symbol}: {e}")
+        notify(f"❌ OCO SELL failed: {e}")
         return None
-
+        
 # =========================
-# MAIN TRADE CYCLE
+# MAIN LOOP
 # =========================
 def trade_cycle():
     while True:
         coin = pick_coin()
         if not coin:
-            notify("⚠️ No coins meet criteria or market closed. Waiting 60s...")
+            notify("⚠️ No coins meet criteria. Waiting 60s...")
             time.sleep(SLEEP_BETWEEN_CHECKS)
             continue
-
         symbol, price, volume, change = coin
-        notify(f"🎯 Selected {symbol} for market buy (24h change={change:.2f}%, volume≈{volume})")
-
+        notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, volume≈{volume})")
         usd_to_buy = min(TRADE_USD, get_free_usdt())
         if usd_to_buy < 1.0:
             notify("⚠️ Not enough USDT to buy. Waiting 60s...")
             time.sleep(SLEEP_BETWEEN_CHECKS)
             continue
-
         try:
-            qty, buy_price = place_safe_market_buy(symbol, usd_to_buy)
-            notify(f"💰 Market buy executed for {symbol}: qty={qty}, price={buy_price:.8f}")
-
-            # Small price coins: set sl_cents lower
-            sl_cents = 0.00005 if buy_price < 0.01 else 0.005
-            stop_order = place_fixed_stop_market_sell(symbol, qty, buy_price, sl_cents=sl_cents)
-
-            if stop_order:
-                notify(f"📌 Stop market SELL order placed for {symbol} at ~{buy_price-sl_cents:.8f}")
-
+            place_safe_market_buy(symbol, usd_to_buy)
         except Exception as e:
-            notify(f"❌ Trade cycle failed for {symbol}: {e}")
-
+            notify(f"❌ Market buy failed: {e}")
         time.sleep(COOLDOWN_AFTER_EXIT)
 
 # =========================
