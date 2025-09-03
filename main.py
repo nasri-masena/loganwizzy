@@ -99,7 +99,7 @@ def pick_coin():
         return None
     candidates.sort(key=lambda x: x[2]*x[3], reverse=True)
     return candidates[0]
-
+    
 # =========================
 # MARKET BUY
 # =========================
@@ -135,6 +135,15 @@ def place_safe_market_buy(symbol, usd_amount):
 # =========================
 # OCO SELL
 # =========================
+def format_price(value, tick_size):
+    """Format price kulingana na tick_size decimals"""
+    decimals = str(tick_size).rstrip('0')
+    if '.' in decimals:
+        precision = len(decimals.split('.')[1])
+    else:
+        precision = 0
+    return f"{value:.{precision}f}"
+
 def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
@@ -144,6 +153,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
     stop_price  = buy_price * (1 - sl_pct/100.0)
     stop_limit  = stop_price * (1 - 0.002)  # ~0.2% chini ya stop
 
+    # clip helper
     def clip(v, step):
         return math.floor(v / step) * step
 
@@ -155,6 +165,11 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
     if qty <= 0:
         raise RuntimeError("❌ Quantity too small for OCO order")
 
+    # format values kwa decimal sahihi
+    tp_str = format_price(tp, f['tickSize'])
+    sp_str = format_price(sp, f['tickSize'])
+    sl_str = format_price(sl, f['tickSize'])
+
     try:
         order = client.create_oco_order(
             symbol=symbol,
@@ -163,15 +178,15 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
 
             # --- ABOVE (take profit) ---
             aboveType="LIMIT_MAKER",
-            abovePrice=str(tp),
+            abovePrice=tp_str,
 
             # --- BELOW (stop loss) ---
             belowType="STOP_LOSS_LIMIT",
-            belowStopPrice=str(sp),
-            belowPrice=str(sl),
+            belowStopPrice=sp_str,
+            belowPrice=sl_str,
             belowTimeInForce="GTC"
         )
-        notify(f"📌 OCO SELL placed: TP={tp}, SL={sp}/{sl}, qty={qty}")
+        notify(f"📌 OCO SELL placed: TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty}")
         return order
     except Exception as e:
         notify(f"❌ OCO SELL failed: {e}")
@@ -187,19 +202,27 @@ def trade_cycle():
             notify("⚠️ No coins meet criteria. Waiting 60s...")
             time.sleep(SLEEP_BETWEEN_CHECKS)
             continue
+
         symbol, price, volume, change = coin
         notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, volume≈{volume})")
+
         usd_to_buy = min(TRADE_USD, get_free_usdt())
         if usd_to_buy < 1.0:
             notify("⚠️ Not enough USDT to buy. Waiting 60s...")
             time.sleep(SLEEP_BETWEEN_CHECKS)
             continue
-        try:
-            place_safe_market_buy(symbol, usd_to_buy)
-        except Exception as e:
-            notify(f"❌ Market buy failed: {e}")
-        time.sleep(COOLDOWN_AFTER_EXIT)
 
+        try:
+            qty, buy_price = place_safe_market_buy(symbol, usd_to_buy)
+
+            # immediately place OCO sell order
+            place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0)
+
+        except Exception as e:
+            notify(f"❌ Market buy or OCO SELL failed: {e}")
+
+        time.sleep(COOLDOWN_AFTER_EXIT)
+        
 # =========================
 # FLASK KEEPALIVE
 # =========================
