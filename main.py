@@ -121,7 +121,7 @@ def get_tickers_cached():
         LAST_FETCH = now
     return TICKER_CACHE
 
-def pick_symbols_multi(top_n=5):
+def pick_symbols_multi(top_n=1):
     tickers = get_tickers_cached()
     candidates = []
     for t in tickers:
