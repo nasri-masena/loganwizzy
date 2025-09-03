@@ -127,11 +127,11 @@ def place_safe_market_buy(symbol, usd_amount):
     order = client.order_market_buy(symbol=symbol, quantity=qty)
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
 
-    # 🔥 Immediately place OCO SELL (TP +3%, SL -1%)
-    place_oco_sell(symbol, qty, price, tp_pct=3.0, sl_pct=1.0)
+    # 🔥 Immediately place TP + SL (Spot-friendly)
+    place_tp_and_sl_market(symbol, qty, price, tp_pct=TP_PCT, sl_pct=SL_PCT)
 
     return qty, price
-
+    
 # =========================
 # OCO SELL
 # =========================
@@ -144,25 +144,17 @@ def format_price(value, tick_size):
         precision = 0
     return f"{value:.{precision}f}"
 
-def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.5, retries=3, delay=2):
+def place_tp_and_sl_market(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.8):
+    """
+    Place Take Profit (LIMIT) and Stop Loss (MARKET) separately on Spot market.
+    TP = Limit sell, SL = Stop Market sell
+    """
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
-
-    # target prices
-    take_profit = buy_price * (1 + tp_pct/100.0)
-    stop_price  = buy_price * (1 - sl_pct/100.0)
 
     def clip(v, step):
         return math.floor(v / step) * step
 
-    qty = clip(qty, f['stepSize'])
-    tp  = clip(take_profit, f['tickSize'])
-    sp  = clip(stop_price,  f['tickSize'])
-
-    if qty <= 0:
-        raise RuntimeError("❌ Quantity too small for OCO order")
-
-    # format prices
     def format_price(value, tick_size):
         decimals = str(tick_size).rstrip('0')
         if '.' in decimals:
@@ -171,34 +163,29 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.5, retries=3, de
             precision = 0
         return f"{value:.{precision}f}"
 
-    tp_str = format_price(tp, f['tickSize'])
-    sp_str = format_price(sp, f['tickSize'])
+    # Take Profit (Limit)
+    tp_price = clip(buy_price * (1 + tp_pct/100.0), f['tickSize'])
+    tp_str   = format_price(tp_price, f['tickSize'])
+    try:
+        tp_order = client.order_limit_sell(symbol=symbol, quantity=str(qty), price=tp_str)
+        notify(f"📈 TP LIMIT placed: {tp_str}, qty={qty}")
+    except Exception as e:
+        notify(f"❌ TP LIMIT failed: {e}")
 
-    # retry loop
-    for attempt in range(1, retries+1):
-        try:
-            order = client.create_oco_order(
-                symbol=symbol,
-                side="SELL",
-                quantity=str(qty),
-
-                # ABOVE TP = LIMIT_MAKER
-                aboveType="LIMIT_MAKER",
-                abovePrice=tp_str,
-
-                # BELOW SL = MARKET
-                belowType="STOP_MARKET",
-                belowStopPrice=sp_str
-            )
-            notify(f"📌 OCO SELL placed ✅ TP={tp_str}, SL={sp_str} (MARKET), qty={qty}")
-            return order
-        except Exception as e:
-            notify(f"⚠️ OCO SELL attempt {attempt} failed: {e}")
-            if attempt < retries:
-                time.sleep(delay)
-            else:
-                notify("❌ OCO SELL failed after retries.")
-                return None
+    # Stop Loss (Stop Market)
+    sl_price = clip(buy_price * (1 - sl_pct/100.0), f['tickSize'])
+    sl_str   = format_price(sl_price, f['tickSize'])
+    try:
+        sl_order = client.create_order(
+            symbol=symbol,
+            side="SELL",
+            type="STOP_MARKET",
+            stopPrice=sl_str,
+            quantity=str(qty)
+        )
+        notify(f"📉 SL MARKET placed: trigger={sl_str}, qty={qty}")
+    except Exception as e:
+        notify(f"❌ SL MARKET failed: {e}")
         
 # =========================
 # MAIN LOOP
@@ -221,13 +208,14 @@ def trade_cycle():
             continue
 
         try:
+            # place market buy
             qty, buy_price = place_safe_market_buy(symbol, usd_to_buy)
 
-            # immediately place OCO sell order
-            place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0)
+            # immediately place TP + SL (Spot-friendly)
+            place_tp_and_sl_market(symbol, qty, buy_price, tp_pct=TP_PCT, sl_pct=SL_PCT)
 
         except Exception as e:
-            notify(f"❌ Market buy or OCO SELL failed: {e}")
+            notify(f"❌ Market buy or TP/SL placement failed: {e}")
 
         time.sleep(COOLDOWN_AFTER_EXIT)
         
