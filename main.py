@@ -21,26 +21,20 @@ PRICE_MAX = 3.0
 MIN_VOLUME = 5_000_000
 MOVEMENT_MIN_PCT = 3.0
 
-TRADE_USD = 8.0
-SLEEP_BETWEEN_CHECKS = 15
-COOLDOWN_AFTER_EXIT = 10
-MAX_ACTIVE_TRADES = 1
+TRADE_USD = 8.0  # ⚡ test amount
+SLEEP_BETWEEN_CHECKS = 60
+COOLDOWN_AFTER_EXIT = 30
 
 # =========================
 # INIT
 # =========================
 client = Client(API_KEY, API_SECRET)
 LAST_NOTIFY = 0
-active_trades = []
-start_balance_usdt = None
 
-# =========================
-# UTILS
-# =========================
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
-    if now_ts - LAST_NOTIFY < 2:
+    if now_ts - LAST_NOTIFY < 2:  # short throttle for testing
         return
     LAST_NOTIFY = now_ts
     text = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -72,38 +66,11 @@ def get_filters(symbol_info):
     }
 
 # =========================
-# FUNDING WALLET TRANSFER
-# =========================
-def send_profit_to_funding(amount, asset='USDT'):
-    try:
-        result = client.universal_transfer(
-            type='SPOT_TO_FUNDING',
-            asset=asset,
-            amount=amount
-        )
-        notify(f"💸 Profit ${amount:.6f} transferred to funding wallet.")
-        return result
-    except Exception as e:
-        notify(f"❌ Failed to transfer profit: {e}")
-        return None
-        
-def handle_profit_transfer():
-    global start_balance_usdt
-    current_balance = get_free_usdt()
-    if start_balance_usdt is None:
-        start_balance_usdt = current_balance
-        return
-    profit = current_balance - start_balance_usdt
-    if profit > 0:
-        send_profit_to_funding(profit)
-        start_balance_usdt = get_free_usdt()
-
-# =========================
-# SYMBOL PICKING
+# SYMBOL SELECTION
 # =========================
 TICKER_CACHE = None
 LAST_FETCH = 0
-CACHE_TTL = 30
+CACHE_TTL = 30  # seconds
 
 def get_tickers_cached():
     global TICKER_CACHE, LAST_FETCH
@@ -113,7 +80,7 @@ def get_tickers_cached():
         LAST_FETCH = now
     return TICKER_CACHE
 
-def pick_symbols_multi(top_n=1):
+def pick_coin():
     tickers = get_tickers_cached()
     candidates = []
     for t in tickers:
@@ -123,15 +90,16 @@ def pick_symbols_multi(top_n=1):
         try:
             price = float(t['lastPrice'])
             volume = float(t['quoteVolume'])
-            change_pct = abs(float(t['priceChangePercent']))
+            change_pct = float(t['priceChangePercent'])
             if PRICE_MIN <= price <= PRICE_MAX and volume >= MIN_VOLUME and change_pct >= MOVEMENT_MIN_PCT:
-                score = volume * change_pct
-                candidates.append((sym, price, volume, change_pct, score))
+                candidates.append((sym, price, volume, change_pct))
         except:
             continue
-    candidates.sort(key=lambda x: x[-1], reverse=True)
-    return candidates[:top_n]
-
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[2]*x[3], reverse=True)
+    return candidates[0]
+    
 # =========================
 # MARKET BUY
 # =========================
@@ -159,7 +127,7 @@ def place_safe_market_buy(symbol, usd_amount):
     order = client.order_market_buy(symbol=symbol, quantity=qty)
     notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
 
-    # 🔥 Immediately place OCO SELL
+    # 🔥 Immediately place OCO SELL (TP +3%, SL -1%)
     place_oco_sell(symbol, qty, price, tp_pct=3.0, sl_pct=1.0)
 
     return qty, price
@@ -168,6 +136,7 @@ def place_safe_market_buy(symbol, usd_amount):
 # OCO SELL
 # =========================
 def format_price(value, tick_size):
+    """Format price kulingana na tick_size decimals"""
     decimals = str(tick_size).rstrip('0')
     if '.' in decimals:
         precision = len(decimals.split('.')[1])
@@ -179,10 +148,12 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.5, retries=3, de
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
 
+    # target prices
     take_profit = buy_price * (1 + tp_pct/100.0)
     stop_price  = buy_price * (1 - sl_pct/100.0)
-    stop_limit  = stop_price * (1 - 0.002)
+    stop_limit  = stop_price * (1 - 0.002)  # ~0.2% chini ya stop
 
+    # clip helper
     def clip(v, step):
         return math.floor(v / step) * step
 
@@ -194,20 +165,28 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.5, retries=3, de
     if qty <= 0:
         raise RuntimeError("❌ Quantity too small for OCO order")
 
+    # format values sahihi
     tp_str = format_price(tp, f['tickSize'])
     sp_str = format_price(sp, f['tickSize'])
     sl_str = format_price(sl, f['tickSize'])
 
+    # Retry loop
     for attempt in range(1, retries+1):
         try:
             order = client.create_oco_order(
                 symbol=symbol,
                 side="SELL",
                 quantity=str(qty),
-                price=tp_str,
-                stopPrice=sp_str,
-                stopLimitPrice=sl_str,
-                stopLimitTimeInForce="GTC"
+
+                # --- ABOVE (take profit) ---
+                aboveType="LIMIT_MAKER",
+                abovePrice=tp_str,
+
+                # --- BELOW (stop loss) ---
+                belowType="STOP_LOSS_LIMIT",
+                belowStopPrice=sp_str,
+                belowPrice=sl_str,
+                belowTimeInForce="GTC"
             )
             notify(f"📌 OCO SELL placed ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty}")
             return order
@@ -218,57 +197,52 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.5, retries=3, de
             else:
                 notify("❌ OCO SELL failed after retries.")
                 return None
-
+        
 # =========================
-# TRADE CYCLE
+# MAIN LOOP
 # =========================
 def trade_cycle():
-    global active_trades
     while True:
+        coin = pick_coin()
+        if not coin:
+            notify("⚠️ No coins meet criteria. Waiting 60s...")
+            time.sleep(SLEEP_BETWEEN_CHECKS)
+            continue
+
+        symbol, price, volume, change = coin
+        notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, volume≈{volume})")
+
+        usd_to_buy = min(TRADE_USD, get_free_usdt())
+        if usd_to_buy < 1.0:
+            notify("⚠️ Not enough USDT to buy. Waiting 60s...")
+            time.sleep(SLEEP_BETWEEN_CHECKS)
+            continue
+
         try:
-            if len(active_trades) >= MAX_ACTIVE_TRADES:
-                time.sleep(5)
-                continue
+            qty, buy_price = place_safe_market_buy(symbol, usd_to_buy)
 
-            syms = pick_symbols_multi(top_n=1)
-            if not syms:
-                notify("⚠️ No symbol candidates found.")
-                time.sleep(10)
-                continue
-
-            sym, price, _, _, _ = syms[0]
-            free_usdt = get_free_usdt()
-            if free_usdt < TRADE_USD:
-                notify(f"⚠️ Not enough USDT to trade. Free={free_usdt:.2f}")
-                time.sleep(30)
-                continue
-
-            qty, entry_price = place_safe_market_buy(sym, TRADE_USD)
-            active_trades.append({"symbol": sym, "qty": qty, "entry": entry_price})
-
-            time.sleep(COOLDOWN_AFTER_EXIT)
-            handle_profit_transfer()
-
-            notify("⏳ Subiri sekunde 15 kabla ya cycle mpya...")
-            time.sleep(15)
+            # immediately place OCO sell order
+            place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.5)
 
         except Exception as e:
-            notify(f"❌ Error in trade cycle: {e}")
-            time.sleep(10)
+            notify(f"❌ Market buy or OCO SELL failed: {e}")
 
+        time.sleep(COOLDOWN_AFTER_EXIT)
+        
 # =========================
-# FLASK SERVER
+# FLASK KEEPALIVE
 # =========================
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return "Bot running! ✅"
 
 def start_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=5000)
 
 # =========================
-# START
+# RUN THREADS
 # =========================
 if __name__ == "__main__":
     bot_thread = threading.Thread(target=trade_cycle, daemon=True)
