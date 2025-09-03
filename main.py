@@ -144,33 +144,37 @@ def format_price(value, tick_size):
         precision = 0
     return f"{value:.{precision}f}"
 
-def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0, retries=3, delay=2):
+def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.5, retries=3, delay=2):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
 
     # target prices
     take_profit = buy_price * (1 + tp_pct/100.0)
     stop_price  = buy_price * (1 - sl_pct/100.0)
-    stop_limit  = stop_price * (1 - 0.002)  # ~0.2% chini ya stop
 
-    # clip helper
     def clip(v, step):
         return math.floor(v / step) * step
 
     qty = clip(qty, f['stepSize'])
     tp  = clip(take_profit, f['tickSize'])
     sp  = clip(stop_price,  f['tickSize'])
-    sl  = clip(stop_limit,  f['tickSize'])
 
     if qty <= 0:
         raise RuntimeError("❌ Quantity too small for OCO order")
 
-    # format values sahihi
+    # format prices
+    def format_price(value, tick_size):
+        decimals = str(tick_size).rstrip('0')
+        if '.' in decimals:
+            precision = len(decimals.split('.')[1])
+        else:
+            precision = 0
+        return f"{value:.{precision}f}"
+
     tp_str = format_price(tp, f['tickSize'])
     sp_str = format_price(sp, f['tickSize'])
-    sl_str = format_price(sl, f['tickSize'])
 
-    # Retry loop
+    # retry loop
     for attempt in range(1, retries+1):
         try:
             order = client.create_oco_order(
@@ -178,17 +182,15 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0, retries=3, de
                 side="SELL",
                 quantity=str(qty),
 
-                # --- ABOVE (take profit) ---
+                # ABOVE TP = LIMIT_MAKER
                 aboveType="LIMIT_MAKER",
                 abovePrice=tp_str,
 
-                # --- BELOW (stop loss) ---
-                belowType="STOP_LOSS_LIMIT",
-                belowStopPrice=sp_str,
-                belowPrice=sl_str,
-                belowTimeInForce="GTC"
+                # BELOW SL = MARKET
+                belowType="STOP_MARKET",
+                belowStopPrice=sp_str
             )
-            notify(f"📌 OCO SELL placed ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty}")
+            notify(f"📌 OCO SELL placed ✅ TP={tp_str}, SL={sp_str} (MARKET), qty={qty}")
             return order
         except Exception as e:
             notify(f"⚠️ OCO SELL attempt {attempt} failed: {e}")
