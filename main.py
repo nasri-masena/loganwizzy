@@ -1,9 +1,10 @@
 import os
-import math
 import time
+import math
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask
 from binance.client import Client
 
@@ -14,61 +15,85 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-QUOTE = "USDT"
 
-PRICE_MIN = 1.0
-PRICE_MAX = 3.0
-MIN_VOLUME = 5_000_000
-MOVEMENT_MIN_PCT = 3.0
+PRICE_MIN = float(os.getenv("PRICE_MIN", "1.0"))
+PRICE_MAX = float(os.getenv("PRICE_MAX", "3.0"))
+QUOTE = os.getenv("QUOTE", "USDT")
 
-TRADE_USD = 8.0
-SLEEP_BETWEEN_CHECKS = 15
-COOLDOWN_AFTER_EXIT = 10
-STEP_INCREMENT_PCT = 0.03
-TRIGGER_PROXIMITY = 0.04
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
+DAILY_TARGET_PCT = float(os.getenv("DAILY_TARGET_PCT", "0.20"))
+MOVEMENT_MIN_PCT = float(os.getenv("MOVEMENT_MIN_PCT", "3.0"))
 
-MAX_ACTIVE_TRADES = 1  # trades in parallel
+INITIAL_TP_PCT = float(os.getenv("INITIAL_TP_PCT", "0.20"))
+INITIAL_SL_PCT = float(os.getenv("INITIAL_SL_PCT", "0.05"))
+STEP_INCREMENT_PCT = float(os.getenv("STEP_INCREMENT_PCT", "0.03"))
+TRIGGER_PROXIMITY = float(os.getenv("TRIGGER_PROXIMITY", "0.04"))
+
+MIN_QUOTE_VOLUME_USD = float(os.getenv("MIN_QUOTE_VOLUME_USD", "5000000"))
+
+SLEEP_BETWEEN_CHECKS = int(os.getenv("SLEEP_BETWEEN_CHECKS", "15"))
+COOLDOWN_AFTER_EXIT = int(os.getenv("COOLDOWN_AFTER_EXIT", "30"))
+
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Africa/Dar_es_Salaam"))
 
 # =========================
 # INIT
 # =========================
 client = Client(API_KEY, API_SECRET)
-LAST_NOTIFY = 0
-active_trades = []
-LOCKED_SYMBOL = None
 start_balance_usdt = None
+paused_until = None
 
 # =========================
 # UTILITIES
 # =========================
+LAST_NOTIFY = 0
+
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
-    if now_ts - LAST_NOTIFY < 2:
+    if now_ts - LAST_NOTIFY < 15:  # Throttle: send only if 10s passed
         return
     LAST_NOTIFY = now_ts
-    text = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+
+    t = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    text = f"[{t}] {msg}"
     print(text)
     if BOT_TOKEN and CHAT_ID:
         try:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          data={"chat_id": CHAT_ID, "text": text})
-        except:
-            pass
-
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+        except Exception as e:
+            print("Telegram notify error:", e)
+            
 def get_free_usdt():
     try:
         bal = client.get_asset_balance(asset=QUOTE)
         return float(bal['free'])
-    except:
+    except Exception:
         return 0.0
 
 def get_free_asset(asset):
     try:
         bal = client.get_asset_balance(asset=asset)
         return float(bal['free'])
-    except:
+    except Exception:
         return 0.0
+
+def next_midnight_local():
+    now = datetime.now(LOCAL_TZ)
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return tomorrow
+
+def compute_trade_amount():
+    free = get_free_usdt()
+    usd_amount = min(10.0, free)
+    return max(usd_amount, 1.0)
+
+def round_step(n, step):
+    return math.floor(n / step) * step if step else n
+
+def round_price(p, tick):
+    return math.floor(p / tick) * tick if tick else p
 
 def get_filters(symbol_info):
     fs = {f['filterType']: f for f in symbol_info['filters']}
@@ -81,127 +106,19 @@ def get_filters(symbol_info):
         'tickSize': float(pricef['tickSize']),
         'minNotional': float(min_notional) if min_notional else None
     }
-
-def round_step(n, step):
-    return math.floor(n / step) * step if step else n
-
-def round_price(p, tick):
-    return math.floor(p / tick) * tick if tick else p
-
-# =========================
-# FUNDING WALLET TRANSFER
-# =========================
-def send_profit_to_funding(amount, asset='USDT'):
-    try:
-        result = client.universal_transfer(
-            type='SPOT_TO_FUNDING',
-            asset=asset,
-            amount=amount
-        )
-        notify(f"💸 Profit ${amount:.6f} transferred to funding wallet.")
-        return result
-    except Exception as e:
-        notify(f"❌ Failed to transfer profit: {e}")
-        return None
-        
-def handle_daily_profit():
-    global start_balance_usdt
-    current_balance = get_free_usdt()
-    profit = current_balance - start_balance_usdt
-    if profit > 0:
-        send_profit_to_funding(profit)
-        start_balance_usdt = get_free_usdt()  # reset baseline
-
-# =========================
-# SYMBOL PICKING
-# =========================
+# ===== REST load-shedding / caching =====
 TICKER_CACHE = None
-LAST_FETCH = 0
-CACHE_TTL = 30
+LAST_TICKER_FETCH = 0.0
+TICKER_TTL = 60.0  # sekunde; update mara 1 kwa dakika
 
 def get_tickers_cached():
-    global TICKER_CACHE, LAST_FETCH
+    """Rudisha 24h tickers kwa cache ili kupunguza weight."""
+    global TICKER_CACHE, LAST_TICKER_FETCH
     now = time.time()
-    if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
+    if TICKER_CACHE is None or (now - LAST_TICKER_FETCH) > TICKER_TTL:
         TICKER_CACHE = client.get_ticker()
-        LAST_FETCH = now
+        LAST_TICKER_FETCH = now
     return TICKER_CACHE
-
-def pick_symbols_multi(top_n=1):
-    tickers = get_tickers_cached()
-    candidates = []
-    for t in tickers:
-        sym = t['symbol']
-        if not sym.endswith(QUOTE):
-            continue
-        try:
-            price = float(t['lastPrice'])
-            volume = float(t['quoteVolume'])
-            change_pct = abs(float(t['priceChangePercent']))
-            if PRICE_MIN <= price <= PRICE_MAX and volume >= MIN_VOLUME and change_pct >= MOVEMENT_MIN_PCT:
-                score = volume * change_pct
-                candidates.append((sym, price, volume, change_pct, score))
-        except:
-            continue
-    candidates.sort(key=lambda x: x[-1], reverse=True)
-    return candidates[:top_n]
-
-# =========================
-# MARKET BUY
-# =========================
-def place_market_buy(symbol, usd_amount):
-    info = client.get_symbol_info(symbol)
-    f = get_filters(info)
-    price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-
-    qty = usd_amount / price
-    qty = max(qty, f['minQty'])
-    qty = round_step(qty, f['stepSize'])
-
-    if f['minNotional']:
-        notional = qty * price
-        if notional < f['minNotional']:
-            needed_qty = round_step(f['minNotional']/price, f['stepSize'])
-            free_usdt = get_free_usdt()
-            if needed_qty * price > free_usdt + 1e-8:
-                raise RuntimeError("Not enough funds for MIN_NOTIONAL")
-            qty = needed_qty
-
-    order = client.order_market_buy(symbol=symbol, quantity=qty)
-    notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f}")
-    return qty, price, f
-
-# =========================
-# OCO SELL
-# =========================
-def format_price(value, tick_size):
-    decimals = str(tick_size).rstrip('0')
-    if '.' in decimals:
-        precision = len(decimals.split('.')[1])
-    else:
-        precision = 0
-    return f"{value:.{precision}f}"
-
-def place_oco_order(symbol, qty, entry_price, f, tp_pct=0.03, sl_pct=0.01):
-    tp_price = round_price(entry_price * (1 + tp_pct), f['tickSize'])
-    sl_price = round_price(entry_price * (1 - sl_pct), f['tickSize'])
-    stop_limit_price = round_price(sl_price * 0.999, f['tickSize'])
-
-    try:
-        oco = client.create_oco_order(
-            symbol=symbol,
-            side='SELL',
-            quantity=str(qty),
-            price=str(tp_price),
-            stopPrice=str(sl_price),
-            stopLimitPrice=str(stop_limit_price),
-            stopLimitTimeInForce='GTC'
-        )
-        notify(f"📌 OCO set for {symbol}: SL={sl_price}, TP={tp_price}, qty={qty}")
-        return {'tp': tp_price, 'sl': sl_price}
-    except Exception as e:
-        notify(f"❌ Failed to place OCO: {e}")
-        return None
 
 def cancel_all_open_orders(symbol):
     try:
@@ -210,30 +127,119 @@ def cancel_all_open_orders(symbol):
         notify(f"Cancel open orders error on {symbol}: {e}")
 
 # =========================
-# MONITOR & ROLL
+# SYMBOL PICKER
 # =========================
-def monitor_and_roll(symbol, qty, entry_price, f):
-    state = place_oco_order(symbol, qty, entry_price, f)
-    if state is None:
-        return False, entry_price, 0.0
+def pick_symbols_multi(top_n=1, price_min=PRICE_MIN, price_max=PRICE_MAX,
+                       min_volume=MIN_QUOTE_VOLUME_USD, movement_min_pct=MOVEMENT_MIN_PCT):
+    tickers = get_tickers_cached()
+    candidates = []
 
+    for t in tickers:
+        sym = t['symbol']
+        if not sym.endswith(QUOTE):  # tuangalie tu USDT pairs
+            continue
+        try:
+            price = float(t['lastPrice'])
+            volume = float(t['quoteVolume'])
+            change = abs(float(t['priceChangePercent']))
+
+            if price_min <= price <= price_max and volume >= min_volume and change >= movement_min_pct:
+                score = change * volume
+                candidates.append((sym, price, volume, change, score))
+        except:
+            continue
+
+    # Sort kwa score (highest first)
+    candidates.sort(key=lambda x: x[-1], reverse=True)
+    return candidates[:top_n]
+    
+# =========================
+# TRADING FUNCTIONS
+# =========================
+def place_safe_market_buy(symbol, usd_amount):
+    info = client.get_symbol_info(symbol)
+    f = get_filters(info)
+    price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+
+    # Compute qty based on price and usd_amount
+    qty = usd_amount / price
+    qty = max(qty, f['minQty'])
+    qty = round_step(qty, f['stepSize'])
+    qty = float(f"{qty:.8f}")
+
+    # Ensure minNotional
+    if f['minNotional']:
+        notional = qty * price
+        if notional < f['minNotional']:
+            needed_qty = round_step(f['minNotional'] / price, f['stepSize'])
+            free_usdt = get_free_usdt()
+            if needed_qty * price > free_usdt + 1e-8:
+                raise RuntimeError(
+                    f"Not enough funds to meet MIN_NOTIONAL (${f['minNotional']:.2f}). "
+                    f"Free=${free_usdt:.2f}, need≈${needed_qty*price:.2f}"
+                )
+            qty = needed_qty
+
+    order = client.order_market_buy(symbol=symbol, quantity=qty)
+    notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
+    return qty, price, f
+
+def place_safe_oco(symbol, intended_qty, entry_price, f):
+    # Adjust qty
+    free_qty = get_free_asset(symbol[:-len(QUOTE)])
+    qty = min(intended_qty, free_qty)
+    qty = max(round_step(qty, f['stepSize']), f['minQty'])
+
+    # Adjust TP/SL prices
+    tp_price = round_price(entry_price * (1 + INITIAL_TP_PCT), f['tickSize'])
+    sl_price = round_price(entry_price * (1 - INITIAL_SL_PCT), f['tickSize'])
+    stop_limit_price = round_price(sl_price * 0.999, f['tickSize'])
+
+    # Ensure minNotional
+    if f['minNotional']:
+        notional = qty * tp_price
+        if notional < f['minNotional']:
+            needed_qty = round_step(f['minNotional'] / tp_price, f['stepSize'])
+            qty = min(needed_qty, free_qty)
+
+    # Place OCO
+    try:
+        oco = client.create_oco_order(
+            symbol=symbol,
+            side='SELL',
+            quantity=qty,
+            price=str(tp_price),
+            stopPrice=str(sl_price),
+            stopLimitPrice=str(stop_limit_price),
+            stopLimitTimeInForce='GTC'
+        )
+        notify(f"📌 OCO set for {symbol}: SL={sl_price}, TP={tp_price}, qty={qty}")
+        return {'tp': tp_price, 'sl': sl_price, 'orderListId': oco.get('orderListId')}
+    except Exception as e:
+        notify(f"❌ Failed to place OCO for {symbol}: {e}")
+        return None
+
+def monitor_and_roll(symbol, qty, entry_price, f):
+    # Set initial OCO
+    state = place_oco_order(symbol, qty, entry_price, f)
     last_tp = None
     active = True
+
     while active:
         time.sleep(SLEEP_BETWEEN_CHECKS)
-        free_qty = get_free_asset(symbol[:-len(QUOTE)])
+        asset = symbol[:-len(QUOTE)]
+        free_qty = get_free_asset(asset)
         open_orders = client.get_open_orders(symbol=symbol)
         price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
 
-        # Position closed
+        # Check kama position imefungwa
         if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
             exit_price = price_now
             profit_usd = (exit_price - entry_price) * qty
             notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
-            active_trades[:] = [t for t in active_trades if t['symbol'] != symbol]
             return True, exit_price, profit_usd
 
-        # Roll TP/SL
+        # Roll TP/SL kama price iko karibu na TP
         near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
         if near_trigger:
             cancel_all_open_orders(symbol)
@@ -241,85 +247,195 @@ def monitor_and_roll(symbol, qty, entry_price, f):
             new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
             last_tp = state['tp']
             state = place_oco_order(symbol, free_qty, new_tp, f)
-            if state:
-                notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (price≈{price_now:.8f})")
+            notify(f"🔁 Rolled OCO for {symbol}: new SL={state['sl']:.8f}, new TP={state['tp']:.8f} (price≈{price_now:.8f})")
+            
+# =========================
+# DAILY TARGET
+# =========================
+def get_current_total_balance():
+    return get_free_usdt()
+
+def check_daily_target_and_pause():
+    global paused_until, start_balance_usdt
+    if start_balance_usdt is None:
+        return False
+    current = get_current_total_balance()
+    profit_pct = (current - start_balance_usdt) / start_balance_usdt
+    if profit_pct >= DAILY_TARGET_PCT:
+        paused_until = next_midnight_local()
+        notify(f"🚀 Daily Target Achieved: {profit_pct*100:.2f}%. Pausing until {paused_until.isoformat()}")
+        return True
+    return False
 
 # =========================
-# MAIN LOOP
+# ACTIVE TRADES TRACKER
 # =========================
+MAX_ACTIVE_TRADES = 1
+active_trades = []
+
+# =========================
+# MAIN CYCLE (update)
+# =========================
+LOCKED_SYMBOL = None
+
 def trade_cycle():
-    global LOCKED_SYMBOL, start_balance_usdt, active_trades
+    global start_balance_usdt, paused_until, active_trades, LOCKED_SYMBOL
 
     if start_balance_usdt is None:
-        start_balance_usdt = get_free_usdt()
+        start_balance_usdt = get_current_total_balance()
         notify(f"🔰 Start balance recorded: ${start_balance_usdt:.6f}")
 
+    now = datetime.now(LOCAL_TZ)
+    if paused_until and now < paused_until:
+        notify(f"⏸️ Bot paused until {paused_until.isoformat()}, sleeping 60s.")
+        time.sleep(60)
+        return
+
+    if paused_until and now >= paused_until:
+        paused_until = None
+        start_balance_usdt = get_current_total_balance()
+        notify(f"🔁 New day: baseline reset to ${start_balance_usdt:.6f}")
+
+    # Usiruhusu zaidi ya trade moja
+    if len(active_trades) > 0:
+        notify("⏳ Trade in progress, skipping new buys.")
+        return
+
+    # Chagua coin moja tu (ile ya juu kwenye list) na lock
+    if LOCKED_SYMBOL is None:
+        candidates = pick_symbols_multi(top_n=1)
+        if not candidates:
+            notify("⚠️ No coins meet filters. Sleeping 10s.")
+            time.sleep(10)
+            return
+        symbol, price, qvol, chg, score = candidates[0]
+        LOCKED_SYMBOL = symbol
+    else:
+        symbol = LOCKED_SYMBOL
+
+    notify(f"🎯 Selected {symbol}")
+
+    # Trade amount: ignore low balance warning
+    trade_usd = max(min(19.0, get_current_total_balance()), 0.01)
+
+    # === Step 1: Market Buy ===
+    try:
+        qty, entry_price, f = place_market_buy(symbol, trade_usd)
+        active_trades.append({
+            'symbol': symbol,
+            'qty': qty,
+            'entry_price': entry_price,
+            'filters': f
+        })
+        notify(f"✅ Buy success: {symbol}, qty={qty}, entry={entry_price:.8f}")
+        time.sleep(2)  # 🕒 delay kidogo kabla ya OCO
+    except Exception as e:
+        notify(f"❌ Buy failed for {symbol}: {e}")
+        LOCKED_SYMBOL = None  # unlock coin ili next cycle ijaribu nyingine
+        return
+
+    # === Step 2: Place OCO ===
+    try:
+        state = place_oco_order(symbol, qty, entry_price, f)
+        notify(f"✅ OCO order placed for {symbol}")
+    except Exception as e:
+        notify(f"❌ OCO failed for {symbol}: {e}")
+        active_trades = [t for t in active_trades if t['symbol'] != symbol]
+        LOCKED_SYMBOL = None
+        return
+
+    # === Step 3: Monitoring & Rolling ===
+    last_tp = None
+    active = True
+    while active:
+        time.sleep(SLEEP_BETWEEN_CHECKS)
+        asset = symbol[:-len(QUOTE)]
+        free_qty = get_free_asset(asset)
+        open_orders = client.get_open_orders(symbol=symbol)
+        price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
+
+        # Check kama position imefungwa
+        if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
+            exit_price = price_now
+            profit_usd = (exit_price - entry_price) * qty
+            notify(f"✅ Position closed for {symbol}: profit ≈ ${profit_usd:.6f}")
+            active = False
+            break
+
+        # Roll TP/SL kama price iko karibu na TP
+        near_trigger = price_now >= state['tp'] * (1 - TRIGGER_PROXIMITY)
+        if near_trigger:
+            cancel_all_open_orders(symbol)
+            new_sl = entry_price if last_tp is None else last_tp
+            new_tp = state['tp'] * (1 + STEP_INCREMENT_PCT)
+            last_tp = state['tp']
+            state = place_oco_order(symbol, free_qty, new_tp, f)
+            notify(
+                f"🔁 Rolled OCO for {symbol}: "
+                f"new SL={state['sl']:.8f}, new TP={state['tp']:.8f} "
+                f"(price≈{price_now:.8f})"
+            )
+
+    # === Step 4: Safisha trade list na unlock ===
+    active_trades = [t for t in active_trades if t['symbol'] != symbol]
+    LOCKED_SYMBOL = None  # unlock coin baada ya OCO ifikie
+    check_daily_target_and_pause()
+    time.sleep(COOLDOWN_AFTER_EXIT)
+    
+# =========================
+# RUN FOREVER WITH THREADING
+# =========================
+def run_forever():
+    notify("🤖 Scalper OCO bot started.")
+    soft_backoff = 90    # sekunde ukipigwa "Too much request weight"
+    hard_backoff = 600   # sekunde ukipigwa "IP banned"
+    
     while True:
         try:
-            # Haitaongeza trade mpya ikiwa kuna active trade
-            if len(active_trades) >= MAX_ACTIVE_TRADES:
-                time.sleep(5)
+            trade_cycle()
+        except Exception as e:
+            msg = str(e)
+            
+            # Binance weight/IP issues
+            if "-1003" in msg or "Too many requests" in msg:
+                if "IP banned" in msg or "too many requests" in msg.lower():
+                    notify("⛔ IP banned (weight). Pausing hard to cool down.")
+                    time.sleep(hard_backoff)
+                else:
+                    notify("⚠️ Weight limit hit. Cooling down briefly.")
+                    time.sleep(soft_backoff)
                 continue
 
-            # Chagua coin 1 tu
-            candidates = pick_symbols_multi(top_n=1)
-            if not candidates:
-                notify("⚠️ No eligible coins to buy. Sleeping 10s.")
+            # Binance API error for order issues
+            elif "MIN_NOTIONAL" in msg or "quantity" in msg or "lot size" in msg:
+                notify(f"⚠️ Trade calculation or API error: {msg}. Skipping this cycle.")
                 time.sleep(10)
                 continue
 
-            symbol, price, volume, change, score = candidates[0]
-            if symbol in [t['symbol'] for t in active_trades]:
+            # Generic exception
+            else:
+                notify(f"❌ Cycle error: {msg}. Retrying in 5s.")
                 time.sleep(5)
-                continue
 
-            LOCKED_SYMBOL = symbol
-            notify(f"🎯 Selected {symbol} for trading.")
-
-            trade_usd = max(min(TRADE_USD, get_free_usdt()), 1.0)
-
-            # === Step 1: Market Buy ===
-            try:
-                qty, entry_price, f = place_market_buy(symbol, trade_usd)
-                active_trades.append({'symbol': symbol, 'qty': qty, 'entry_price': entry_price, 'filters': f})
-            except Exception as e:
-                notify(f"❌ Buy failed: {e}")
-                LOCKED_SYMBOL = None
-                time.sleep(5)
-                continue
-
-            # === Step 2 & 3: Monitor OCO & Roll ===
-            success, exit_price, profit_usd = monitor_and_roll(symbol, qty, entry_price, f)
-
-            # === Step 4: Transfer profit to funding wallet ===
-            if success and profit_usd > 0:
-                send_profit_to_funding(profit_usd)
-
-            # Remove from active trades & unlock
-            active_trades[:] = [t for t in active_trades if t['symbol'] != symbol]
-            LOCKED_SYMBOL = None
-
-            time.sleep(COOLDOWN_AFTER_EXIT)
-
-        except Exception as e:
-            notify(f"❌ Trade cycle error: {e}")
-            time.sleep(5)
-            
 # =========================
-# FLASK KEEPALIVE
+# FLASK KEEPALIVE FOR RENDER
 # =========================
 app = Flask(__name__)
+
 @app.route("/")
 def home():
-    return "Bot running! ✅"
+    return "Bot is running! ✅"
 
 def start_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 # =========================
-# START
+# START BOTH THREADS
 # =========================
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=trade_cycle, daemon=True)
+    # Run bot in a separate thread
+    bot_thread = threading.Thread(target=run_forever, daemon=True)
     bot_thread.start()
+    
+    # Run Flask server (main thread)
     start_flask()
