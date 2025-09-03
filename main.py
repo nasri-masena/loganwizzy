@@ -139,19 +139,18 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
 
-    # Calculate TP and SL prices
+    # target prices
     take_profit = buy_price * (1 + tp_pct/100.0)
-    stop_price   = buy_price * (1 - sl_pct/100.0)
-    stop_limit   = stop_price * (1 - 0.002)  # 0.2% below stop for safety
+    stop_price  = buy_price * (1 - sl_pct/100.0)
+    stop_limit  = stop_price * (1 - 0.002)  # ~0.2% chini ya stop
 
-    # Round helper
     def clip(v, step):
         return math.floor(v / step) * step
 
     qty = clip(qty, f['stepSize'])
     tp  = clip(take_profit, f['tickSize'])
-    sp  = clip(stop_price, f['tickSize'])
-    sl  = clip(stop_limit, f['tickSize'])
+    sp  = clip(stop_price,  f['tickSize'])
+    sl  = clip(stop_limit,  f['tickSize'])
 
     if qty <= 0:
         raise RuntimeError("❌ Quantity too small for OCO order")
@@ -161,10 +160,16 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0):
             symbol=symbol,
             side="SELL",
             quantity=str(qty),
-            price=str(tp),              # Take-Profit
-            stopPrice=str(sp),          # Stop trigger
-            stopLimitPrice=str(sl),     # Stop-Limit
-            stopLimitTimeInForce="GTC"
+
+            # --- ABOVE (take profit) ---
+            aboveType="LIMIT_MAKER",
+            abovePrice=str(tp),
+
+            # --- BELOW (stop loss) ---
+            belowType="STOP_LOSS_LIMIT",
+            belowStopPrice=str(sp),
+            belowPrice=str(sl),
+            belowTimeInForce="GTC"
         )
         notify(f"📌 OCO SELL placed: TP={tp}, SL={sp}/{sl}, qty={qty}")
         return order
