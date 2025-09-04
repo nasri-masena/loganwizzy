@@ -149,16 +149,64 @@ def pick_coin():
             continue
         try:
             price = float(t['lastPrice'])
-            volume = float(t['quoteVolume'])
+            qvol = float(t['quoteVolume'])  # 24h quote volume
             change_pct = float(t['priceChangePercent'])
-            if PRICE_MIN <= price <= PRICE_MAX and volume >= MIN_VOLUME and change_pct >= MOVEMENT_MIN_PCT:
-                candidates.append((sym, price, volume, change_pct))
+
+            # basic range filters
+            if not (PRICE_MIN <= price <= PRICE_MAX):
+                continue
+            if qvol < 500_000:             # adjust to your risk/market
+                continue
+            # require at least 1% short-term move (you can change to 2)
+            if change_pct < 1.0:
+                continue
+
+            # --- additional confirmations (use klines for short-term volume & EMA) ---
+            # fetch recent 5m candles (limit small so not heavy)
+            try:
+                klines = client.get_klines(symbol=sym, interval='5m', limit=20)
+                # compute recent volume spike ratio: latest volume divided by avg of previous 10
+                vols = [float(k[5]) * float(k[4]) if len(k)>5 else float(k[5]) for k in klines]  # careful: depends on returned fields
+                recent_vol = vols[-1]
+                avg_vol = sum(vols[-11:-1]) / 10 if len(vols) >= 11 else (sum(vols)/len(vols))
+                vol_ratio = recent_vol / (avg_vol + 1e-9)
+            except Exception:
+                vol_ratio = 1.0
+
+            if vol_ratio < 1.8:  # require ~80%+ spike
+                continue
+
+            # optional: check simple RSI or EMA via last closes
+            closes = [float(k[4]) for k in klines] if 'klines' in locals() else None
+            rsi_ok = True
+            if closes and len(closes) >= 14:
+                # quick RSI calc (simplified)
+                gains = []
+                losses = []
+                for i in range(1, 14):
+                    diff = closes[-14+i] - closes[-15+i]
+                    if diff > 0: gains.append(diff)
+                    else: losses.append(abs(diff))
+                avg_gain = sum(gains)/14 if gains else 0
+                avg_loss = sum(losses)/14 if losses else 1e-9
+                rs = avg_gain/avg_loss if avg_loss>0 else 999
+                rsi = 100 - (100/(1+rs))
+                if rsi > 70:
+                    rsi_ok = False
+
+            if not rsi_ok:
+                continue
+
+            # score: weight by change and volume spike and quoteVolume
+            score = change_pct * qvol * vol_ratio
+            candidates.append((sym, price, qvol, change_pct, vol_ratio, score))
+
         except Exception:
             continue
+
     if not candidates:
         return None
-    # sort by liquidity * move
-    candidates.sort(key=lambda x: x[2] * x[3], reverse=True)
+    candidates.sort(key=lambda x: x[-1], reverse=True)
     return candidates[0]
 
 # =========================
@@ -350,13 +398,13 @@ def trade_cycle():
             open_orders_global = client.get_open_orders()
             if open_orders_global:
                 notify("⏳ Still waiting for previous trade(s) to finish...")
-                time.sleep(CYCLE_DELAY)
+                time.sleep(1800)
                 continue
 
             candidate = pick_coin()
             if not candidate:
                 notify("⚠️ No eligible coin found. Sleeping...")
-                time.sleep(CYCLE_DELAY)
+                time.sleep(600)
                 continue
 
             symbol, price, volume, change = candidate
