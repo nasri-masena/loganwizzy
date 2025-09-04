@@ -21,9 +21,9 @@ PRICE_MAX = 3.0
 MIN_VOLUME = 5_000_000
 MOVEMENT_MIN_PCT = 3.0
 
-TRADE_USD = 7.0  # ⚡ test amount
+TRADE_USD = 8.0  # ⚡ test amount
 SLEEP_BETWEEN_CHECKS = 60   # monitor frequency inside monitor_and_roll
-CYCLE_DELAY = 15            # delay between trade cycles (you asked 15s)
+CYCLE_DELAY = 15            # default delay between trade cycles (used at end)
 COOLDOWN_AFTER_EXIT = 10    # small cooldown after trade finishes
 
 # Rolling params
@@ -103,7 +103,6 @@ def format_price(value, tick_size):
 def send_profit_to_funding(amount, asset='USDT'):
     """Use universal transfer: SPOT -> FUNDING"""
     try:
-        # python-binance wrapper uses client.universal_transfer with type
         result = client.universal_transfer(
             type='MAIN_FUNDING' if hasattr(client, 'universal_transfer') else 'SPOT_TO_FUNDING',
             asset=asset,
@@ -112,7 +111,6 @@ def send_profit_to_funding(amount, asset='USDT'):
         notify(f"💸 Profit ${amount:.6f} transferred to funding wallet.")
         return result
     except Exception as e:
-        # Try alternate param name / fallback
         try:
             result = client.universal_transfer(
                 type='SPOT_TO_FUNDING',
@@ -126,7 +124,7 @@ def send_profit_to_funding(amount, asset='USDT'):
             return None
 
 # =========================
-# SYMBOL PICKER
+# SYMBOL PICKER (UPDATED: returns 4-tuple)
 # =========================
 TICKER_CACHE = None
 LAST_FETCH = 0
@@ -141,6 +139,11 @@ def get_tickers_cached():
     return TICKER_CACHE
 
 def pick_coin():
+    """
+    Returns either None or (symbol, price, quoteVolume, change_pct)
+    Internally scores candidates using vol spike + 24h change + 24h quoteVolume,
+    but the return is kept compatible with trade_cycle (4 items).
+    """
     tickers = get_tickers_cached()
     candidates = []
     for t in tickers:
@@ -149,48 +152,64 @@ def pick_coin():
             continue
         try:
             price = float(t['lastPrice'])
-            qvol = float(t['quoteVolume'])  # 24h quote volume
-            change_pct = float(t['priceChangePercent'])
+            qvol = float(t.get('quoteVolume') or t.get('quoteVolume', 0))  # 24h quote volume
+            change_pct = float(t.get('priceChangePercent') or 0.0)
 
             # basic range filters
             if not (PRICE_MIN <= price <= PRICE_MAX):
                 continue
             if qvol < 500_000:             # adjust to your risk/market
                 continue
-            # require at least 1% short-term move (you can change to 2)
+            # require at least 1% short-term move (24h-based filter here)
             if change_pct < 1.0:
                 continue
 
             # --- additional confirmations (use klines for short-term volume & EMA) ---
-            # fetch recent 5m candles (limit small so not heavy)
+            vol_ratio = 1.0
+            closes = None
             try:
                 klines = client.get_klines(symbol=sym, interval='5m', limit=20)
-                # compute recent volume spike ratio: latest volume divided by avg of previous 10
-                vols = [float(k[5]) * float(k[4]) if len(k)>5 else float(k[5]) for k in klines]  # careful: depends on returned fields
-                recent_vol = vols[-1]
-                avg_vol = sum(vols[-11:-1]) / 10 if len(vols) >= 11 else (sum(vols)/len(vols))
-                vol_ratio = recent_vol / (avg_vol + 1e-9)
+                if klines and len(klines) >= 2:
+                    # Prefer quote asset volume if available at index 7, else approximate by base volume * close
+                    vols = []
+                    for k in klines:
+                        try:
+                            # Binance kline: [openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, ...]
+                            if len(k) > 7 and k[7] is not None:
+                                vols.append(float(k[7]))  # quoteAssetVolume
+                            else:
+                                vols.append(float(k[5]) * float(k[4]))  # approximate
+                        except Exception:
+                            vols.append(0.0)
+                    recent_vol = vols[-1]
+                    if len(vols) >= 11:
+                        avg_vol = sum(vols[-11:-1]) / 10.0
+                    else:
+                        avg_vol = (sum(vols[:-1]) / max(len(vols)-1, 1)) if len(vols) > 1 else vols[-1] or 1.0
+                    vol_ratio = recent_vol / (avg_vol + 1e-9)
+                    closes = [float(k[4]) for k in klines]
             except Exception:
                 vol_ratio = 1.0
+                closes = None
 
             if vol_ratio < 1.8:  # require ~80%+ spike
                 continue
 
-            # optional: check simple RSI or EMA via last closes
-            closes = [float(k[4]) for k in klines] if 'klines' in locals() else None
+            # optional: quick RSI check using closes
             rsi_ok = True
-            if closes and len(closes) >= 14:
-                # quick RSI calc (simplified)
+            if closes and len(closes) >= 15:
                 gains = []
                 losses = []
-                for i in range(1, 14):
-                    diff = closes[-14+i] - closes[-15+i]
-                    if diff > 0: gains.append(diff)
-                    else: losses.append(abs(diff))
-                avg_gain = sum(gains)/14 if gains else 0
-                avg_loss = sum(losses)/14 if losses else 1e-9
-                rs = avg_gain/avg_loss if avg_loss>0 else 999
-                rsi = 100 - (100/(1+rs))
+                for i in range(1, 15):
+                    diff = closes[-15 + i] - closes[-16 + i]
+                    if diff > 0:
+                        gains.append(diff)
+                    else:
+                        losses.append(abs(diff))
+                avg_gain = sum(gains) / 14.0 if gains else 0.0
+                avg_loss = sum(losses) / 14.0 if losses else 1e-9
+                rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
+                rsi = 100 - (100 / (1 + rs))
                 if rsi > 70:
                     rsi_ok = False
 
@@ -206,8 +225,12 @@ def pick_coin():
 
     if not candidates:
         return None
+
     candidates.sort(key=lambda x: x[-1], reverse=True)
-    return candidates[0]
+    # Return only first 4 fields so trade_cycle unpack works:
+    best = candidates[0]
+    sym, price, qvol, change_pct = best[0], best[1], best[2], best[3]
+    return (sym, price, qvol, change_pct)
 
 # =========================
 # MARKET BUY (unchanged semantic)
@@ -244,16 +267,9 @@ def place_safe_market_buy(symbol, usd_amount):
 def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=2):
-    """
-    Places an OCO order on Spot via create_oco_order.
-    By default it computes TP = buy_price*(1+tp_pct/100), SL = buy_price*(1-sl_pct/100).
-    If explicit_tp/explicit_sl provided, those precise levels are used (they'll be clipped to tick).
-    Returns the API response or None.
-    """
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
 
-    # compute candidate TP/SL
     if explicit_tp is not None:
         tp = explicit_tp
     else:
@@ -266,7 +282,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
 
     stop_limit = sp * 0.999  # small buffer below stop trigger
 
-    # clip to tick/step
     def clip(v, step):
         return math.floor(v / step) * step
 
@@ -284,7 +299,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
 
     for attempt in range(1, retries + 1):
         try:
-            # create_oco_order expects price, stopPrice, stopLimitPrice, stopLimitTimeInForce
             oco = client.create_oco_order(
                 symbol=symbol,
                 side='SELL',
@@ -323,12 +337,6 @@ def cancel_all_open_orders(symbol):
 # MONITOR + ROLLING LOGIC
 # =========================
 def monitor_and_roll(symbol, qty, entry_price, f):
-    """
-    Monitor an OCO placed by place_safe_market_buy. When price nears current TP,
-    cancel & re-place OCO with higher TP and SL moved up.
-    Returns (closed_bool, exit_price, profit_usd)
-    """
-    # initial state (use same TP/SL logic as place_oco_sell)
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
     curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
 
@@ -360,14 +368,10 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                 notify(f"🔎 Price near TP (price={price_now:.8f}, TP={curr_tp:.8f}). Rolling OCO...")
                 cancel_all_open_orders(symbol)
 
-                # new SL becomes previous TP (or entry if first)
                 new_sl = entry_price if last_tp is None else last_tp
-                # new TP increases by STEP_INCREMENT_PCT on top of current TP
                 new_tp = curr_tp * (1 + STEP_INCREMENT_PCT)
 
-                # we want to call place_oco_sell with explicit TP/SL levels.
-                # place_oco_sell expects "buy_price" base but we added explicit_tp/explicit_sl to pass levels directly.
-                oco2 = place_oco_sell(symbol, free_qty, entry_price,
+                oco2 = place_oco_sell(symbol, get_free_asset(asset), entry_price,
                                       tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT,
                                       explicit_tp=new_tp, explicit_sl=new_sl)
                 if oco2:
@@ -380,7 +384,6 @@ def monitor_and_roll(symbol, qty, entry_price, f):
 
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
-            # break/return so main cycle can decide next steps
             return False, entry_price, 0.0
 
 # =========================
@@ -398,15 +401,16 @@ def trade_cycle():
             open_orders_global = client.get_open_orders()
             if open_orders_global:
                 notify("⏳ Still waiting for previous trade(s) to finish...")
-                time.sleep(1800)
+                time.sleep(1800)   # 30 minutes as you requested for still-waiting
                 continue
 
             candidate = pick_coin()
             if not candidate:
                 notify("⚠️ No eligible coin found. Sleeping...")
-                time.sleep(600)
+                time.sleep(600)    # 10 minutes when no coins
                 continue
 
+            # unpack the 4-tuple returned by pick_coin (compatible now)
             symbol, price, volume, change = candidate
             notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, vol≈{volume})")
 
