@@ -144,62 +144,63 @@ def get_tickers_cached():
 
 def pick_coin():
     """
-    Returns either None or (symbol, price, quoteVolume, change_pct)
-    Internally scores candidates using vol spike + 24h change + 24h quoteVolume,
-    but the return is kept compatible with trade_cycle (4 items).
+    Returns either None or (symbol, price, quoteVolume, change_pct).
+    Skips symbols present in TEMP_SKIP until their expiry.
     """
+    now = time.time()
     tickers = get_tickers_cached()
     candidates = []
     for t in tickers:
         sym = t['symbol']
+        # skip if temporarily blacklisted
+        skip_until = TEMP_SKIP.get(sym)
+        if skip_until and now < skip_until:
+            # skip this symbol for now
+            continue
+
         if not sym.endswith(QUOTE):
             continue
         try:
             price = float(t['lastPrice'])
-            qvol = float(t.get('quoteVolume') or t.get('quoteVolume', 0))  # 24h quote volume
+            qvol = float(t.get('quoteVolume') or 0.0)  # 24h quote volume
             change_pct = float(t.get('priceChangePercent') or 0.0)
 
             # basic range filters
             if not (PRICE_MIN <= price <= PRICE_MAX):
                 continue
-            if qvol < 500_000:             # adjust to your risk/market
+            if qvol < 500_000:
                 continue
-            # require at least 1% short-term move (24h-based filter here)
             if change_pct < 1.0:
                 continue
 
-            # --- additional confirmations (use klines for short-term volume & EMA) ---
+            # short-term confirmation via klines (5m)
             vol_ratio = 1.0
             closes = None
             try:
                 klines = client.get_klines(symbol=sym, interval='5m', limit=20)
                 if klines and len(klines) >= 2:
-                    # Prefer quote asset volume if available at index 7, else approximate by base volume * close
                     vols = []
                     for k in klines:
-                        try:
-                            # Binance kline: [openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, ...]
-                            if len(k) > 7 and k[7] is not None:
-                                vols.append(float(k[7]))  # quoteAssetVolume
-                            else:
-                                vols.append(float(k[5]) * float(k[4]))  # approximate
-                        except Exception:
-                            vols.append(0.0)
-                    recent_vol = vols[-1]
+                        # Binance kline: [openTime, open, high, low, close, volume, ... , quoteAssetVolume, ...]
+                        if len(k) > 7 and k[7] is not None:
+                            vols.append(float(k[7]))
+                        else:
+                            vols.append(float(k[5]) * float(k[4]))
+                    recent_vol = vols[-1] if vols else 0.0
                     if len(vols) >= 11:
                         avg_vol = sum(vols[-11:-1]) / 10.0
                     else:
-                        avg_vol = (sum(vols[:-1]) / max(len(vols)-1, 1)) if len(vols) > 1 else vols[-1] or 1.0
+                        avg_vol = (sum(vols[:-1]) / max(len(vols)-1, 1)) if len(vols) > 1 else (vols[-1] or 1.0)
                     vol_ratio = recent_vol / (avg_vol + 1e-9)
                     closes = [float(k[4]) for k in klines]
             except Exception:
                 vol_ratio = 1.0
                 closes = None
 
-            if vol_ratio < 1.8:  # require ~80%+ spike
+            if vol_ratio < 1.8:
                 continue
 
-            # optional: quick RSI check using closes
+            # quick RSI sanity
             rsi_ok = True
             if closes and len(closes) >= 15:
                 gains = []
@@ -216,11 +217,9 @@ def pick_coin():
                 rsi = 100 - (100 / (1 + rs))
                 if rsi > 70:
                     rsi_ok = False
-
             if not rsi_ok:
                 continue
 
-            # score: weight by change and volume spike and quoteVolume
             score = change_pct * qvol * vol_ratio
             candidates.append((sym, price, qvol, change_pct, vol_ratio, score))
 
@@ -231,11 +230,10 @@ def pick_coin():
         return None
 
     candidates.sort(key=lambda x: x[-1], reverse=True)
-    # Return only first 4 fields so trade_cycle unpack works:
     best = candidates[0]
     sym, price, qvol, change_pct = best[0], best[1], best[2], best[3]
     return (sym, price, qvol, change_pct)
-
+    
 # =========================
 # MARKET BUY (unchanged semantic)
 # =========================
@@ -304,28 +302,40 @@ def place_safe_market_buy(symbol, usd_amount):
     return qty, price
     
 def is_symbol_tradable(symbol):
-    """Return True only if exchange reports symbol status TRADING and SPOT permission present."""
+    """
+    Return True if exchange reports symbol status TRADING and pair allows spot market orders.
+    This checks 'permissions' OR 'orderTypes' heuristically to be robust across API responses.
+    """
     try:
         info = client.get_symbol_info(symbol)
         if not info:
             return False
-        status = info.get('status', '').upper()
-        perms = info.get('permissions') or info.get('orderTypes') or []
-        # permissions often contains 'SPOT' for tradable spot pairs
-        has_spot = False
-        try:
-            # perms might be like ['SPOT','MARGIN'] or orderTypes list
-            for p in perms:
-                if isinstance(p, str) and p.upper() == 'SPOT':
-                    has_spot = True
-                    break
-        except Exception:
-            has_spot = False
-        return status == 'TRADING' and has_spot
+        status = (info.get('status') or "").upper()
+
+        # First, if status is not TRADING -> not tradable
+        if status != 'TRADING':
+            return False
+
+        # Many symbols include 'SPOT' in permissions; others leave permissions empty but have orderTypes.
+        perms = info.get('permissions') or []
+        if isinstance(perms, list) and any(str(p).upper() == 'SPOT' for p in perms):
+            return True
+
+        # Fallback: check orderTypes - accept if MARKET or LIMIT or both present
+        order_types = info.get('orderTypes') or []
+        if isinstance(order_types, list):
+            for ot in order_types:
+                ot_up = str(ot).upper()
+                if ot_up in ('MARKET', 'LIMIT', 'LIMIT_MAKER', 'TAKE_PROFIT_MARKET', 'STOP_MARKET'):
+                    return True
+
+        # As last fallback: if "icebergAllowed" etc present but no orderTypes, assume not tradable
+        return False
     except Exception as e:
         notify(f"⚠️ is_symbol_tradable check failed for {symbol}: {e}")
+        # conservative fallback: mark not tradable to avoid bad buys
         return False
-
+        
 # =========================
 # OCO SELL (kept compatible + optional explicit TP/SL)
 # =========================
