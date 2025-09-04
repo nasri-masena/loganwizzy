@@ -141,6 +141,16 @@ def get_tickers_cached():
         TICKER_CACHE = client.get_ticker()
         LAST_FETCH = now
     return TICKER_CACHE
+    
+def cleanup_temp_skip():
+    """
+    Remove expired entries from TEMP_SKIP to keep it small.
+    Call this from pick_coin() or periodically.
+    """
+    now = time.time()
+    for s, until in list(TEMP_SKIP.items()):
+        if now >= until:
+            del TEMP_SKIP[s]
 
 def pick_coin():
     """
@@ -233,23 +243,63 @@ def pick_coin():
     best = candidates[0]
     sym, price, qvol, change_pct = best[0], best[1], best[2], best[3]
     return (sym, price, qvol, change_pct)
+
+# --- helper: extract executed qty & avg price from market order response
+def _parse_market_buy_exec(order_resp):
+    """
+    Return (executed_qty: float, avg_price: float).
+    Works with python-binance order response that may include:
+      - 'executedQty' and 'cummulativeQuoteQty'
+      - OR 'fills' list
+    """
+    executed_qty = 0.0
+    avg_price = 0.0
+    try:
+        # direct fields
+        if order_resp is None:
+            return 0.0, 0.0
+        exec_qty = order_resp.get('executedQty') or order_resp.get('executedQty', '0')
+        if exec_qty and float(exec_qty) > 0:
+            executed_qty = float(exec_qty)
+            cumm = float(order_resp.get('cummulativeQuoteQty') or order_resp.get('cumulativeQuoteQty', 0.0) or 0.0)
+            if executed_qty > 0:
+                avg_price = cumm / executed_qty if cumm and executed_qty else 0.0
+        else:
+            # try fills
+            fills = order_resp.get('fills') or []
+            total_qty = 0.0
+            total_quote = 0.0
+            for f in fills:
+                q = float(f.get('qty', 0.0))
+                p = float(f.get('price', 0.0))
+                total_qty += q
+                total_quote += q * p
+            if total_qty > 0:
+                executed_qty = total_qty
+                avg_price = total_quote / total_qty
+    except Exception:
+        pass
+    return executed_qty, avg_price
     
 # =========================
 # MARKET BUY (unchanged semantic)
 # =========================
 def place_safe_market_buy(symbol, usd_amount):
-    # Skip temporarily blacklisted symbols
+    """
+    Places market buy and returns (executed_qty, avg_price) or (None, None) on failure.
+    Also respects TEMP_SKIP for symbols recently failing.
+    """
+    # Temp-skip check
     now = time.time()
     skip_until = TEMP_SKIP.get(symbol)
     if skip_until and now < skip_until:
         notify(f"⏭️ Skipping {symbol} until {time.ctime(skip_until)} (recently failed).")
         return None, None
 
-    # quick tradable check
+    # Quick tradable check
     if not is_symbol_tradable(symbol):
         notify(f"⛔ Symbol {symbol} not tradable / market closed. Skipping and blacklisting for a while.")
         TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
-        # optional: log symbol info to help debug
         try:
             info = client.get_symbol_info(symbol)
             notify(f"ℹ️ symbol info for {symbol}: status={info.get('status')} permissions={info.get('permissions')}")
@@ -258,37 +308,42 @@ def place_safe_market_buy(symbol, usd_amount):
         return None, None
 
     info = client.get_symbol_info(symbol)
+    if not info:
+        notify(f"❌ place_safe_market_buy: couldn't fetch symbol info for {symbol}")
+        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+        return None, None
+
     f = get_filters(info)
+
+    # get price for qty calc
     try:
         price = float(client.get_symbol_ticker(symbol=symbol)['price'])
     except Exception as e:
         notify(f"⚠️ Failed to fetch ticker for {symbol}: {e}")
         return None, None
 
-    qty = usd_amount / price
-    qty = max(qty, f['minQty'])
-    qty = round_step(qty, f['stepSize'])
+    qty_target = usd_amount / price
+    qty_target = max(qty_target, f['minQty'])
+    qty_target = round_step(qty_target, f['stepSize'])
 
     if f['minNotional']:
-        notional = qty * price
+        notional = qty_target * price
         if notional < f['minNotional']:
             needed_qty = round_step(f['minNotional'] / price, f['stepSize'])
             free_usdt = get_free_usdt()
             if needed_qty * price > free_usdt + 1e-8:
                 notify(f"❌ Not enough funds for MIN_NOTIONAL on {symbol}")
                 return None, None
-            qty = needed_qty
+            qty_target = needed_qty
 
+    # try market buy
     try:
-        order = client.order_market_buy(symbol=symbol, quantity=qty)
-        notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
+        order_resp = client.order_market_buy(symbol=symbol, quantity=qty_target)
     except Exception as e:
         err = str(e)
         notify(f"❌ Market buy failed for {symbol}: {err}")
-        # if market closed, blacklist symbol for a while to avoid spam
         if '-1013' in err or 'Market is closed' in err:
             TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
-            # log symbol info for debugging
             try:
                 info = client.get_symbol_info(symbol)
                 notify(f"ℹ️ symbol info for {symbol}: status={info.get('status')} permissions={info.get('permissions')}")
@@ -297,43 +352,55 @@ def place_safe_market_buy(symbol, usd_amount):
             return None, None
         return None, None
 
-    # place the first OCO only if buy succeeded
-    place_oco_sell(symbol, qty, price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-    return qty, price
+    executed_qty, avg_price = _parse_market_buy_exec(order_resp)
+
+    # fallback if parser gave 0
+    if executed_qty <= 0:
+        try:
+            executed_qty = float(order_resp.get('origQty', qty_target))
+        except Exception:
+            executed_qty = qty_target
+        avg_price = price
+
+    # round executed_qty down to step
+    executed_qty = round_step(executed_qty, f['stepSize'])
+
+    # short sleep to allow balances update on exchange
+    time.sleep(0.6)
+
+    notify(f"✅ BUY {symbol}: qty={executed_qty} ~price={avg_price:.8f} notional≈${executed_qty*avg_price:.6f}")
+
+    # place OCO using the executed_qty (not theoretical)
+    oco_res = place_oco_sell(symbol, executed_qty, avg_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+    if oco_res is None:
+        notify("⚠️ OCO placement failed after buy; position is UNPROTECTED (will abort monitoring).")
+
+    return executed_qty, avg_price
     
 def is_symbol_tradable(symbol):
     """
-    Return True if exchange reports symbol status TRADING and pair allows spot market orders.
-    This checks 'permissions' OR 'orderTypes' heuristically to be robust across API responses.
+    Return True only if exchange reports symbol status TRADING and SPOT permission / MARKET allowed.
     """
     try:
         info = client.get_symbol_info(symbol)
         if not info:
             return False
         status = (info.get('status') or "").upper()
-
-        # First, if status is not TRADING -> not tradable
         if status != 'TRADING':
             return False
 
-        # Many symbols include 'SPOT' in permissions; others leave permissions empty but have orderTypes.
         perms = info.get('permissions') or []
         if isinstance(perms, list) and any(str(p).upper() == 'SPOT' for p in perms):
             return True
 
-        # Fallback: check orderTypes - accept if MARKET or LIMIT or both present
         order_types = info.get('orderTypes') or []
         if isinstance(order_types, list):
             for ot in order_types:
-                ot_up = str(ot).upper()
-                if ot_up in ('MARKET', 'LIMIT', 'LIMIT_MAKER', 'TAKE_PROFIT_MARKET', 'STOP_MARKET'):
+                if str(ot).upper() in ('MARKET', 'LIMIT', 'LIMIT_MAKER', 'STOP_MARKET', 'TAKE_PROFIT_MARKET'):
                     return True
-
-        # As last fallback: if "icebergAllowed" etc present but no orderTypes, assume not tradable
         return False
     except Exception as e:
         notify(f"⚠️ is_symbol_tradable check failed for {symbol}: {e}")
-        # conservative fallback: mark not tradable to avoid bad buys
         return False
         
 # =========================
@@ -341,34 +408,23 @@ def is_symbol_tradable(symbol):
 # =========================
 def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                    explicit_tp: float = None, explicit_sl: float = None,
-                   retries=2, delay=1):
+                   retries=3, delay=1):
     """
-    Robust OCO placement:
-      - try standard create_oco_order (price/stopPrice/stopLimitPrice)
-      - if aboveType error occurs, try alternative param names (aboveType/belowType...)
-      - if both fail, fallback to separate: LIMIT TP + STOP_MARKET SL
-    Returns dict {'tp': tp, 'sl': sp, 'method': 'oco'|'oco_abovebelow'|'fallback_separate'} or None.
+    Robust OCO placement with retries + alt param set + fallback to separate orders.
+    Returns dict {'tp': tp, 'sl': sp, 'method': ..., 'raw': ...} or None.
     """
     info = client.get_symbol_info(symbol)
     if not info:
         notify(f"⚠️ place_oco_sell: couldn't fetch symbol info for {symbol}")
         return None
     f = get_filters(info)
+    asset = symbol[:-len(QUOTE)]
 
-    # compute TP / Stop trigger / stop-limit buffer
-    if explicit_tp is not None:
-        tp = explicit_tp
-    else:
-        tp = buy_price * (1 + tp_pct / 100.0)
+    # compute TP / SP
+    tp = explicit_tp if explicit_tp is not None else (buy_price * (1 + tp_pct / 100.0))
+    sp = explicit_sl if explicit_sl is not None else (buy_price * (1 - sl_pct / 100.0))
+    stop_limit = sp * 0.999
 
-    if explicit_sl is not None:
-        sp = explicit_sl
-    else:
-        sp = buy_price * (1 - sl_pct / 100.0)
-
-    stop_limit = sp * 0.999  # small buffer under stop trigger
-
-    # clip helpers (tick/step)
     def clip(v, step):
         return math.floor(v / step) * step
 
@@ -381,11 +437,22 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         notify("❌ place_oco_sell: quantity too small after clipping")
         return None
 
+    # check available free asset and adjust if needed
+    free_qty = get_free_asset(asset)
+    safe_margin = f['stepSize'] if f['stepSize'] and f['stepSize'] > 0 else 0.0
+    if free_qty + 1e-12 < qty:
+        new_qty = clip(max(0.0, free_qty - safe_margin), f['stepSize'])
+        if new_qty <= 0:
+            notify(f"❌ Not enough free {asset} to place sell. free={free_qty}, required={qty}")
+            return None
+        notify(f"ℹ️ Adjusting sell qty down from {qty} to available {new_qty} to avoid insufficient balance.")
+        qty = new_qty
+
     tp_str = format_price(tp, f['tickSize'])
     sp_str = format_price(sp, f['tickSize'])
     sl_str = format_price(sl, f['tickSize'])
 
-    # --- Attempt 1: standard OCO (price/stopPrice/stopLimitPrice) ---
+    # Attempt 1: standard param names
     for attempt in range(1, retries + 1):
         try:
             oco = client.create_oco_order(
@@ -402,31 +469,23 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         except Exception as e:
             err = str(e)
             notify(f"⚠️ OCO SELL attempt {attempt} (standard) failed: {err}")
-            # If error suggests different param-set is required, break to try alt
             if 'aboveType' in err or '-1102' in err or 'Mandatory parameter' in err:
-                notify("ℹ️ Detected 'aboveType' style API required, will attempt alternative param names.")
+                notify("ℹ️ Detected 'aboveType' style requirement; will attempt alternative param names.")
                 break
-            # otherwise retry small delay
             if attempt < retries:
                 time.sleep(delay)
             else:
-                # we'll try alternative below
                 time.sleep(0.2)
 
-    # --- Attempt 2: alternative param names (aboveType / belowType) ---
-    # some versions expect aboveType/abovePrice and belowType/belowStopPrice naming
+    # Attempt 2: alternative param names
     for attempt in range(1, retries + 1):
         try:
             oco2 = client.create_oco_order(
                 symbol=symbol,
                 side='SELL',
                 quantity=str(qty),
-
-                # ABOVE (take profit) using alternative names
                 aboveType="LIMIT_MAKER",
                 abovePrice=tp_str,
-
-                # BELOW (stop loss) using alternative names
                 belowType="STOP_LOSS_LIMIT",
                 belowStopPrice=sp_str,
                 belowPrice=sl_str,
@@ -442,18 +501,16 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
             else:
                 time.sleep(0.2)
 
-    # --- Fallback: place TP limit + SL stop-market separately ---
+    # Fallback to separate orders
     notify("⚠️ All OCO attempts failed — falling back to separate TP (limit) + SL (stop-market).")
+    tp_order = None
+    sl_order = None
     try:
-        # place TP limit sell
         tp_order = client.order_limit_sell(symbol=symbol, quantity=str(qty), price=tp_str)
         notify(f"📈 TP LIMIT placed (fallback): {tp_str}, qty={qty}")
     except Exception as e:
         notify(f"❌ Fallback TP limit failed: {e}")
-        tp_order = None
-
     try:
-        # place SL as stop-market (market exit when trigger hits)
         sl_order = client.create_order(
             symbol=symbol,
             side="SELL",
@@ -464,7 +521,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         notify(f"📉 SL STOP_MARKET placed (fallback): trigger={sp_str}, qty={qty}")
     except Exception as e:
         notify(f"❌ Fallback SL stop-market failed: {e}")
-        sl_order = None
 
     if tp_order or sl_order:
         return {'tp': tp, 'sl': sp, 'method': 'fallback_separate', 'raw': {'tp': tp_order, 'sl': sl_order}}
@@ -550,8 +606,17 @@ BUY_LOCK_SECONDS = 60   # don't start another buy within 60s of previous buy (ad
 
 # Replace your existing trade_cycle() with this updated version:
 def trade_cycle():
+    """
+    Main trading loop:
+    - avoids double-buys when there are global open orders
+    - rate-limits buys via BUY_LOCK_SECONDS
+    - respects ACTIVE_SYMBOL to avoid overlapping trades
+    - uses pick_coin() -> (symbol, price, volume, change)
+    - calls place_safe_market_buy and then monitor_and_roll (blocking) for that trade
+    """
     global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS
 
+    # initialize start balance snapshot once
     if start_balance_usdt is None:
         start_balance_usdt = get_free_usdt()
         notify(f"🔰 Start balance snapshot: ${start_balance_usdt:.6f}")
@@ -585,7 +650,7 @@ def trade_cycle():
             candidate = pick_coin()
             if not candidate:
                 notify("⚠️ No eligible coin found. Sleeping...")
-                time.sleep(180)    # 10 minutes when no coins
+                time.sleep(600)    # 10 minutes when no coins
                 continue
 
             # unpack the 4-tuple returned by pick_coin
@@ -602,16 +667,21 @@ def trade_cycle():
             buy_res = place_safe_market_buy(symbol, usd_to_buy)
             if not buy_res or buy_res == (None, None):
                 notify(f"ℹ️ Buy skipped/failed for {symbol}. Will not retry immediately.")
-                # blacklist symbol if place_safe_market_buy set TEMP_SKIP, else short cooldown
+                # small cooldown before next selection
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # buy succeeded: set active symbol and last buy timestamp
+            # buy succeeded: unpack and mark active symbol + time
             qty, entry_price = buy_res
+            if qty is None or entry_price is None:
+                notify(f"⚠️ Unexpected buy result for {symbol}, skipping.")
+                time.sleep(CYCLE_DELAY)
+                continue
+
             ACTIVE_SYMBOL = symbol
             LAST_BUY_TS = time.time()
 
-            # fetch filters for monitor loop
+            # fetch filters for monitor loop (best-effort)
             info = client.get_symbol_info(symbol)
             f = get_filters(info)
 
@@ -630,7 +700,7 @@ def trade_cycle():
             # small wait to avoid tight exception loop
             time.sleep(CYCLE_DELAY)
 
-        # small delay before new cycle
+        # small delay before new cycle (keeps loop friendly)
         time.sleep(30)
         
 # =========================
