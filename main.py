@@ -39,6 +39,10 @@ client = Client(API_KEY, API_SECRET)
 LAST_NOTIFY = 0
 start_balance_usdt = None
 
+# temporary skip map to avoid re-trying closed/paused symbols too often
+TEMP_SKIP = {}  # symbol -> retry_unix_ts
+SKIP_SECONDS_ON_MARKET_CLOSED = 60 * 60  # skip 1 hour after "market closed"
+
 # =========================
 # UTIL
 # =========================
@@ -236,9 +240,32 @@ def pick_coin():
 # MARKET BUY (unchanged semantic)
 # =========================
 def place_safe_market_buy(symbol, usd_amount):
+    # Skip temporarily blacklisted symbols
+    now = time.time()
+    skip_until = TEMP_SKIP.get(symbol)
+    if skip_until and now < skip_until:
+        notify(f"⏭️ Skipping {symbol} until {time.ctime(skip_until)} (recently failed).")
+        return None, None
+
+    # quick tradable check
+    if not is_symbol_tradable(symbol):
+        notify(f"⛔ Symbol {symbol} not tradable / market closed. Skipping and blacklisting for a while.")
+        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+        # optional: log symbol info to help debug
+        try:
+            info = client.get_symbol_info(symbol)
+            notify(f"ℹ️ symbol info for {symbol}: status={info.get('status')} permissions={info.get('permissions')}")
+        except Exception as e:
+            notify(f"⚠️ could not fetch symbol info for {symbol}: {e}")
+        return None, None
+
     info = client.get_symbol_info(symbol)
     f = get_filters(info)
-    price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+    try:
+        price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+    except Exception as e:
+        notify(f"⚠️ Failed to fetch ticker for {symbol}: {e}")
+        return None, None
 
     qty = usd_amount / price
     qty = max(qty, f['minQty'])
@@ -250,16 +277,54 @@ def place_safe_market_buy(symbol, usd_amount):
             needed_qty = round_step(f['minNotional'] / price, f['stepSize'])
             free_usdt = get_free_usdt()
             if needed_qty * price > free_usdt + 1e-8:
-                raise RuntimeError(f"Not enough funds: need≈${needed_qty*price:.2f}, free=${free_usdt:.2f}")
+                notify(f"❌ Not enough funds for MIN_NOTIONAL on {symbol}")
+                return None, None
             qty = needed_qty
 
-    order = client.order_market_buy(symbol=symbol, quantity=qty)
-    notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
+    try:
+        order = client.order_market_buy(symbol=symbol, quantity=qty)
+        notify(f"✅ BUY {symbol}: qty={qty} ~price={price:.8f} notional≈${qty*price:.6f}")
+    except Exception as e:
+        err = str(e)
+        notify(f"❌ Market buy failed for {symbol}: {err}")
+        # if market closed, blacklist symbol for a while to avoid spam
+        if '-1013' in err or 'Market is closed' in err:
+            TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+            # log symbol info for debugging
+            try:
+                info = client.get_symbol_info(symbol)
+                notify(f"ℹ️ symbol info for {symbol}: status={info.get('status')} permissions={info.get('permissions')}")
+            except Exception:
+                pass
+            return None, None
+        return None, None
 
-    # place the first OCO (uses default BASE_TP_PCT / BASE_SL_PCT)
+    # place the first OCO only if buy succeeded
     place_oco_sell(symbol, qty, price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-
     return qty, price
+    
+def is_symbol_tradable(symbol):
+    """Return True only if exchange reports symbol status TRADING and SPOT permission present."""
+    try:
+        info = client.get_symbol_info(symbol)
+        if not info:
+            return False
+        status = info.get('status', '').upper()
+        perms = info.get('permissions') or info.get('orderTypes') or []
+        # permissions often contains 'SPOT' for tradable spot pairs
+        has_spot = False
+        try:
+            # perms might be like ['SPOT','MARGIN'] or orderTypes list
+            for p in perms:
+                if isinstance(p, str) and p.upper() == 'SPOT':
+                    has_spot = True
+                    break
+        except Exception:
+            has_spot = False
+        return status == 'TRADING' and has_spot
+    except Exception as e:
+        notify(f"⚠️ is_symbol_tradable check failed for {symbol}: {e}")
+        return False
 
 # =========================
 # OCO SELL (kept compatible + optional explicit TP/SL)
@@ -468,28 +533,52 @@ def monitor_and_roll(symbol, qty, entry_price, f):
 # =========================
 # MAIN TRADE CYCLE (single coin at a time)
 # =========================
+# add near top of file (globals area) if not present:
+ACTIVE_SYMBOL = None
+LAST_BUY_TS = 0.0
+BUY_LOCK_SECONDS = 60   # don't start another buy within 60s of previous buy (adjustable)
+
+# Replace your existing trade_cycle() with this updated version:
 def trade_cycle():
-    global start_balance_usdt
+    global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS
+
     if start_balance_usdt is None:
         start_balance_usdt = get_free_usdt()
         notify(f"🔰 Start balance snapshot: ${start_balance_usdt:.6f}")
 
     while True:
         try:
-            # if any global open orders exist => wait (avoid double buys)
+            # 1) If any global open orders exist => wait (avoid double buys)
             open_orders_global = client.get_open_orders()
             if open_orders_global:
+                # only send the "still waiting" notify occasionally to reduce spam
                 notify("⏳ Still waiting for previous trade(s) to finish...")
-                time.sleep(1800)   # 30 minutes as you requested for still-waiting
+                # long sleep to avoid hammering while previous trade is active
+                time.sleep(1800)   # 30 minutes as configured earlier
                 continue
 
+            # 2) If we already have an active symbol (we're inside a trade cycle) -> skip until cleared
+            if ACTIVE_SYMBOL is not None:
+                # ACTIVE_SYMBOL is set right after a successful market buy and cleared after monitor completes
+                notify(f"⏳ Active trade in progress for {ACTIVE_SYMBOL}, skipping new buys.")
+                time.sleep(CYCLE_DELAY)
+                continue
+
+            # 3) Enforce global buy-rate limit (prevent two buys in quick succession)
+            now = time.time()
+            if now - LAST_BUY_TS < BUY_LOCK_SECONDS:
+                # short sleep to wait until buy-lock expires
+                time.sleep(CYCLE_DELAY)
+                continue
+
+            # 4) Pick candidate coin (returns None or 4-tuple)
             candidate = pick_coin()
             if not candidate:
                 notify("⚠️ No eligible coin found. Sleeping...")
                 time.sleep(600)    # 10 minutes when no coins
                 continue
 
-            # unpack the 4-tuple returned by pick_coin (compatible now)
+            # unpack the 4-tuple returned by pick_coin
             symbol, price, volume, change = candidate
             notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, vol≈{volume})")
 
@@ -499,24 +588,41 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # === Market buy (immediately places initial OCO) ===
-            qty, entry_price = place_safe_market_buy(symbol, usd_to_buy)
+            # === Attempt Market buy (this function may return (None, None) on failure) ===
+            buy_res = place_safe_market_buy(symbol, usd_to_buy)
+            if not buy_res or buy_res == (None, None):
+                notify(f"ℹ️ Buy skipped/failed for {symbol}. Will not retry immediately.")
+                # blacklist symbol if place_safe_market_buy set TEMP_SKIP, else short cooldown
+                time.sleep(CYCLE_DELAY)
+                continue
+
+            # buy succeeded: set active symbol and last buy timestamp
+            qty, entry_price = buy_res
+            ACTIVE_SYMBOL = symbol
+            LAST_BUY_TS = time.time()
+
+            # fetch filters for monitor loop
             info = client.get_symbol_info(symbol)
             f = get_filters(info)
 
-            # === Monitor & roll until closed ===
+            # === Monitor & roll until closed (blocking) ===
             closed, exit_price, profit_usd = monitor_and_roll(symbol, qty, entry_price, f)
 
-            # === Transfer profits to funding wallet if any ===
+            # === After monitor completes: clear active symbol and handle profit transfer ===
+            ACTIVE_SYMBOL = None
+
             if closed and profit_usd > 0:
+                # transfer profits out (optional)
                 send_profit_to_funding(profit_usd)
 
         except Exception as e:
             notify(f"❌ Trade cycle unexpected error: {e}")
+            # small wait to avoid tight exception loop
+            time.sleep(CYCLE_DELAY)
 
         # small delay before new cycle
         time.sleep(30)
-
+        
 # =========================
 # FLASK KEEPALIVE
 # =========================
