@@ -21,7 +21,7 @@ PRICE_MAX = 3.0
 MIN_VOLUME = 5_000_000
 MOVEMENT_MIN_PCT = 3.0
 
-TRADE_USD = 8.0  # ⚡ test amount
+TRADE_USD = 7.0  # ⚡ test amount
 SLEEP_BETWEEN_CHECKS = 60   # monitor frequency inside monitor_and_roll
 CYCLE_DELAY = 15            # delay between trade cycles (you asked 15s)
 COOLDOWN_AFTER_EXIT = 10    # small cooldown after trade finishes
