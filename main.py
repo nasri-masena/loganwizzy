@@ -585,7 +585,7 @@ def trade_cycle():
             candidate = pick_coin()
             if not candidate:
                 notify("⚠️ No eligible coin found. Sleeping...")
-                time.sleep(600)    # 10 minutes when no coins
+                time.sleep(180)    # 10 minutes when no coins
                 continue
 
             # unpack the 4-tuple returned by pick_coin
