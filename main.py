@@ -266,10 +266,21 @@ def place_safe_market_buy(symbol, usd_amount):
 # =========================
 def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                    explicit_tp: float = None, explicit_sl: float = None,
-                   retries=3, delay=2):
+                   retries=2, delay=1):
+    """
+    Robust OCO placement:
+      - try standard create_oco_order (price/stopPrice/stopLimitPrice)
+      - if aboveType error occurs, try alternative param names (aboveType/belowType...)
+      - if both fail, fallback to separate: LIMIT TP + STOP_MARKET SL
+    Returns dict {'tp': tp, 'sl': sp, 'method': 'oco'|'oco_abovebelow'|'fallback_separate'} or None.
+    """
     info = client.get_symbol_info(symbol)
+    if not info:
+        notify(f"⚠️ place_oco_sell: couldn't fetch symbol info for {symbol}")
+        return None
     f = get_filters(info)
 
+    # compute TP / Stop trigger / stop-limit buffer
     if explicit_tp is not None:
         tp = explicit_tp
     else:
@@ -280,8 +291,9 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
     else:
         sp = buy_price * (1 - sl_pct / 100.0)
 
-    stop_limit = sp * 0.999  # small buffer below stop trigger
+    stop_limit = sp * 0.999  # small buffer under stop trigger
 
+    # clip helpers (tick/step)
     def clip(v, step):
         return math.floor(v / step) * step
 
@@ -291,12 +303,14 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
     sl = clip(stop_limit, f['tickSize'])
 
     if qty <= 0:
-        raise RuntimeError("❌ Quantity too small for OCO order")
+        notify("❌ place_oco_sell: quantity too small after clipping")
+        return None
 
     tp_str = format_price(tp, f['tickSize'])
     sp_str = format_price(sp, f['tickSize'])
     sl_str = format_price(sl, f['tickSize'])
 
+    # --- Attempt 1: standard OCO (price/stopPrice/stopLimitPrice) ---
     for attempt in range(1, retries + 1):
         try:
             oco = client.create_oco_order(
@@ -308,15 +322,80 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                 stopLimitPrice=sl_str,
                 stopLimitTimeInForce='GTC'
             )
-            notify(f"📌 OCO SELL placed ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty}")
-            return oco
+            notify(f"📌 OCO SELL placed (standard) ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty}")
+            return {'tp': tp, 'sl': sp, 'method': 'oco', 'raw': oco}
         except Exception as e:
-            notify(f"⚠️ OCO SELL attempt {attempt} failed: {e}")
+            err = str(e)
+            notify(f"⚠️ OCO SELL attempt {attempt} (standard) failed: {err}")
+            # If error suggests different param-set is required, break to try alt
+            if 'aboveType' in err or '-1102' in err or 'Mandatory parameter' in err:
+                notify("ℹ️ Detected 'aboveType' style API required, will attempt alternative param names.")
+                break
+            # otherwise retry small delay
             if attempt < retries:
                 time.sleep(delay)
             else:
-                notify("❌ OCO SELL failed after retries.")
-                return None
+                # we'll try alternative below
+                time.sleep(0.2)
+
+    # --- Attempt 2: alternative param names (aboveType / belowType) ---
+    # some versions expect aboveType/abovePrice and belowType/belowStopPrice naming
+    for attempt in range(1, retries + 1):
+        try:
+            oco2 = client.create_oco_order(
+                symbol=symbol,
+                side='SELL',
+                quantity=str(qty),
+
+                # ABOVE (take profit) using alternative names
+                aboveType="LIMIT_MAKER",
+                abovePrice=tp_str,
+
+                # BELOW (stop loss) using alternative names
+                belowType="STOP_LOSS_LIMIT",
+                belowStopPrice=sp_str,
+                belowPrice=sl_str,
+                belowTimeInForce="GTC"
+            )
+            notify(f"📌 OCO SELL placed (alt params) ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty}")
+            return {'tp': tp, 'sl': sp, 'method': 'oco_abovebelow', 'raw': oco2}
+        except Exception as e:
+            err = str(e)
+            notify(f"⚠️ OCO SELL attempt {attempt} (alt) failed: {err}")
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                time.sleep(0.2)
+
+    # --- Fallback: place TP limit + SL stop-market separately ---
+    notify("⚠️ All OCO attempts failed — falling back to separate TP (limit) + SL (stop-market).")
+    try:
+        # place TP limit sell
+        tp_order = client.order_limit_sell(symbol=symbol, quantity=str(qty), price=tp_str)
+        notify(f"📈 TP LIMIT placed (fallback): {tp_str}, qty={qty}")
+    except Exception as e:
+        notify(f"❌ Fallback TP limit failed: {e}")
+        tp_order = None
+
+    try:
+        # place SL as stop-market (market exit when trigger hits)
+        sl_order = client.create_order(
+            symbol=symbol,
+            side="SELL",
+            type="STOP_MARKET",
+            stopPrice=sp_str,
+            quantity=str(qty)
+        )
+        notify(f"📉 SL STOP_MARKET placed (fallback): trigger={sp_str}, qty={qty}")
+    except Exception as e:
+        notify(f"❌ Fallback SL stop-market failed: {e}")
+        sl_order = None
+
+    if tp_order or sl_order:
+        return {'tp': tp, 'sl': sp, 'method': 'fallback_separate', 'raw': {'tp': tp_order, 'sl': sl_order}}
+    else:
+        notify("❌ All attempts to protect position failed (no TP/SL placed).")
+        return None
 
 # =========================
 # CANCEL HELPERS
@@ -436,7 +515,7 @@ def trade_cycle():
             notify(f"❌ Trade cycle unexpected error: {e}")
 
         # small delay before new cycle
-        time.sleep(CYCLE_DELAY)
+        time.sleep(30)
 
 # =========================
 # FLASK KEEPALIVE
