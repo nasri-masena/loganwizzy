@@ -46,14 +46,22 @@ SKIP_SECONDS_ON_MARKET_CLOSED = 60 * 60
 getcontext().prec = 28
 
 # -------------------------
+# REBUY / RECENT BUYS CONFIG
+# -------------------------
+RECENT_BUYS = {}            # symbol -> {'ts': float, 'price': float, 'profit': float|None, 'cooldown': int}
+REBUY_COOLDOWN = 60 * 60    # 1 hour default after a win
+LOSS_COOLDOWN = 60 * 60 * 4 # 4 hours after a loss
+REBUY_MAX_RISE_PCT = 5.0    # don't re-buy if price rose > 5% since last buy
+
+# -------------------------
 # HELPERS: formatting & rounding
 # -------------------------
 def notify(msg: str):
     global LAST_NOTIFY
     now_ts = time.time()
+    # actual throttle: skip if last notify was too recent
     if now_ts - LAST_NOTIFY < 1.0:
-        # throttle small burst notifications
-        pass
+        return
     LAST_NOTIFY = now_ts
     text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     print(text)
@@ -80,19 +88,25 @@ def format_qty(qty: float, step: float) -> str:
     """
     try:
         if not step or float(step) == 0.0:
-            return str(qty)
+            # ensure safe decimal string
+            return format(Decimal(str(qty)), 'f')
         q = Decimal(str(qty))
         s = Decimal(str(step))
+        if s == 0:
+            return format(q, 'f')
         multiples = (q // s)
         quant = multiples * s
         precision = max(0, -s.as_tuple().exponent)
-        # ensure non-negative
         if quant < Decimal('0'):
             quant = Decimal('0')
+        # ensure plain string with required decimal places
         return format(quant, f'.{precision}f')
     except Exception:
-        # fallback minimal formatting
-        return f"{math.floor(qty):.0f}"
+        # fallback: return truncated int-like string
+        try:
+            return str(math.floor(qty))
+        except Exception:
+            return "0"
 
 def round_step(n, step):
     try:
@@ -121,10 +135,10 @@ def get_free_asset(asset):
         return 0.0
 
 def get_filters(symbol_info):
-    fs = {f['filterType']: f for f in symbol_info.get('filters', [])}
+    fs = {f.get('filterType'): f for f in symbol_info.get('filters', [])}
     lot = fs.get('LOT_SIZE')
     pricef = fs.get('PRICE_FILTER')
-    min_notional = fs.get('MIN_NOTIONAL', {}).get('minNotional', None)
+    min_notional = fs.get('MIN_NOTIONAL', {}).get('minNotional', None) if fs.get('MIN_NOTIONAL') else None
     return {
         'stepSize': float(lot['stepSize']) if lot else 0.0,
         'minQty': float(lot['minQty']) if lot else 0.0,
@@ -178,14 +192,22 @@ def cleanup_temp_skip():
         if now >= until:
             del TEMP_SKIP[s]
 
+def cleanup_recent_buys():
+    """Remove expired entries from RECENT_BUYS to keep it small."""
+    now = time.time()
+    for s, info in list(RECENT_BUYS.items()):
+        cd = info.get('cooldown', REBUY_COOLDOWN)
+        if now >= info['ts'] + cd:
+            del RECENT_BUYS[s]
+
 def pick_coin():
     """
-    Efficient picker:
-      - cheap prefilter by 24h quoteVolume, price, 24h change
-      - for top candidates fetch 5m klines and compute vol_ratio & recent_pct
-      - returns (symbol, price, quoteVolume, change_pct) or None
+    Efficient picker with RECENT_BUYS guard:
+      - skips symbols bought recently (RECENT_BUYS) while still in cooldown
+      - also skips if current price pumped > REBUY_MAX_RISE_PCT since last buy
     """
     cleanup_temp_skip()
+    cleanup_recent_buys()
     now = time.time()
     tickers = get_tickers_cached() or []
     prefiltered = []
@@ -196,15 +218,33 @@ def pick_coin():
     MIN_VOL_RATIO = 1.8
     MIN_RECENT_PCT = 0.5
 
+    # cheap prefilter
     for t in tickers:
         sym = t.get('symbol')
         if not sym or not sym.endswith(QUOTE):
             continue
+
+        # skip TEMP_SKIP'd symbols
         skip_until = TEMP_SKIP.get(sym)
         if skip_until and now < skip_until:
             continue
+
+        # skip RECENT_BUYS if still in cooldown OR price pumped
+        last = RECENT_BUYS.get(sym)
         try:
             price = float(t.get('lastPrice') or 0.0)
+        except Exception:
+            continue
+        if last:
+            # still in cooldown?
+            if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
+                continue
+            # skip if price rose too much since last buy
+            last_price = last.get('price')
+            if last_price and price > last_price * (1 + REBUY_MAX_RISE_PCT / 100.0):
+                continue
+
+        try:
             qvol = float(t.get('quoteVolume') or 0.0)
             change_pct = float(t.get('priceChangePercent') or 0.0)
         except Exception:
@@ -235,7 +275,6 @@ def pick_coin():
             vols = []
             closes = []
             for k in klines:
-                # k format: [openTime, open, high, low, close, volume, closeTime, quoteAssetVolume, ...]
                 try:
                     if len(k) > 7 and k[7] is not None:
                         vols.append(float(k[7]))
@@ -307,36 +346,52 @@ def pick_coin():
 def _parse_market_buy_exec(order_resp):
     """
     Return (executed_qty, avg_price) from order response if available.
+    Robust to different field spellings and to using fills[].
     """
     executed_qty = 0.0
     avg_price = 0.0
     try:
         if not order_resp:
             return 0.0, 0.0
-        exec_qty = None
-        # try common spellings
-        if 'executedQty' in order_resp:
-            exec_qty = order_resp.get('executedQty')
-        elif 'executedQty' in order_resp:
-            exec_qty = order_resp.get('executedQty')
-        if exec_qty is not None and float(exec_qty) > 0:
-            executed_qty = float(exec_qty)
-            cumm = float(order_resp.get('cummulativeQuoteQty') or order_resp.get('cumulativeQuoteQty') or 0.0)
-            if executed_qty > 0 and cumm > 0:
+
+        # common direct field (python-binance)
+        for key in ('executedQty', 'executedQty'):  # kept simple, prefer executedQty
+            val = order_resp.get(key)
+            if val is not None:
+                try:
+                    if float(val) > 0:
+                        executed_qty = float(val)
+                        break
+                except Exception:
+                    pass
+
+        # cumulative quote qty variants
+        if executed_qty > 0:
+            cumm = order_resp.get('cummulativeQuoteQty') or order_resp.get('cumulativeQuoteQty') or 0.0
+            try:
+                cumm = float(cumm)
+            except Exception:
+                cumm = 0.0
+            if cumm > 0:
                 avg_price = cumm / executed_qty
 
+        # fallback to fills
         if executed_qty == 0.0:
             fills = order_resp.get('fills') or []
             total_qty = 0.0
             total_quote = 0.0
             for f in fills:
-                q = float(f.get('qty', 0.0) or 0.0)
-                p = float(f.get('price', 0.0) or 0.0)
+                try:
+                    q = float(f.get('qty', 0.0) or 0.0)
+                    p = float(f.get('price', 0.0) or 0.0)
+                except Exception:
+                    q = 0.0; p = 0.0
                 total_qty += q
                 total_quote += q * p
             if total_qty > 0:
                 executed_qty = total_qty
                 avg_price = total_quote / total_qty if total_qty > 0 else 0.0
+
     except Exception:
         return 0.0, 0.0
     return executed_qty, avg_price
@@ -437,11 +492,17 @@ def place_safe_market_buy(symbol, usd_amount):
         notify(f"❌ Executed quantity too small after reconciliation for {symbol}: {executed_qty}")
         return None, None
 
+    # SAFEGUARD: if free_after_clip is dramatically smaller than expected executed_qty, treat as failure and temporary-skip symbol
+    if free_after_clip < max(1e-8, executed_qty * 0.5):
+        notify(f"⚠️ After buy free balance {free_after_clip} is much smaller than expected executed {executed_qty}. Skipping symbol for a while.")
+        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+        return None, None
+
     notify(f"✅ BUY {symbol}: qty={executed_qty} ~price={avg_price:.8f} notional≈${executed_qty*avg_price:.6f}")
 
     # IMPORTANT: DO NOT place OCO here. monitor_and_roll will handle it once it confirms balances / open orders.
     return executed_qty, avg_price
-    
+
 # -------------------------
 # OCO SELL with fallbacks
 # -------------------------
@@ -584,96 +645,62 @@ def cancel_all_open_orders(symbol):
 # MONITOR & ROLL
 # -------------------------
 def monitor_and_roll(symbol, qty, entry_price, f):
-    """
-    Monitor OCO placed by this function (it will place the initial OCO if none exists).
-    Returns (closed_bool, exit_price, profit_usd)
-    """
+    orig_qty = qty  # original qty we expect to sell
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
     curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
 
-    asset = symbol[:-len(QUOTE)]
-
-    # Wait a short while for exchange to update balances/orders and check if protective orders already exist.
-    found_open_orders = False
-    free_qty = 0.0
-    for attempt in range(8):  # ~ up to 4 seconds
-        time.sleep(0.5)
-        try:
-            open_orders = client.get_open_orders(symbol=symbol)
-            free_qty = get_free_asset(asset)
-            if open_orders:
-                found_open_orders = True
-                notify(f"ℹ️ Found existing open orders for {symbol} after buy — assuming protective orders already placed.")
-                break
-            # if free_qty looks like the bought qty (allow tiny slippage) break and place OCO here
-            if free_qty >= max(qty * 0.95, f['minQty']):
-                break
-        except Exception:
-            # ignore transient errors and retry
-            pass
-
-    # If no open orders found, place initial OCO using available free_qty (prefer actual free balance)
-    # set used_qty to free_qty if available, else fallback to qty
-    try:
-        free_now = get_free_asset(asset)
-    except Exception:
-        free_now = 0.0
-    used_qty = round_step(free_now, f['stepSize']) if free_now >= f['minQty'] else round_step(qty, f['stepSize'])
-
-    # If we don't see open orders and used_qty looks reasonable -> place OCO
-    initial_oco = None
-    if not found_open_orders:
-        initial_oco = place_oco_sell(symbol, used_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-        if initial_oco is None:
-            notify(f"❌ Initial OCO failed for {symbol}, aborting monitor.")
-            return False, entry_price, 0.0
-        else:
-            notify(f"✅ Initial protective orders placed for {symbol} (qty={used_qty}).")
-    else:
-        # If open orders were found earlier, we assume they're the protective orders (do not abort)
-        initial_oco = True
+    # place initial protective OCO here (monitor will manage rolling)
+    oco = place_oco_sell(symbol, qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+    if oco is None:
+        notify(f"❌ Initial OCO failed for {symbol}, aborting monitor.")
+        return False, entry_price, 0.0
 
     last_tp = None
 
     while True:
         try:
             time.sleep(SLEEP_BETWEEN_CHECKS)
-            free_qty = get_free_asset(asset)
-            open_orders = client.get_open_orders(symbol=symbol)
+            asset = symbol[:-len(QUOTE)]
+
+            # current market price
             price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
 
-            # Position closed? no free asset or no open orders
-            if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
+            # refresh free qty (single source of truth), but cap to original buy qty
+            free_qty = get_free_asset(asset)
+            available_for_sell = min(round_step(free_qty, f['stepSize']), orig_qty)
+
+            # Position closed? if no open orders OR negligible free qty
+            open_orders = client.get_open_orders(symbol=symbol)
+            if available_for_sell < round_step(orig_qty * 0.05, f['stepSize']) and len(open_orders) == 0:
                 exit_price = price_now
-                profit_usd = (exit_price - entry_price) * qty
+                profit_usd = (exit_price - entry_price) * orig_qty
                 notify(f"✅ Position closed for {symbol}: exit={exit_price:.8f}, profit≈${profit_usd:.6f}")
                 return True, exit_price, profit_usd
 
-            # near TP -> roll
+            # near TP -> roll (only if we still have meaningful available qty)
             near_trigger = price_now >= curr_tp * (1 - TRIGGER_PROXIMITY)
-            if near_trigger:
+            if near_trigger and available_for_sell >= f['minQty']:
                 notify(f"🔎 Price near TP (price={price_now:.8f}, TP={curr_tp:.8f}). Rolling OCO...")
+                # cancel existing protective orders
                 cancel_all_open_orders(symbol)
-
-                new_sl = entry_price if last_tp is None else last_tp
+                # place new OCO using available_for_sell (capped to orig_qty)
                 new_tp = curr_tp * (1 + STEP_INCREMENT_PCT)
-
-                available_qty = get_free_asset(asset)
-                oco2 = place_oco_sell(symbol, available_qty, entry_price,
+                new_sl = entry_price if last_tp is None else last_tp
+                oco2 = place_oco_sell(symbol, available_for_sell, entry_price,
                                       tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT,
-                                      explicit_tp=new_tp, explicit_sl=new_sl)
+                                      explicit_tp=new_tp,
+                                      explicit_sl=new_sl)
                 if oco2:
                     last_tp = curr_tp
                     curr_tp = new_tp
                     curr_sl = new_sl
-                    notify(f"🔁 Rolled OCO: new TP={curr_tp:.8f}, new SL={curr_sl:.8f}")
+                    notify(f"🔁 Rolled OCO: new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, sell_qty={available_for_sell}")
                 else:
                     notify("⚠️ Roll failed, will retry on next check.")
-
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-            
+
 # -------------------------
 # MAIN TRADE CYCLE
 # -------------------------
@@ -684,12 +711,15 @@ BUY_LOCK_SECONDS = 60
 def trade_cycle():
     global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS
 
+    # init snapshot once
     if start_balance_usdt is None:
         start_balance_usdt = get_free_usdt()
         notify(f"🔰 Start balance snapshot: ${start_balance_usdt:.6f}")
 
     while True:
         try:
+            cleanup_recent_buys()
+
             open_orders_global = client.get_open_orders()
             if open_orders_global:
                 notify("⏳ Still waiting for previous trade(s) to finish...")
@@ -715,6 +745,18 @@ def trade_cycle():
             symbol, price, volume, change = candidate
             notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, vol≈{volume})")
 
+            # before attempting buy, check RECENT_BUYS again (race safety)
+            last = RECENT_BUYS.get(symbol)
+            if last:
+                if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
+                    notify(f"⏭️ Skipping {symbol} due to recent buy cooldown.")
+                    time.sleep(CYCLE_DELAY)
+                    continue
+                if last.get('price') and price > last['price'] * (1 + REBUY_MAX_RISE_PCT / 100.0):
+                    notify(f"⏭️ Skipping {symbol} because price rose >{REBUY_MAX_RISE_PCT}% since last buy.")
+                    time.sleep(CYCLE_DELAY)
+                    continue
+
             usd_to_buy = min(TRADE_USD, get_free_usdt())
             if usd_to_buy < 1.0:
                 notify(f"⚠️ Not enough USDT to buy (free={get_free_usdt():.4f}). Sleeping...")
@@ -733,6 +775,14 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
+            # record the recent buy immediately (prevents near-immediate rebuy)
+            RECENT_BUYS[symbol] = {
+                'ts': time.time(),
+                'price': entry_price,
+                'profit': None,
+                'cooldown': REBUY_COOLDOWN
+            }
+
             ACTIVE_SYMBOL = symbol
             LAST_BUY_TS = time.time()
 
@@ -741,8 +791,24 @@ def trade_cycle():
 
             closed, exit_price, profit_usd = monitor_and_roll(symbol, qty, entry_price, f)
 
+            # clear active
             ACTIVE_SYMBOL = None
 
+            # update RECENT_BUYS result & cooldown
+            now2 = time.time()
+            ent = RECENT_BUYS.get(symbol, {})
+            ent['ts'] = now2
+            ent['price'] = entry_price
+            ent['profit'] = profit_usd
+            if profit_usd is None:
+                ent['cooldown'] = REBUY_COOLDOWN
+            elif profit_usd < 0:
+                ent['cooldown'] = LOSS_COOLDOWN
+            else:
+                ent['cooldown'] = REBUY_COOLDOWN
+            RECENT_BUYS[symbol] = ent
+
+            # optional: transfer profit if positive
             if closed and profit_usd > 0:
                 send_profit_to_funding(profit_usd)
 
