@@ -58,7 +58,7 @@ RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 60
 
-CACHE_TTL = 60   # unified cache TTL for tickers (seconds)
+CACHE_TTL = 90   # unified cache TTL for tickers (seconds)
 
 # -------------------------
 # HELPERS: formatting & rounding
