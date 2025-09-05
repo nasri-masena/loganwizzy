@@ -259,10 +259,10 @@ def pick_coin():
 
     MIN_QVOL = max(MIN_VOLUME, 500_000)
     MIN_CHANGE_PCT = max(1.0, MOVEMENT_MIN_PCT if 'MOVEMENT_MIN_PCT' in globals() else 1.0)
-    TOP_CANDIDATES = 120
+    TOP_CANDIDATES = 200
     MIN_VOL_RATIO = 1.4
-    MIN_RECENT_PCT = 1.0
-    KLINES_LIMIT = 12
+    MIN_RECENT_PCT = 0.5
+    KLINES_LIMIT = 10
 
     for t in tickers:
         sym = t.get('symbol')
