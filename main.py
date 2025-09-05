@@ -364,7 +364,8 @@ def is_symbol_tradable(symbol):
 
 def place_safe_market_buy(symbol, usd_amount):
     """
-    Market buy using qty formatted to stepSize. Returns (executed_qty, avg_price) or (None, None).
+    Market buy: returns (executed_qty, avg_price) or (None, None).
+    NOTE: this function NO LONGER places OCO — monitor_and_roll will place the initial protective orders.
     """
     # temp-skip check
     now = time.time()
@@ -418,13 +419,14 @@ def place_safe_market_buy(symbol, usd_amount):
 
     executed_qty, avg_price = _parse_market_buy_exec(order_resp)
 
-    # reconcile with actual free balance (single source of truth)
+    # small wait then fetch actual free balance to reconcile (single source of truth)
     time.sleep(0.8)
     asset = symbol[:-len(QUOTE)]
     free_after = get_free_asset(asset)
     free_after_clip = round_step(free_after, f['stepSize'])
 
-    if free_after_clip >= f['minQty'] and (executed_qty <= 0 or (abs(free_after_clip - executed_qty) / (executed_qty + 1e-9) > 0.02)):
+    # If parsed executed_qty is zero or disagrees with free balance ( >2% ), prefer balance
+    if free_after_clip >= f['minQty'] and (executed_qty <= 0 or abs(free_after_clip - executed_qty) / (executed_qty + 1e-9) > 0.02):
         notify(f"ℹ️ Adjusting executed qty from parsed {executed_qty} to actual free balance {free_after_clip}")
         executed_qty = free_after_clip
         if not avg_price or avg_price == 0.0:
@@ -437,13 +439,9 @@ def place_safe_market_buy(symbol, usd_amount):
 
     notify(f"✅ BUY {symbol}: qty={executed_qty} ~price={avg_price:.8f} notional≈${executed_qty*avg_price:.6f}")
 
-    # place protective orders (OCO or fallback)
-    oco_res = place_oco_sell(symbol, executed_qty, avg_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-    if oco_res is None:
-        notify("⚠️ OCO placement failed after buy; position may be UNPROTECTED.")
-
+    # IMPORTANT: DO NOT place OCO here. monitor_and_roll will handle it once it confirms balances / open orders.
     return executed_qty, avg_price
-
+    
 # -------------------------
 # OCO SELL with fallbacks
 # -------------------------
@@ -586,34 +584,75 @@ def cancel_all_open_orders(symbol):
 # MONITOR & ROLL
 # -------------------------
 def monitor_and_roll(symbol, qty, entry_price, f):
+    """
+    Monitor OCO placed by this function (it will place the initial OCO if none exists).
+    Returns (closed_bool, exit_price, profit_usd)
+    """
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
     curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
 
-    oco = place_oco_sell(symbol, qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-    if oco is None:
-        notify(f"❌ Initial OCO failed for {symbol}, aborting monitor.")
-        return False, entry_price, 0.0
+    asset = symbol[:-len(QUOTE)]
+
+    # Wait a short while for exchange to update balances/orders and check if protective orders already exist.
+    found_open_orders = False
+    free_qty = 0.0
+    for attempt in range(8):  # ~ up to 4 seconds
+        time.sleep(0.5)
+        try:
+            open_orders = client.get_open_orders(symbol=symbol)
+            free_qty = get_free_asset(asset)
+            if open_orders:
+                found_open_orders = True
+                notify(f"ℹ️ Found existing open orders for {symbol} after buy — assuming protective orders already placed.")
+                break
+            # if free_qty looks like the bought qty (allow tiny slippage) break and place OCO here
+            if free_qty >= max(qty * 0.95, f['minQty']):
+                break
+        except Exception:
+            # ignore transient errors and retry
+            pass
+
+    # If no open orders found, place initial OCO using available free_qty (prefer actual free balance)
+    # set used_qty to free_qty if available, else fallback to qty
+    try:
+        free_now = get_free_asset(asset)
+    except Exception:
+        free_now = 0.0
+    used_qty = round_step(free_now, f['stepSize']) if free_now >= f['minQty'] else round_step(qty, f['stepSize'])
+
+    # If we don't see open orders and used_qty looks reasonable -> place OCO
+    initial_oco = None
+    if not found_open_orders:
+        initial_oco = place_oco_sell(symbol, used_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+        if initial_oco is None:
+            notify(f"❌ Initial OCO failed for {symbol}, aborting monitor.")
+            return False, entry_price, 0.0
+        else:
+            notify(f"✅ Initial protective orders placed for {symbol} (qty={used_qty}).")
+    else:
+        # If open orders were found earlier, we assume they're the protective orders (do not abort)
+        initial_oco = True
 
     last_tp = None
 
     while True:
         try:
             time.sleep(SLEEP_BETWEEN_CHECKS)
-            asset = symbol[:-len(QUOTE)]
             free_qty = get_free_asset(asset)
             open_orders = client.get_open_orders(symbol=symbol)
             price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
 
+            # Position closed? no free asset or no open orders
             if free_qty < round_step(qty * 0.05, f['stepSize']) and len(open_orders) == 0:
                 exit_price = price_now
                 profit_usd = (exit_price - entry_price) * qty
                 notify(f"✅ Position closed for {symbol}: exit={exit_price:.8f}, profit≈${profit_usd:.6f}")
                 return True, exit_price, profit_usd
 
+            # near TP -> roll
             near_trigger = price_now >= curr_tp * (1 - TRIGGER_PROXIMITY)
             if near_trigger:
                 notify(f"🔎 Price near TP (price={price_now:.8f}, TP={curr_tp:.8f}). Rolling OCO...")
-                # cancel existing orders & re-place with raised TP
                 cancel_all_open_orders(symbol)
 
                 new_sl = entry_price if last_tp is None else last_tp
@@ -634,7 +673,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-
+            
 # -------------------------
 # MAIN TRADE CYCLE
 # -------------------------
