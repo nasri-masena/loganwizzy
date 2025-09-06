@@ -29,17 +29,19 @@ COOLDOWN_AFTER_EXIT = 10
 
 TRIGGER_PROXIMITY = 0.01
 STEP_INCREMENT_PCT = 0.02
-BASE_TP_PCT = 1.5
-BASE_SL_PCT = 1.0
+BASE_TP_PCT = 2.0      # initial TP ~2% above entry
+BASE_SL_PCT = 1.0      # initial SL ~1% below entry
 
 MICRO_TP_PCT = 0.8
 MICRO_TP_FRACTION = 0.35
 
+# Rolling fine-tune
 ROLL_ON_RISE_PCT = 0.8            # percent rise from entry that can trigger a roll (e.g. 0.8%)
-ROLL_TRIGGER_DELTA_ABS = 0.010   # absolute rise from entry in quote units (e.g. 0.012 = 1.2 cents)
-ROLL_TP_STEP_ABS = 0.025          # on roll, increase TP by this absolute amount (e.g. 0.010 = 10 cents)
-ROLL_SL_STEP_ABS = 0.008         # on roll, raise SL by this absolute amount (e.g. 0.017)
-ROLL_COOLDOWN_SECONDS = 15       # minimum seconds between consecutive rolls
+ROLL_TRIGGER_DELTA_ABS = 0.010    # absolute rise from entry in quote units (e.g. 0.010 = 1 cent)
+ROLL_TP_STEP_ABS = 0.030          # on roll, increase TP by this absolute amount (e.g. 0.030 = 3 cents)
+# We'll use last_tp/entry to move SL (safer). Keep SL step small or zero.
+ROLL_SL_STEP_ABS = 0.000          # not used (we prefer to set SL = entry or last_tp)
+ROLL_COOLDOWN_SECONDS = 15        # minimum seconds between consecutive rolls
 
 # -------------------------
 # INIT / GLOBALS
@@ -576,7 +578,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
     except Exception as e:
         notify(f"⚠️ place_micro_tp error: {e}")
         return None, 0.0
-        
+
 # -------------------------
 # OCO SELL with fallbacks
 # -------------------------
@@ -761,7 +763,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         # small skip for symbol on repeated failure
         TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
         return None
-        
+
 # -------------------------
 # CANCEL HELPERS
 # -------------------------
@@ -852,9 +854,8 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                 # compute new TP & SL using absolute steps (and respect tickSize rounding) BEFORE cancelling old orders
                 tick = f.get('tickSize', 0.0) or 0.0
                 candidate_tp = curr_tp + ROLL_TP_STEP_ABS
-                candidate_sl = curr_sl + ROLL_SL_STEP_ABS
-                if candidate_sl > entry_price:
-                    candidate_sl = entry_price
+                # IMPORTANT: set SL to entry on first roll (locks loss at zero), otherwise to last_tp to lock profit
+                candidate_sl = entry_price if last_tp is None else last_tp
 
                 new_tp = clip_tp(candidate_tp, tick)
                 new_sl = clip_sl(candidate_sl, tick)
@@ -912,7 +913,6 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                 else:
                     notify("⚠️ Roll attempt failed; previous orders are cancelled. Will try to re-place previous OCO on next loop.")
                     # attempt to re-place previous protective OCO to avoid being unprotected
-                    # small delay then attempt re-place of previous TP/SL using orig qty
                     time.sleep(0.4)
                     fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
                     if fallback:
@@ -923,7 +923,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-            
+
 # -------------------------
 # MAIN TRADE CYCLE
 # -------------------------
@@ -1105,7 +1105,7 @@ def trade_cycle():
 
         # pause between loops
         time.sleep(30)
-        
+
 # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
