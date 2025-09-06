@@ -32,11 +32,11 @@ STEP_INCREMENT_PCT = 0.02
 BASE_TP_PCT = 3.0
 BASE_SL_PCT = 1.0
 
-ROLL_ON_RISE_PCT = 0.8            # percent rise from entry that can trigger a roll (e.g. 0.8%)
-ROLL_TRIGGER_DELTA_ABS = 0.010   # absolute rise from entry in quote units (e.g. 0.012 = 1.2 cents)
-ROLL_TP_STEP_ABS = 0.025          # on roll, increase TP by this absolute amount (e.g. 0.010 = 10 cents)
-ROLL_SL_STEP_ABS = 0.008         # on roll, raise SL by this absolute amount (e.g. 0.017)
-ROLL_COOLDOWN_SECONDS = 15       # minimum seconds between consecutive rolls
+ROLL_ON_RISE_PCT = 1.0            # percent rise from entry that can trigger a roll (e.g. 0.8%)
+ROLL_TRIGGER_DELTA_ABS = 0.012   # absolute rise from entry in quote units (e.g. 0.012 = 1.2 cents)
+ROLL_TP_STEP_ABS = 0.020          # on roll, increase TP by this absolute amount (e.g. 0.010 = 10 cents)
+ROLL_SL_STEP_ABS = 0.005         # on roll, raise SL by this absolute amount (e.g. 0.017)
+ROLL_COOLDOWN_SECONDS = 20       # minimum seconds between consecutive rolls
 
 # -------------------------
 # INIT / GLOBALS
