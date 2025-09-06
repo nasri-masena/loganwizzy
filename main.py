@@ -65,7 +65,7 @@ REBUY_MAX_RISE_PCT = 5.0    # don't re-buy if price rose > 5% since last buy
 # --- rate-limit backoff & cache adjustments ---
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
-RATE_LIMIT_BASE_SLEEP = 80
+RATE_LIMIT_BASE_SLEEP = 90
 
 CACHE_TTL = 90   # unified cache TTL for tickers (seconds)
 
