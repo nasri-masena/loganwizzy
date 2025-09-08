@@ -19,8 +19,8 @@ CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
 PRICE_MIN = 1.0
-PRICE_MAX = 3.0
-MIN_VOLUME = 3_000_000
+PRICE_MAX = 4.0
+MIN_VOLUME = 5_000_000
 MOVEMENT_MIN_PCT = 1.0
 
 TRADE_USD = 7.0
@@ -303,7 +303,7 @@ def pick_coin():
     now = time.time()
 
     # local tuning (feel free to move these to module-level config)
-    MAX_24H_RISE_PCT = 3.0
+    MAX_24H_RISE_PCT = 4.0
     RECENT_PCT_MIN = 1.0
     RECENT_PCT_MAX = 2.0
     TOP_CANDIDATES = 120
