@@ -282,7 +282,7 @@ def get_price_cached(symbol):
     except Exception as e:
         notify(f"⚠️ get_price_cached fallback failed for {symbol}: {e}")
         return None
-        
+
 def cleanup_temp_skip():
     now = time.time()
     for s, until in list(TEMP_SKIP.items()):
@@ -301,71 +301,83 @@ def pick_coin():
     cleanup_temp_skip()
     cleanup_recent_buys()
     now = time.time()
+
+    # local tuning (feel free to move these to module-level config)
+    MAX_24H_RISE_PCT = 3.0
+    RECENT_PCT_MIN = 1.0
+    RECENT_PCT_MAX = 2.0
+    TOP_CANDIDATES = 120
+    MIN_VOL_RATIO = 1.8
+    KLINES_LIMIT = 20
+
     tickers = get_tickers_cached() or []
     prefiltered = []
 
     MIN_QVOL = max(MIN_VOLUME, 500_000)
-    MIN_CHANGE_PCT = max(1.0, MOVEMENT_MIN_PCT if 'MOVEMENT_MIN_PCT' in globals() else 1.0)  # require >=1% 24h
-    TOP_CANDIDATES = 80      # reduce how many we deeper-check to limit API calls
-    MIN_VOL_RATIO = 1.8      # stricter volume spike requirement
-    MIN_RECENT_PCT = 1.5     # require recent move >= 1%
-    KLINES_LIMIT = 20        # enough candles for EMA/RSI but tune for weight
+    MIN_CHANGE_PCT = max(1.0, MOVEMENT_MIN_PCT if 'MOVEMENT_MIN_PCT' in globals() else 1.0)
 
-    # helper: simple EMA
     def ema(values, period):
         if not values or period <= 0:
             return None
         alpha = 2.0 / (period + 1.0)
-        # seed with first value
         e = float(values[0])
         for v in values[1:]:
             e = alpha * float(v) + (1 - alpha) * e
         return e
 
+    # Phase 1: coarse prefilter using tickers (cheap)
     for t in tickers:
         sym = t.get('symbol')
         if not sym or not sym.endswith(QUOTE):
             continue
+
         skip_until = TEMP_SKIP.get(sym)
         if skip_until and now < skip_until:
             continue
+
         last = RECENT_BUYS.get(sym)
         try:
             price = float(t.get('lastPrice') or 0.0)
+            qvol = float(t.get('quoteVolume') or 0.0)
+            change_pct = float(t.get('priceChangePercent') or 0.0)
         except Exception:
             continue
+
+        # avoid immediate rebuys and big rises since last buy
         if last:
             if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
                 continue
             last_price = last.get('price')
             if last_price and price > last_price * (1 + REBUY_MAX_RISE_PCT / 100.0):
                 continue
-        try:
-            qvol = float(t.get('quoteVolume') or 0.0)
-            change_pct = float(t.get('priceChangePercent') or 0.0)
-        except Exception:
-            continue
-        # price filter
+
+        # price boundary
         if not (PRICE_MIN <= price <= PRICE_MAX):
             continue
-        # volume / 24h change filters
+
+        # skip pumpy names (24h)
+        if change_pct >= MAX_24H_RISE_PCT:
+            continue
+
+        # volume and 24h movement baseline
         if qvol < MIN_QVOL:
             continue
         if change_pct < MIN_CHANGE_PCT:
             continue
+
         prefiltered.append((sym, price, qvol, change_pct))
 
     if not prefiltered:
         return None
 
-    # focus on top by volume first
+    # focus on top by quote volume to limit heavy klines calls
     prefiltered.sort(key=lambda x: x[2], reverse=True)
     prefiltered = prefiltered[:TOP_CANDIDATES]
 
     candidates = []
     for sym, price, qvol, change_pct in prefiltered:
         try:
-            # fetch klines; be defensive about rate-limits
+            # fetch klines with defensive rate-limit handling
             try:
                 klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
             except Exception as e:
@@ -385,7 +397,6 @@ def pick_coin():
             closes = []
             for k in klines:
                 try:
-                    # use quote volume if present (k[7]), fallback to volume*close
                     if len(k) > 7 and k[7] is not None:
                         vols.append(float(k[7]))
                     else:
@@ -406,29 +417,30 @@ def pick_coin():
             avg_vol = (sum(prev_slice) / max(len(prev_slice), 1)) if prev_slice else recent_vol
             vol_ratio = recent_vol / (avg_vol + 1e-9)
 
-            # recent percent change: compare last to 3 candles ago (approx 15m)
+            # recent percent change: last vs ~15m ago (4 candles)
             recent_pct = 0.0
             if len(closes) >= 4 and closes[-4] > 0:
                 recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
 
-            # require volume spike and recent rise
-            if vol_ratio < MIN_VOL_RATIO:
-                continue
-            if recent_pct < MIN_RECENT_PCT:
+            # require recent breakout in desired small window
+            if recent_pct < RECENT_PCT_MIN or recent_pct > RECENT_PCT_MAX:
                 continue
 
-            # quick momentum: last 3 closes should show at least 2-up candles or monotonic increase
+            # require volume spike
+            if vol_ratio < MIN_VOL_RATIO:
+                continue
+
+            # quick momentum: at least one consecutive up in last 3 closes
             last3 = closes[-3:]
             ups = 0
             if last3[1] > last3[0]:
                 ups += 1
             if last3[2] > last3[1]:
                 ups += 1
-            if ups < 1:  # require at least one consecutive up move
+            if ups < 1:
                 continue
 
-            # EMA confirmation: short EMA > long EMA (momentum)
-            # use last 3 for short, last 10 for long (or available)
+            # EMA confirmation
             short_period = 3
             long_period = 10
             if len(closes) >= long_period:
@@ -443,11 +455,10 @@ def pick_coin():
 
             if short_ema is None or long_ema is None:
                 continue
-            # require a positive EMA uplift (short > long)
-            if not (short_ema > long_ema * 0.999):  # slight tolerance
+            if not (short_ema > long_ema * 0.999):
                 continue
 
-            # quick RSI sanity (avoid overbought)
+            # RSI sanity check (avoid overbought)
             rsi_ok = True
             if len(closes) >= 15:
                 gains = []
@@ -462,17 +473,25 @@ def pick_coin():
                 avg_loss = sum(losses) / 14.0 if losses else 1e-9
                 rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
                 rsi = 100 - (100 / (1 + rs))
-                # avoid very overbought names
                 if rsi > 65:
                     rsi_ok = False
             if not rsi_ok:
                 continue
 
-            # momentum score: combine change, volume, vol_ratio and EMA uplift
+            # NEW: require immediate orderbook bullishness before accepting candidate
+            try:
+                if not orderbook_bullish(sym, depth=5, min_imbalance=1.1, max_spread_pct=0.6):
+                    continue
+            except Exception:
+                # be conservative on orderbook errors
+                continue
+
+            # score and append
             ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
             score = change_pct * qvol * vol_ratio * max(1.0, recent_pct / 2.0) * (1.0 + ema_uplift)
 
             candidates.append((sym, price, qvol, change_pct, vol_ratio, recent_pct, score))
+
         except Exception as e:
             notify(f"⚠️ pick_coin processing error for {sym}: {e}")
             continue
@@ -545,7 +564,7 @@ def orderbook_bullish(symbol, depth=5, min_imbalance=1.1, max_spread_pct=0.6):
         return (imbalance >= min_imbalance) and (spread_pct <= max_spread_pct)
     except Exception:
         return False
-        
+
 def is_symbol_tradable(symbol):
     try:
         info = get_symbol_info_cached(symbol)
@@ -596,7 +615,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
         except Exception as e:
             notify(f"⚠️ Orderbook check error for {symbol}: {e}")
             # fail-open: continue (avoid blocking buys on transient ob errors)
-    
+
     # get price (use cache first)
     price = get_price_cached(symbol)
     if price is None:
@@ -697,7 +716,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
 
     notify(f"✅ BUY {symbol}: qty={executed_qty} ~price={avg_price:.8f} notional≈${executed_qty*avg_price:.6f}")
     return executed_qty, avg_price
-    
+
 # --- Modified place_micro_tp: returns (order_resp, sell_qty) or (None, 0.0)
 def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO_TP_FRACTION):
     try:
@@ -811,7 +830,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
     except Exception as e:
         notify(f"⚠️ place_micro_tp error: {e}")
         return None, 0.0, None
-        
+
 # -------------------------
 # OCO SELL with fallbacks
 # -------------------------
@@ -1003,7 +1022,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         notify("❌ All attempts to protect position failed (no TP/SL placed).")
         TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
         return None
-        
+
 # -------------------------
 # CANCEL HELPERS
 # -------------------------
@@ -1026,7 +1045,7 @@ def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
         OPEN_ORDERS_CACHE['data'] = None
     except Exception as e:
         notify(f"⚠️ Failed to cancel orders: {e}")
-        
+
 # -------------------------
 # MONITOR & ROLL
 # -------------------------
@@ -1157,7 +1176,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-            
+
 # =========================
 # DAILY METRICS (per-date)
 # =========================
@@ -1374,7 +1393,7 @@ def trade_cycle():
             time.sleep(CYCLE_DELAY)
 
         time.sleep(30)
-        
+
 # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
