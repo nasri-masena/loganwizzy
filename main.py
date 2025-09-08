@@ -323,11 +323,11 @@ def pick_coin():
     now = time.time()
 
     # relaxed tuning compared to previous aggressive settings
-    MAX_24H_RISE_PCT = 12.0   # allow coins that rose up to ~12% in 24h (was 5%)
+    MAX_24H_RISE_PCT = 5.0   # allow coins that rose up to ~12% in 24h (was 5%)
     RECENT_PCT_MIN = 0.6      # accept smaller immediate moves (was 1.0)
     RECENT_PCT_MAX = 4.0      # allow slightly bigger short moves (was 2.0)
     TOP_CANDIDATES = 200      # evaluate more symbols (was 120)
-    MIN_VOL_RATIO = 1.4       # looser volume spike requirement (was 1.8)
+    MIN_VOL_RATIO = 1.8       # looser volume spike requirement (was 1.8)
     KLINES_LIMIT = 14         # fewer candles to reduce API weight a bit (was 20)
 
     tickers = get_tickers_cached() or []
