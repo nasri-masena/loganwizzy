@@ -1,4 +1,4 @@
-import os
+mport os
 import math
 import time
 import random
@@ -18,33 +18,38 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
+# price / liquidity filters
 PRICE_MIN = 1.0
 PRICE_MAX = 3.0
-MIN_VOLUME = 3_000_000
+MIN_VOLUME = 5_000_000          # tighten minimum daily quote volume to avoid illiquid coins
 MOVEMENT_MIN_PCT = 1.0
 
-TRADE_USD = 7.0
-SLEEP_BETWEEN_CHECKS = 60
-CYCLE_DELAY = 13
+# runtime / pacing
+TRADE_USD = 10.0
+SLEEP_BETWEEN_CHECKS = 30       # more responsive monitoring (still conservative)
+CYCLE_DELAY = 10
 COOLDOWN_AFTER_EXIT = 10
 
+# order / protection
 TRIGGER_PROXIMITY = 0.06
 STEP_INCREMENT_PCT = 0.02
 BASE_TP_PCT = 2.0
 BASE_SL_PCT = 2.0
 
-MICRO_TP_PCT = 0.8
-MICRO_TP_FRACTION = 0.35
+# micro-take profit
+MICRO_TP_PCT = 1.0            # slightly larger micro TP to cover fees/slippage
+MICRO_TP_FRACTION = 0.40
+MICRO_MAX_WAIT = 18.0         # wait longer for micro TP fills
 
-ROLL_ON_RISE_PCT = 0.5            # percent rise from entry that can trigger a roll (e.g. 0.8%)
-ROLL_TRIGGER_DELTA_ABS = 0.007   # absolute rise from entry in quote units (e.g. 0.012 = 1.2 cents)
-ROLL_TP_STEP_ABS = 0.015          # on roll, increase TP by this absolute amount (e.g. 0.010 = 10 cents)
-ROLL_SL_STEP_ABS = 0.004         # on roll, raise SL by this absolute amount (e.g. 0.017)
-ROLL_COOLDOWN_SECONDS = 30 # minimum seconds between consecutive rolls
+# rolling config
+ROLL_ON_RISE_PCT = 0.5            # percent rise from entry that can trigger a roll (relative)
+ROLL_TRIGGER_PCT = 0.75           # additional percent-based trigger (relative)
+ROLL_TRIGGER_DELTA_ABS = 0.007    # absolute fallback trigger
+ROLL_TP_STEP_ABS = 0.015          # on roll, increase TP by this absolute amount
+ROLL_SL_STEP_ABS = 0.004          # on roll, raise SL by this absolute amount
+ROLL_COOLDOWN_SECONDS = 30        # minimum seconds between consecutive rolls
 MAX_ROLLS_PER_POSITION = 3
 ROLL_POST_CANCEL_JITTER = (0.3, 0.8)
-
-
 
 # -------------------------
 # INIT / GLOBALS
@@ -315,26 +320,25 @@ def orderbook_bullish(symbol, depth=5, min_imbalance=1.05, max_spread_pct=1.5):
     except Exception:
         return False
         
-
 def pick_coin():
     global RATE_LIMIT_BACKOFF
     cleanup_temp_skip()
     cleanup_recent_buys()
     now = time.time()
 
-    # relaxed tuning compared to previous aggressive settings
-    MAX_24H_RISE_PCT = 5.0   # allow coins that rose up to ~12% in 24h (was 5%)
-    RECENT_PCT_MIN = 0.6      # accept smaller immediate moves (was 1.0)
-    RECENT_PCT_MAX = 4.0      # allow slightly bigger short moves (was 2.0)
-    TOP_CANDIDATES = 200      # evaluate more symbols (was 120)
-    MIN_VOL_RATIO = 1.8       # looser volume spike requirement (was 1.8)
-    KLINES_LIMIT = 14         # fewer candles to reduce API weight a bit (was 20)
+    # tuned for higher quality picks (less noise)
+    MAX_24H_RISE_PCT = 10.0   # avoid heavy pumps but allow healthy momentum
+    RECENT_PCT_MIN = 1.0      # require >=1% recent move (last ~15m)
+    RECENT_PCT_MAX = 3.5      # avoid extremely fast short pumps
+    TOP_CANDIDATES = 150      # evaluate top volume coins
+    MIN_VOL_RATIO = 1.6       # require moderate recent volume spike
+    KLINES_LIMIT = 14         # fewer candles to reduce API weight
 
     tickers = get_tickers_cached() or []
     prefiltered = []
 
-    MIN_QVOL = max(MIN_VOLUME, 300_000)  # reduce the hard floor so more pairs pass
-    MIN_CHANGE_PCT = max(0.8, MOVEMENT_MIN_PCT if 'MOVEMENT_MIN_PCT' in globals() else 0.8)
+    MIN_QVOL = max(MIN_VOLUME, 300_000)
+    MIN_CHANGE_PCT = max(1.0, MOVEMENT_MIN_PCT if 'MOVEMENT_MIN_PCT' in globals() else 1.0)
 
     def ema(values, period):
         if not values or period <= 0:
@@ -375,14 +379,14 @@ def pick_coin():
         if not (PRICE_MIN <= price <= PRICE_MAX):
             continue
 
-        # skip EXTREME pump names (24h) but be more permissive
+        # skip EXTREME pump names (24h)
         if change_pct >= MAX_24H_RISE_PCT:
             continue
 
         # volume and 24h movement baseline
         if qvol < MIN_QVOL:
             continue
-        if change_pct < MIN_CHANGE_PCT:
+        if abs(change_pct) < MIN_CHANGE_PCT:
             continue
 
         prefiltered.append((sym, price, qvol, change_pct))
@@ -442,11 +446,11 @@ def pick_coin():
             if len(closes) >= 4 and closes[-4] > 0:
                 recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
 
-            # require recent breakout in desired small window (looser)
+            # require recent breakout in desired small window
             if recent_pct < RECENT_PCT_MIN or recent_pct > RECENT_PCT_MAX:
                 continue
 
-            # require volume spike (looser)
+            # require volume spike
             if vol_ratio < MIN_VOL_RATIO:
                 continue
 
@@ -460,7 +464,7 @@ def pick_coin():
             if ups < 1:
                 continue
 
-            # EMA confirmation
+            # EMA confirmation (slightly stronger)
             short_period = 3
             long_period = 10
             if len(closes) >= long_period:
@@ -475,7 +479,7 @@ def pick_coin():
 
             if short_ema is None or long_ema is None:
                 continue
-            if not (short_ema > long_ema * 0.995):  # slightly more tolerant
+            if not (short_ema > long_ema * 1.0005):  # tighter than before to prefer stronger momentum
                 continue
 
             # RSI sanity check (avoid very overbought)
@@ -493,24 +497,21 @@ def pick_coin():
                 avg_loss = sum(losses) / 14.0 if losses else 1e-9
                 rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
                 rsi = 100 - (100 / (1 + rs))
-                if rsi > 68:  # slightly higher threshold tolerated
+                if rsi > 66:  # slightly lower threshold
                     rsi_ok = False
             if not rsi_ok:
                 continue
 
-            # NEW: require immediate orderbook bullishness before accepting candidate
-            # but allow looser imbalance/spread (orderbook_bullish uses softer defaults now)
+            # require immediate orderbook bullishness before accepting candidate
             try:
-                if not orderbook_bullish(sym, depth=5, min_imbalance=1.05, max_spread_pct=1.5):
+                if not orderbook_bullish(sym, depth=5, min_imbalance=1.1, max_spread_pct=1.0):
                     continue
             except Exception:
-                # if OB fails, be permissive and continue (to avoid losing every candidate)
-                # but here we choose to skip noisy OB errors conservatively:
                 continue
 
-            # score and append
+            # score and append (more weight to recent_pct and vol_ratio, normalize)
             ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-            score = change_pct * qvol * vol_ratio * max(1.0, recent_pct / 2.0) * (1.0 + ema_uplift)
+            score = (recent_pct * 10.0) + (math.log1p(qvol) * 0.5) + (vol_ratio * 5.0) + (change_pct * 2.0) + (ema_uplift * 100.0)
 
             candidates.append((sym, price, qvol, change_pct, vol_ratio, recent_pct, score))
 
@@ -722,7 +723,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
     notify(f"✅ BUY {symbol}: qty={executed_qty} ~price={avg_price:.8f} notional≈${executed_qty*avg_price:.6f}")
     return executed_qty, avg_price
     
-# --- Modified place_micro_tp: returns (order_resp, sell_qty) or (None, 0.0)
+# --- Modified place_micro_tp: returns (order_resp, sell_qty, tp_price) or (None, 0.0, None)
 def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO_TP_FRACTION):
     try:
         sell_qty = float(qty) * float(fraction)
@@ -752,22 +753,21 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
             except Exception:
                 pass
 
-            # shorter, less-frequent polling to lower API weight
+            # poll longer to give limit a chance to fill
             order_id = None
             if isinstance(order, dict):
                 order_id = order.get('orderId') or order.get('orderId')
             if not order_id:
                 return order, sell_qty, tp_price
 
-            poll_interval = 0.6  # slightly larger interval
-            max_wait = 4.0       # reduced wait window
+            poll_interval = 0.6
+            max_wait = MICRO_MAX_WAIT
             waited = 0.0
 
             while waited < max_wait:
                 try:
                     status = client.get_order(symbol=symbol, orderId=order_id)
                 except Exception:
-                    # break on inability to fetch order (avoid repeated failures)
                     break
 
                 executed_qty = 0.0
@@ -839,15 +839,10 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
 # -------------------------
 # OCO SELL with fallbacks
 # -------------------------
+# (unchanged except integrated above improvements)
 def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
-    """
-    Robust OCO placement:
-      - respects minNotional (will try to raise TP until qty*TP >= minNotional or give up)
-      - tries standard params, alt params, then fallback separate orders
-      - returns same style dict as before or None
-    """
     global RATE_LIMIT_BACKOFF  # we modify this global on rate-limit detection
 
     info = get_symbol_info_cached(symbol)
@@ -1123,11 +1118,12 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                 return True, exit_price, profit_usd
 
             price_delta = price_now - entry_price
+            # triggers: percent relative OR absolute fallback
             rise_trigger_pct = price_now >= entry_price * (1 + ROLL_ON_RISE_PCT / 100.0)
-            rise_trigger_abs = price_delta >= ROLL_TRIGGER_DELTA_ABS
+            rise_trigger_abs = price_delta >= max(ROLL_TRIGGER_DELTA_ABS, entry_price * (ROLL_TRIGGER_PCT/100.0))
             near_trigger = (price_now >= curr_tp * (1 - TRIGGER_PROXIMITY)) and (price_now < curr_tp * 1.05)
             tick = f.get('tickSize', 0.0) or 0.0
-            minimal_move = max(ROLL_TRIGGER_DELTA_ABS * 0.4, tick or 0.0)
+            minimal_move = max(entry_price * 0.004, ROLL_TRIGGER_DELTA_ABS * 0.4, tick or 0.0)
             moved_enough = price_delta >= minimal_move
             now_ts = time.time()
             can_roll = (now_ts - last_roll_ts) >= ROLL_COOLDOWN_SECONDS
