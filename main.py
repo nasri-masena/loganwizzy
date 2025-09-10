@@ -362,263 +362,189 @@ def orderbook_bullish(symbol, depth=5, min_imbalance=1.05, max_spread_pct=1.5):
 # -------------------------
 def pick_coin():
     global RATE_LIMIT_BACKOFF
-
-    # --- config (read global if present, else fallback) ---
-    QUOTE_LOCAL = globals().get('QUOTE', 'USDT')
-    PRICE_MIN = globals().get('PRICE_MIN', 0.5)
-    PRICE_MAX = globals().get('PRICE_MAX', 3.0)
-
-    MIN_24H_VOL = globals().get('MIN_24H_VOL', 5_000_000)
-    MIN_24H_VOL_UPTO_3 = globals().get('MIN_24H_VOL_UPTO_3', 2_000_000)
-    MIN_24H_VOL_LOW_PRICE = globals().get('MIN_24H_VOL_LOW_PRICE', 1_000_000)
-
-    MAX_24H_CHANGE = globals().get('MAX_24H_CHANGE', 15.0)
-    MIN_24H_CHANGE = globals().get('MIN_24H_CHANGE', 0.5)
-
-    MIN_5M_PCT = globals().get('MIN_5M_PCT', 0.8)
-    MIN_1M_PCT = globals().get('MIN_1M_PCT', 0.5)
-
-    KLINES_5M_LIMIT = globals().get('KLINES_5M_LIMIT', 6)
-    KLINES_1M_LIMIT = globals().get('KLINES_1M_LIMIT', 6)
-    EMA_SHORT = globals().get('EMA_SHORT', 3)
-    EMA_LONG = globals().get('EMA_LONG', 10)
-    RSI_PERIOD = globals().get('RSI_PERIOD', 14)
-
-    OB_DEPTH = globals().get('OB_DEPTH', 5)
-    MIN_OB_IMBALANCE = globals().get('MIN_OB_IMBALANCE', 1.1)
-    MAX_OB_SPREAD_PCT = globals().get('MAX_OB_SPREAD_PCT', 1.2)
-    MIN_OB_LIQUIDITY = globals().get('MIN_OB_LIQUIDITY', 3000.0)
-
-    TOP_BY_24H_VOLUME = globals().get('TOP_BY_24H_VOLUME', 200)
-    REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.12)
-
-    WEIGHT_RECENT_PCT_5M = globals().get('WEIGHT_RECENT_PCT_5M', 4.0)
-    WEIGHT_RECENT_PCT_1M = globals().get('WEIGHT_RECENT_PCT_1M', 2.0)
-    WEIGHT_VOL_RATIO_5M = globals().get('WEIGHT_VOL_RATIO_5M', 3.0)
-    WEIGHT_EMA = globals().get('WEIGHT_EMA', 5.0)
-    WEIGHT_RSI = globals().get('WEIGHT_RSI', 1.5)
-    WEIGHT_24H_CHANGE = globals().get('WEIGHT_24H_CHANGE', 1.0)
-    WEIGHT_OB = globals().get('WEIGHT_OB', 2.0)
-    PRICE_TARGET_BOOST = globals().get('PRICE_TARGET_BOOST', 6.0)
-
-    # small helpers local to this function (safe, avoids depending on other defs)
-    def meets_volume_for_price(last_price, quote_vol_24h):
-        if last_price <= 1.0:
-            return quote_vol_24h >= MIN_24H_VOL_LOW_PRICE
-        elif last_price <= 3.0:
-            return quote_vol_24h >= MIN_24H_VOL_UPTO_3
-        else:
-            return quote_vol_24h >= MIN_24H_VOL
-
-    def pct_change(open_p, close_p):
-        if open_p == 0:
-            return 0.0
-        return (close_p - open_p) / open_p * 100.0
-
-    def ema_local(values, period):
-        if not values or period <= 0:
-            return None
-        alpha = 2.0 / (period + 1.0)
-        e = float(values[0])
-        for v in values[1:]:
-            e = alpha * float(v) + (1 - alpha) * e
-        return e
-
-    def compute_rsi_local(closes, period=14):
-        if not closes or len(closes) < period + 1:
-            return None
-        gains, losses = [], []
-        for i in range(1, len(closes)):
-            diff = closes[i] - closes[i-1]
-            gains.append(max(0.0, diff))
-            losses.append(max(0.0, -diff))
-        avg_gain = sum(gains[:period]) / period
-        avg_loss = sum(losses[:period]) / period if sum(losses[:period]) != 0 else 1e-9
-        for i in range(period, len(gains)):
-            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-
-    # fetch tickers (cached wrapper used by your script)
-    tickers = get_tickers_cached() or []
+    cleanup_temp_skip()
+    cleanup_recent_buys()
     now = time.time()
-    pre = []
 
-    # Phase 1: cheap 24h filters & dynamic volume
+    TOP_CANDIDATES = 150
+    MIN_VOL_RATIO = 1.6
+    KLINES_LIMIT = 14
+
+    tickers = get_tickers_cached() or []
+    prefiltered = []
+
+    MIN_QVOL = max(MIN_VOLUME, 300_000)
     for t in tickers:
         sym = t.get('symbol')
-        if not sym or not sym.endswith(QUOTE_LOCAL):
+        if not sym or not sym.endswith(QUOTE):
             continue
-        try:
-            last = float(t.get('lastPrice') or 0.0)
-            qvol = float(t.get('quoteVolume') or 0.0)
-            ch = float(t.get('priceChangePercent') or 0.0)
-        except Exception:
-            continue
-        # price bounds
-        if not (PRICE_MIN <= last <= PRICE_MAX):
-            continue
-        # dynamic volume baseline
-        if not meets_volume_for_price(last, qvol):
-            continue
-        # 24h change guard
-        if ch < MIN_24H_CHANGE or ch > MAX_24H_CHANGE:
-            continue
-        # skip temp-skip or recent buys
+
         skip_until = TEMP_SKIP.get(sym)
         if skip_until and now < skip_until:
             continue
-        last_buy = RECENT_BUYS.get(sym)
-        if last_buy:
-            if now < last_buy['ts'] + last_buy.get('cooldown', REBUY_COOLDOWN):
-                continue
-        pre.append((sym, last, qvol, ch))
 
-    if not pre:
-        return None
-
-    # sort & limit how many we'll deeply evaluate to limit API calls
-    pre.sort(key=lambda x: x[2], reverse=True)
-    candidates = pre[:TOP_BY_24H_VOLUME]
-
-    scored = []
-    for sym, last_price, qvol, change_24h in candidates:
-        # small sleep to avoid heavy bursts
-        time.sleep(REQUEST_SLEEP)
-
-        # defensive rate-limit handling when fetching klines
-        kl5 = safe_api_call(client.get_klines, symbol=sym, interval='5m', limit=KLINES_5M_LIMIT)
-        if not kl5 or len(kl5) < 3:
-            continue
-        time.sleep(REQUEST_SLEEP)
-        kl1 = safe_api_call(client.get_klines, symbol=sym, interval='1m', limit=KLINES_1M_LIMIT)
-        if not kl1 or len(kl1) < 2:
-            continue
-
+        last = RECENT_BUYS.get(sym)
         try:
-            closes_5m = [float(k[4]) for k in kl5]
-            vols_5m = []
-            for k in kl5:
-                if len(k) > 7 and k[7] is not None:
-                    vols_5m.append(float(k[7]))
-                else:
-                    # fallback approximate quote volume
-                    vols_5m.append(float(k[5]) * float(k[4]))
-            closes_1m = [float(k[4]) for k in kl1]
-            vols_1m = []
-            for k in kl1:
-                if len(k) > 7 and k[7] is not None:
-                    vols_1m.append(float(k[7]))
-                else:
-                    vols_1m.append(float(k[5]) * float(k[4]))
-
-            # pct moves
-            open_5m = float(kl5[0][1])
-            pct_5m = pct_change(open_5m, closes_5m[-1])
-            open_1m = float(kl1[0][1])
-            pct_1m = pct_change(open_1m, closes_1m[-1])
-
-            # vol ratios (last vs avg previous)
-            avg_prev_5m = (sum(vols_5m[:-1]) / max(len(vols_5m[:-1]), 1)) if len(vols_5m) > 1 else vols_5m[-1]
-            vol_ratio_5m = vols_5m[-1] / (avg_prev_5m + 1e-12)
-
-            avg_prev_1m = (sum(vols_1m[:-1]) / max(len(vols_1m[:-1]), 1)) if len(vols_1m) > 1 else vols_1m[-1]
-            vol_ratio_1m = vols_1m[-1] / (avg_prev_1m + 1e-12)
-
-            # EMA
-            short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
-            long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
-            ema_ok = False
-            ema_uplift = 0.0
-            if short_ema and long_ema:
-                ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-                ema_ok = short_ema > long_ema * 1.0005
-
-            # RSI
-            rsi_val = compute_rsi_local(closes_5m[-(RSI_PERIOD+1):], RSI_PERIOD) if len(closes_5m) >= RSI_PERIOD+1 else None
-            rsi_ok = True
-            if rsi_val is not None and rsi_val > 68:
-                rsi_ok = False
-
-            # orderbook
-            time.sleep(REQUEST_SLEEP)
-            ob = safe_api_call(client.get_order_book, symbol=sym, limit=OB_DEPTH)
-            ob_ok = False
-            ob_imbalance = 1.0
-            ob_spread_pct = 100.0
-            bid_quote_liq = 0.0
-            if ob:
-                bids = ob.get('bids') or []
-                asks = ob.get('asks') or []
-                if bids and asks:
-                    top_bid = float(bids[0][0]); top_ask = float(asks[0][0])
-                    bid_sum = sum(float(b[1]) for b in bids[:OB_DEPTH]) + 1e-12
-                    ask_sum = sum(float(a[1]) for a in asks[:OB_DEPTH]) + 1e-12
-                    ob_imbalance = bid_sum / ask_sum
-                    ob_spread_pct = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
-                    bid_quote_liq = sum(float(b[0]) * float(b[1]) for b in bids[:OB_DEPTH])
-                    if bid_quote_liq >= MIN_OB_LIQUIDITY:
-                        ob_ok = (ob_imbalance >= MIN_OB_IMBALANCE) and (ob_spread_pct <= MAX_OB_SPREAD_PCT)
-                    else:
-                        ob_ok = False
-
-            # scoring
-            score = 0.0
-            score += max(0.0, pct_5m) * WEIGHT_RECENT_PCT_5M
-            score += max(0.0, pct_1m) * WEIGHT_RECENT_PCT_1M
-            score += max(0.0, (vol_ratio_5m - 1.0)) * WEIGHT_VOL_RATIO_5M * 100.0
-            score += ema_uplift * WEIGHT_EMA * 100.0
-            if rsi_val is not None:
-                score += max(0.0, (60.0 - min(rsi_val, 60.0))) * WEIGHT_RSI * 0.2
-            score += max(0.0, change_24h) * WEIGHT_24H_CHANGE * 0.5
-            if ob_ok:
-                score += WEIGHT_OB * 10.0
-            # price cap boost
-            if last_price <= PRICE_MAX:
-                score += PRICE_TARGET_BOOST
-
-            strong_candidate = (pct_5m >= MIN_5M_PCT and pct_1m >= MIN_1M_PCT and vol_ratio_5m >= 1.4
-                                and ema_ok and rsi_ok and ob_ok)
-
-            scored.append({
-                "symbol": sym,
-                "last_price": last_price,
-                "24h_change": change_24h,
-                "24h_vol": qvol,
-                "pct_5m": pct_5m,
-                "pct_1m": pct_1m,
-                "vol_ratio_5m": vol_ratio_5m,
-                "ema_ok": ema_ok,
-                "ema_uplift": ema_uplift,
-                "rsi": rsi_val,
-                "ob_ok": ob_ok,
-                "ob_imbalance": ob_imbalance,
-                "ob_spread_pct": ob_spread_pct,
-                "ob_bid_liq": bid_quote_liq,
-                "score": score,
-                "strong_candidate": strong_candidate
-            })
-        except Exception as e:
-            notify(f"⚠️ pick_coin evaluate error {sym}: {e}")
+            price = float(t.get('lastPrice') or 0.0)
+            qvol = float(t.get('quoteVolume') or 0.0)
+            change_pct = float(t.get('priceChangePercent') or 0.0)
+        except Exception:
             continue
 
-    if not scored:
+        # recent buy cooldown / re-buy avoidance
+        if last:
+            if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
+                continue
+            last_price = last.get('price')
+            if last_price and price > last_price * (1 + REBUY_MAX_RISE_PCT / 100.0):
+                continue
+
+        # price boundary
+        if not (PRICE_MIN <= price <= PRICE_MAX):
+            continue
+
+        # absolute 24h guard: avoid extreme pumps/dumps
+        if abs(change_pct) > MAX_24H_CHANGE_ABS:
+            continue
+        if change_pct > MAX_24H_RISE_PCT:
+            continue
+
+        # volume baseline and directional movement requirement
+        if qvol < MIN_QVOL:
+            continue
+        if abs(change_pct) < MOVEMENT_MIN_PCT:
+            continue
+
+        prefiltered.append((sym, price, qvol, change_pct))
+
+    if not prefiltered:
         return None
 
-    scored.sort(key=lambda x: x['score'], reverse=True)
+    prefiltered.sort(key=lambda x: x[2], reverse=True)
+    prefiltered = prefiltered[:TOP_CANDIDATES]
 
-    # Prefer strong candidates if present
-    strongs = [s for s in scored if s['strong_candidate']]
-    if strongs:
-        best = sorted(strongs, key=lambda x: x['score'], reverse=True)[0]
-    else:
-        best = scored[0]
+    candidates = []
+    for sym, price, qvol, change_pct in prefiltered:
+        try:
+            klines = safe_api_call(client.get_klines, sym, '5m', KLINES_LIMIT)
+            if not klines or len(klines) < 6:
+                continue
 
-    # return in expected tuple shape for trade_cycle
-    return (best['symbol'], best['last_price'], best['24h_vol'], best['24h_change'])
-    
+            vols = []
+            closes = []
+            for k in klines:
+                try:
+                    if len(k) > 7 and k[7] is not None:
+                        vols.append(float(k[7]))
+                    else:
+                        vols.append(float(k[5]) * float(k[4]))
+                except Exception:
+                    vols.append(0.0)
+                try:
+                    closes.append(float(k[4]))
+                except Exception:
+                    closes.append(0.0)
+
+            recent_vol = vols[-1] if vols else 0.0
+            if recent_vol <= 0:
+                continue
+
+            prev_slice = vols[-(KLINES_LIMIT-1):-1] if len(vols) >= 2 else vols[:-1]
+            avg_vol = (sum(prev_slice) / max(len(prev_slice), 1)) if prev_slice else recent_vol
+            vol_ratio = recent_vol / (avg_vol + 1e-9)
+
+            recent_pct = 0.0
+            if len(closes) >= 4 and closes[-4] > 0:
+                recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
+
+            # enforce target recent band (1%..2%)
+            if recent_pct < RECENT_PCT_MIN or recent_pct > RECENT_PCT_MAX:
+                continue
+
+            # volume spike requirement
+            if vol_ratio < MIN_VOL_RATIO:
+                continue
+
+            # require at least one consecutive up in last 3 closes
+            last3 = closes[-3:]
+            ups = 0
+            if last3[1] > last3[0]:
+                ups += 1
+            if last3[2] > last3[1]:
+                ups += 1
+            if ups < 1:
+                continue
+
+            # EMA confirmation
+            def ema_local(values, period):
+                if not values or period <= 0:
+                    return None
+                alpha = 2.0 / (period + 1.0)
+                e = float(values[0])
+                for v in values[1:]:
+                    e = alpha * float(v) + (1 - alpha) * e
+                return e
+
+            short_period = 3
+            long_period = 10
+            if len(closes) >= long_period:
+                short_ema = ema_local(closes[-short_period:], short_period)
+                long_ema = ema_local(closes[-long_period:], long_period)
+            elif len(closes) >= short_period:
+                short_ema = ema_local(closes[-short_period:], short_period)
+                long_ema = ema_local(closes, max(len(closes), 1))
+            else:
+                short_ema = None
+                long_ema = None
+
+            if short_ema is None or long_ema is None:
+                continue
+            if not (short_ema > long_ema * 1.0005):
+                continue
+
+            # RSI sanity
+            rsi_ok = True
+            if len(closes) >= 15:
+                gains = []
+                losses = []
+                for i in range(1, 15):
+                    diff = closes[-15 + i] - closes[-16 + i]
+                    if diff > 0:
+                        gains.append(diff)
+                    else:
+                        losses.append(abs(diff))
+                avg_gain = sum(gains) / 14.0 if gains else 0.0
+                avg_loss = sum(losses) / 14.0 if losses else 1e-9
+                rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
+                rsi = 100 - (100 / (1 + rs))
+                if rsi > 66:
+                    rsi_ok = False
+            if not rsi_ok:
+                continue
+
+            # orderbook bullishness quick check
+            try:
+                if not orderbook_bullish(sym, depth=5, min_imbalance=1.1, max_spread_pct=1.0):
+                    continue
+            except Exception:
+                continue
+
+            ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
+            score = (recent_pct * 12.0) + (math.log1p(qvol) * 0.4) + (vol_ratio * 6.0) + (ema_uplift * 80.0)
+
+            candidates.append((sym, price, qvol, change_pct, vol_ratio, recent_pct, score))
+
+        except Exception as e:
+            notify(f"⚠️ pick_coin processing error for {sym}: {e}")
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[-1], reverse=True)
+    best = candidates[0]
+    return (best[0], best[1], best[2], best[3])
+
 # -------------------------
 # MARKET BUY helpers
 # -------------------------
