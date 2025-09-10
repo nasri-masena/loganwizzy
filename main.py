@@ -23,7 +23,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 1.0
 PRICE_MAX = 3.0
-MIN_VOLUME = 3_000_000          # daily quote volume baseline
+MIN_VOLUME = 5_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 1.0
@@ -322,7 +322,7 @@ def cleanup_recent_buys():
         if now >= info['ts'] + cd:
             del RECENT_BUYS[s]
 
-def orderbook_bullish(symbol, depth=5, min_imbalance=1.05, max_spread_pct=1.5):
+def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
     try:
         ob = client.get_order_book(symbol=symbol, limit=depth)
         bids = ob.get('bids') or []
@@ -349,9 +349,9 @@ def pick_coin():
     cleanup_recent_buys()
     now = time.time()
 
-    TOP_CANDIDATES = 150
+    TOP_CANDIDATES = 120
     MIN_VOL_RATIO = 1.6
-    KLINES_LIMIT = 14
+    KLINES_LIMIT = 10
 
     tickers = get_tickers_cached() or []
     prefiltered = []
