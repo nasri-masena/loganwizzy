@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import time
@@ -27,12 +28,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = os.getenv("QUOTE", "USDT")
 
+# trading / strategy params (you can tune these via env)
 TRADE_USD = float(os.getenv("TRADE_USD", "6.0"))
 PRICE_MIN = float(os.getenv("PRICE_MIN", "1.0"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "3.0"))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "5000000"))
 
-BASE_TP_PCT = float(os.getenv("BASE_TP_PCT", "2.0"))
+BASE_TP_PCT = float(os.getenv("BASE_TPCT", "2.0"))
 BASE_SL_PCT = float(os.getenv("BASE_SL_PCT", "1.5"))
 
 MICRO_TP_PCT = float(os.getenv("MICRO_TPCT", "1.0"))
@@ -47,9 +49,9 @@ ROLL_COOLDOWN_SECONDS = float(os.getenv("ROLL_COOLDOWN_SECONDS", "60"))
 MAX_ROLLS_PER_POSITION = int(os.getenv("MAX_ROLLS_PER_POSITION", "3"))
 
 SLEEP_BETWEEN_CHECKS = float(os.getenv("SLEEP_BETWEEN_CHECKS", "45"))
-CYCLE_DELAY = float(os.getenv("CYCLE_DELAY", "10"))
+CYCLE_DELAY = float(os.getenv("CYCLE_DELAY", "12"))
 BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "60"))
-CACHE_TTL = int(os.getenv("CACHE_TTL", "120"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "180"))
 OPEN_ORDERS_TTL = int(os.getenv("OPEN_ORDERS_TTL", "45"))
 
 CONFIRM_TRANSFERS = os.getenv("CONFIRM_TRANSFERS", "true").lower() in ("1", "true", "yes")
@@ -58,7 +60,7 @@ MIN_TRANSFER_AMOUNT = float(os.getenv("MIN_TRANSFER_AMOUNT", "1.0"))
 DEDUPE_STORE = os.getenv("DEDUPE_STORE", "order_dedupe.json")
 LOG_FILE = os.getenv("LOG_FILE", "cryptobot.log")
 
-# Strategy / picker parameters
+# Picker params
 KLINES_5M_LIMIT = 6
 KLINES_1M_LIMIT = 6
 EMA_SHORT = 3
@@ -69,9 +71,15 @@ MIN_OB_IMBALANCE = 1.1
 MAX_OB_SPREAD_PCT = 1.5
 MIN_OB_LIQUIDITY = 3000.0
 TOP_BY_24H_VOLUME = 200
-REQUEST_SLEEP = 0.12
+REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.18"))
 MIN_5M_PCT = 0.6
 MIN_1M_PCT = 0.3
+
+# notification / throttle config
+NOTIFY_MIN_INTERVAL = float(os.getenv("NOTIFY_MIN_INTERVAL", "1.5"))
+NOTIFY_COLLAPSE_WINDOW = float(os.getenv("NOTIFY_COLLAPSE_WINDOW", "60"))
+MAX_SIMILAR_API_ERRORS = int(os.getenv("MAX_SIMILAR_API_ERRORS", "4"))
+API_ERROR_SUPPRESS_WINDOW = float(os.getenv("API_ERROR_SUPPRESS_WINDOW", "40"))
 
 # -------------------------
 # logging
@@ -86,14 +94,89 @@ fh = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=5)
 fh.setFormatter(fmt)
 logger.addHandler(fh)
 
-def notify(msg: str):
-    logger.info(msg)
+# -------------------------
+# notify: dedupe + collapse + rate-limit
+# -------------------------
+NOTIFY_CACHE = {}   # message -> {'count', 'first_ts', 'last_ts'}
+API_ERR_CACHE = {}  # err_msg -> {'count','first_ts','last_ts'}
+
+def _send_notify_now(text: str):
+    now_ts = datetime.utcnow().isoformat()
+    payload = f"[{now_ts}] {text}"
+    logger.info(payload)
     if BOT_TOKEN and CHAT_ID:
         try:
             requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          data={"chat_id": CHAT_ID, "text": f"[{datetime.utcnow().isoformat()}] {msg}"}, timeout=6)
+                          data={"chat_id": CHAT_ID, "text": payload}, timeout=6)
         except Exception as e:
             logger.debug(f"telegram notify failed: {e}")
+
+def _flush_notify_cache(force=False):
+    """
+    Flush suppressed messages when window expires or force=True.
+    For each cached message, if count>1 produce summary; if single and expired, send.
+    """
+    now = time.time()
+    for msg, meta in list(NOTIFY_CACHE.items()):
+        count = meta.get('count', 0)
+        first = meta.get('first_ts', now)
+        last = meta.get('last_ts', now)
+        if force or (now - first >= NOTIFY_COLLAPSE_WINDOW):
+            if count > 1:
+                _send_notify_now(f"(x{count}) [suppressed {int(now-first)}s] {msg}")
+            else:
+                _send_notify_now(msg)
+            del NOTIFY_CACHE[msg]
+
+def notify(msg: str):
+    """
+    Rate-limited deduping notify:
+      - If same msg repeats within collapse window, increment counter and suppress.
+      - Sends immediate only if last actual send older than NOTIFY_MIN_INTERVAL.
+      - Periodic flush of suppressed messages by caller could be done via _flush_notify_cache().
+    """
+    try:
+        now = time.time()
+        # already suppressed?
+        meta = NOTIFY_CACHE.get(msg)
+        if meta:
+            meta['count'] = meta.get('count', 1) + 1
+            meta['last_ts'] = now
+            NOTIFY_CACHE[msg] = meta
+            # do not send repeated identical messages immediately
+            return
+        # new message: flush other expired/suppressed items first (non-blocking)
+        _flush_notify_cache()
+        # track this msg
+        NOTIFY_CACHE[msg] = {'count': 1, 'first_ts': now, 'last_ts': now}
+        # send immediately if last send far enough
+        last_send = getattr(notify, "_last_send_ts", 0.0)
+        if now - last_send >= NOTIFY_MIN_INTERVAL:
+            _send_notify_now(msg)
+            notify._last_send_ts = now
+        # else keep in cache to be flushed later
+    except Exception:
+        logger.exception("notify failed")
+
+# helper to condense API errors (avoid spam)
+def _maybe_notify_api_error(err_msg: str):
+    try:
+        now = time.time()
+        meta = API_ERR_CACHE.get(err_msg)
+        if not meta:
+            API_ERR_CACHE[err_msg] = {'count': 1, 'first_ts': now, 'last_ts': now}
+            # first occurrence -> send
+            notify(err_msg)
+            return
+        meta['count'] += 1
+        meta['last_ts'] = now
+        API_ERR_CACHE[err_msg] = meta
+        # send compact summary occasionally
+        if meta['count'] % MAX_SIMILAR_API_ERRORS == 0:
+            notify(f"(api err x{meta['count']}) {err_msg}")
+        # otherwise suppress
+    except Exception:
+        logger.exception("api err notify failed")
 
 # -------------------------
 # init & globals
@@ -109,9 +192,7 @@ RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BASE_SLEEP = 90
 RATE_LIMIT_BACKOFF_MAX = 300
 
-# ticker cache: we maintain both a list (for compatibility) and a mapping for fast updates
-TICKER_LIST_CACHE = None   # list of ticker dicts (compatible shape)
-TICKER_MAP = {}            # symbol -> ticker dict
+TICKER_CACHE = None
 LAST_FETCH = 0
 SYMBOL_INFO_CACHE = {}
 SYMBOL_INFO_TTL = 120
@@ -123,11 +204,6 @@ RECENT_BUYS = {}
 LAST_ORDER_HASH = {}
 STATE_LOCK = threading.RLock()
 CACHE_LOCK = threading.RLock()
-
-# WebSocket components
-TWM = None
-WS_RUNNING = False
-WS_LOCK = threading.RLock()
 
 # dedupe persistence
 def _load_dedupe():
@@ -203,10 +279,8 @@ def format_qty(qty: float, step: float) -> str:
 
 def safe_api_call(fn, *args, retries=3, backoff=0.25, **kwargs):
     """
-    Centralized wrapper:
-      - Detects malformed param errors (code -1102) and avoids retrying
-      - Detects rate-limit (-1003) and sets exponential backoff
-      - Logs and returns None on persistent failure
+    Centralized wrapper with rate-limit handling and suppressed repeated error notifications.
+    Always prefer keyword args for client methods (python-binance compatibility).
     """
     global RATE_LIMIT_BACKOFF
     last_err = None
@@ -216,31 +290,35 @@ def safe_api_call(fn, *args, retries=3, backoff=0.25, **kwargs):
         except BinanceAPIException as e:
             err = str(e)
             last_err = err
-            # malformed params: don't retry
+            # malformed param -> do not retry
             if 'code=-1102' in err or 'Mandatory parameter' in err or "was empty/null" in err:
-                notify(f"⚠️ Binance malformed params (no-retry): {err}")
+                _maybe_notify_api_error(f"⚠️ Binance malformed params (no-retry): {err}")
+                # log payload snippet if present
                 try:
-                    payload = kwargs.get('params') or {k:v for k,v in kwargs.items() if k not in ('api_key','api_secret')}
+                    payload = kwargs.get('params') or {k: v for k, v in kwargs.items() if k not in ('api_key', 'api_secret')}
                     logger.debug(f"malformed payload snippet: {json.dumps(payload, default=str)[:1000]}")
                 except Exception:
                     pass
                 return None
-            # rate-limit: backoff and exit current attempt
+            # rate-limit detection
             if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
                 RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
                                         RATE_LIMIT_BACKOFF_MAX)
-                notify(f"❗ Rate-limit detected: backing off {RATE_LIMIT_BACKOFF}s ({err})")
+                _maybe_notify_api_error(f"❗ Rate-limit detected: backing off {RATE_LIMIT_BACKOFF}s ({err})")
                 time.sleep(RATE_LIMIT_BACKOFF)
                 return None
-            notify(f"⚠️ BinanceAPIException (attempt {attempt}/{retries}): {err}")
+            # other API errors - log debug and notify compactly
+            logger.debug(f"BinanceAPIException (attempt {attempt}/{retries}): {err}")
+            _maybe_notify_api_error(f"⚠️ BinanceAPIException (attempt {attempt}/{retries}): {err}")
             time.sleep(backoff * attempt)
             continue
         except Exception as e:
             last_err = str(e)
-            notify(f"⚠️ API error (attempt {attempt}/{retries}): {e}")
+            logger.debug(f"API call error (attempt {attempt}/{retries}): {e}")
+            _maybe_notify_api_error(f"⚠️ API error (attempt {attempt}/{retries}): {e}")
             time.sleep(backoff * attempt)
             continue
-    notify(f"❌ API failed after {retries} attempts: {last_err}")
+    _maybe_notify_api_error(f"❌ API failed after {retries} attempts: {last_err}")
     return None
 
 def exec_api_method(name: str, **kwargs):
@@ -263,119 +341,24 @@ def place_order_idempotent(api_method: str, params: dict, dedupe_ttl: int = 10):
         resp = exec_api_method(api_method, **params_clean)
         if resp is not None:
             LAST_ORDER_HASH[sym] = (h, now)
-            # persist quickly (best-effort)
-            try:
-                _save_dedupe()
-            except Exception:
-                pass
+            _save_dedupe()
         return resp
-
-# -------------------------
-# WebSocket ticker (preferred to avoid rate-limits)
-# -------------------------
-def _start_ws_ticker():
-    """
-    Start a ThreadedWebsocketManager mini-ticker socket (all symbols) if available.
-    Updates TICKER_MAP in real-time. Falls back silently if not available.
-    """
-    global TWM, WS_RUNNING, TICKER_LIST_CACHE, LAST_FETCH
-    try:
-        # import lazily and attempt to start
-        from binance import ThreadedWebsocketManager
-        notify("ℹ️ Attempting to start ThreadedWebsocketManager for tickers...")
-        TWM = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
-        TWM.start()
-
-        def _on_miniticker(msg):
-            # msg expected to include 's' (symbol), 'c' (close price), 'q' (quoteVolume), 'P' (priceChangePercent)
-            try:
-                # sometimes msg is wrapped in 'data' key
-                data = msg.get('data') if isinstance(msg, dict) and 'data' in msg else msg
-                symbol = data.get('s') or data.get('symbol')
-                if not symbol:
-                    return
-                # price
-                price = None
-                if data.get('c') is not None:
-                    price = float(data.get('c'))
-                elif data.get('close') is not None:
-                    price = float(data.get('close'))
-                # quote volume
-                qvol = 0.0
-                if data.get('q') is not None:
-                    try:
-                        qvol = float(data.get('q'))
-                    except Exception:
-                        qvol = 0.0
-                elif data.get('quoteVolume') is not None:
-                    try:
-                        qvol = float(data.get('quoteVolume'))
-                    except Exception:
-                        qvol = 0.0
-                # pct change
-                ch = 0.0
-                if data.get('P') is not None:
-                    try:
-                        ch = float(data.get('P'))
-                    except Exception:
-                        ch = 0.0
-                elif data.get('priceChangePercent') is not None:
-                    try:
-                        ch = float(data.get('priceChangePercent'))
-                    except Exception:
-                        ch = 0.0
-
-                ticker = {
-                    'symbol': symbol,
-                    'lastPrice': str(price if price is not None else 0.0),
-                    'quoteVolume': str(qvol),
-                    'priceChangePercent': str(ch)
-                }
-                with CACHE_LOCK:
-                    TICKER_MAP[symbol] = ticker
-                    TICKER_LIST_CACHE = list(TICKER_MAP.values())
-                    LAST_FETCH = time.time()
-            except Exception:
-                logger.debug("ws callback parse error", exc_info=True)
-
-        # start combined all-miniTicker stream if available
-        TWM.start_miniticker_socket(callback=_on_miniticker)
-        WS_RUNNING = True
-        notify("✅ WebSocket mini-ticker started (if supported by library).")
-    except Exception as e:
-        WS_RUNNING = False
-        notify(f"⚠️ WebSocket mini-ticker not available/failure: {e}")
-
-# start WebSocket in background (best-effort)
-try:
-    ws_thread = threading.Thread(target=_start_ws_ticker, daemon=True)
-    ws_thread.start()
-except Exception as e:
-    notify(f"⚠️ Failed to spawn ws thread: {e}")
 
 # -------------------------
 # caches
 # -------------------------
 def get_tickers_cached():
-    """
-    Returns list of tickers in shape similar to client.get_ticker()
-    Prefer WebSocket cache if available, else use REST with TTL.
-    """
-    global TICKER_LIST_CACHE, LAST_FETCH
+    global TICKER_CACHE, LAST_FETCH
     now = time.time()
-    with CACHE_LOCK:
-        # prefer WS real-time cache if fresh
-        if WS_RUNNING and TICKER_LIST_CACHE and (now - LAST_FETCH) < max(1, CACHE_TTL):
-            return TICKER_LIST_CACHE
-        # fallback: refresh from REST if stale
-        if TICKER_LIST_CACHE is None or now - LAST_FETCH > CACHE_TTL:
-            res = safe_api_call(client.get_ticker)
-            if res:
-                TICKER_LIST_CACHE = res
+    if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
+        res = safe_api_call(client.get_ticker)
+        if res:
+            with CACHE_LOCK:
+                TICKER_CACHE = res
                 LAST_FETCH = now
-            else:
-                notify("⚠️ get_tickers_cached failed - using stale cache if present")
-        return TICKER_LIST_CACHE or []
+        else:
+            notify("⚠️ get_tickers_cached failed - using cache")
+    return TICKER_CACHE or []
 
 def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
     now = time.time()
@@ -397,7 +380,7 @@ def get_open_orders_cached(symbol=None):
             if symbol:
                 return [o for o in data if o.get('symbol') == symbol]
             return data
-    data = safe_api_call(client.get_open_orders, symbol) if symbol else safe_api_call(client.get_open_orders)
+    data = safe_api_call(client.get_open_orders, symbol=symbol) if symbol else safe_api_call(client.get_open_orders)
     if data is None:
         with OPEN_ORDERS_CACHE['lock']:
             return OPEN_ORDERS_CACHE['data'] or []
@@ -409,6 +392,15 @@ def get_open_orders_cached(symbol=None):
 # -------------------------
 # trading helpers
 # -------------------------
+def get_free_usdt():
+    try:
+        res = safe_api_call(client.get_asset_balance, asset=QUOTE)
+        if not res:
+            return 0.0
+        return float(res.get('free') or 0.0)
+    except Exception:
+        return 0.0
+
 def get_free_asset(asset):
     try:
         res = safe_api_call(client.get_asset_balance, asset=asset)
@@ -436,22 +428,24 @@ def get_filters(symbol_info):
         'minNotional': float(min_notional) if min_notional else None
     }
 
-def is_symbol_tradable(symbol):
-    info = get_symbol_info_cached(symbol)
-    if not info:
+def orderbook_bullish(symbol, depth=5, min_imbalance=1.05, max_spread_pct=1.5):
+    ob = safe_api_call(client.get_order_book, symbol=symbol, limit=depth)
+    if not ob:
         return False
-    status = (info.get('status') or "").upper()
-    if status != 'TRADING':
+    bids = ob.get('bids') or []
+    asks = ob.get('asks') or []
+    if not bids or not asks:
         return False
-    perms = info.get('permissions') or []
-    if isinstance(perms, list) and any(str(p).upper() == 'SPOT' for p in perms):
-        return True
-    order_types = info.get('orderTypes') or []
-    if isinstance(order_types, list):
-        for ot in order_types:
-            if str(ot).upper() in ('MARKET', 'LIMIT', 'LIMIT_MAKER', 'STOP_LOSS_LIMIT', 'TAKE_PROFIT_LIMIT'):
-                return True
-    return False
+    try:
+        top_bid_p, top_bid_q = float(bids[0][0]), float(bids[0][1])
+        top_ask_p, top_ask_q = float(asks[0][0]), float(asks[0][1])
+        spread_pct = (top_ask_p - top_bid_p) / (top_bid_p + 1e-12) * 100.0
+        bid_sum = sum(float(b[1]) for b in bids[:depth]) + 1e-12
+        ask_sum = sum(float(a[1]) for a in asks[:depth]) + 1e-12
+        imbalance = bid_sum / ask_sum
+        return (imbalance >= min_imbalance) and (spread_pct <= max_spread_pct)
+    except Exception:
+        return False
 
 def _parse_market_buy_exec(order_resp):
     executed_qty = 0.0
@@ -489,6 +483,23 @@ def _parse_market_buy_exec(order_resp):
         return 0.0, 0.0
     return executed_qty, avg_price
 
+def is_symbol_tradable(symbol):
+    info = get_symbol_info_cached(symbol)
+    if not info:
+        return False
+    status = (info.get('status') or "").upper()
+    if status != 'TRADING':
+        return False
+    perms = info.get('permissions') or []
+    if isinstance(perms, list) and any(str(p).upper() == 'SPOT' for p in perms):
+        return True
+    order_types = info.get('orderTypes') or []
+    if isinstance(order_types, list):
+        for ot in order_types:
+            if str(ot).upper() in ('MARKET', 'LIMIT', 'LIMIT_MAKER', 'STOP_LOSS_LIMIT', 'TAKE_PROFIT_LIMIT'):
+                return True
+    return False
+
 def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
     now = time.time()
     skip_until = TEMP_SKIP.get(symbol)
@@ -510,7 +521,14 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
         return None, None
     f = get_filters(info)
 
-    # Prefer WS tickers if available
+    if require_orderbook:
+        try:
+            if not orderbook_bullish(symbol, depth=5, min_imbalance=1.1, max_spread_pct=0.6):
+                notify(f"⚠️ Orderbook not bullish for {symbol}; aborting market buy.")
+                return None, None
+        except Exception as e:
+            logger.debug(f"orderbook check error: {e}")
+
     price = None
     tickers = get_tickers_cached()
     for t in tickers:
@@ -639,6 +657,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PC
     params = {"symbol": symbol, "side": "SELL", "quantity": qty_str,
               "price": tp_str, "stopPrice": sp_str, "stopLimitPrice": sl_str, "stopLimitTimeInForce": "GTC"}
     notify(f"🔁 Attempting OCO for {symbol} TP={tp_str} SL={sp_str} qty={qty_str}")
+    # Use standard create_oco_order only (avoid alternative 'aboveType' param which may cause -1102)
     oco = place_order_idempotent('create_oco_order', params, dedupe_ttl=8)
     if oco:
         with OPEN_ORDERS_CACHE['lock']:
@@ -646,7 +665,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PC
         notify(f"📌 OCO placed for {symbol}")
         return {'tp': tp, 'sl': sp, 'method': 'oco', 'raw': oco}
 
-    # If OCO failed, try safer fallback flows
     notify("⚠️ OCO failed -> fallback to separate TP/SL")
     tp_order = place_order_idempotent('order_limit_sell', {"symbol": symbol, "quantity": qty_str, "price": tp_str}, dedupe_ttl=6)
     sl_order = place_order_idempotent('create_order', {"symbol": symbol, "side": "SELL", "type": "STOP_LOSS_LIMIT",
@@ -732,10 +750,9 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         return None, 0.0, None
 
 # -------------------------
-# PICKER (adapted)
+# PICKER (adapted, uses keyword param API calls)
 # -------------------------
 def pick_coin():
-    # local helpers
     def pct_change(open_p, close_p):
         if open_p == 0:
             return 0.0
@@ -857,7 +874,7 @@ def pick_coin():
                 rsi_ok = False
 
             time.sleep(REQUEST_SLEEP)
-            ob = safe_api_call(client.get_order_book, sym, limit=OB_DEPTH)
+            ob = safe_api_call(client.get_order_book, symbol=sym, limit=OB_DEPTH)
             ob_ok = False
             ob_imbalance = 1.0
             ob_spread_pct = 100.0
@@ -912,7 +929,8 @@ def pick_coin():
                 "strong_candidate": strong_candidate
             })
         except Exception as e:
-            notify(f"⚠️ pick_coin evaluate error {sym}: {e}")
+            logger.debug(f"pick_coin evaluate error {sym}: {e}")
+            _maybe_notify_api_error(f"⚠️ pick_coin evaluate error {sym}: {e}")
             continue
 
     if not scored:
@@ -927,28 +945,8 @@ def pick_coin():
     return (best['symbol'], best['last_price'], best['24h_vol'], best['24h_change'])
 
 # -------------------------
-# monitor_and_roll (kept from previous logic)
+# monitor_and_roll (same logic; uses place_oco_sell/market fallback)
 # -------------------------
-def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
-    try:
-        open_orders = get_open_orders_cached(symbol)
-        cancelled = 0
-        for o in open_orders:
-            if cancelled >= max_cancel:
-                notify(f"⚠️ Reached max_cancel ({max_cancel}) for {symbol}; leaving remaining orders.")
-                break
-            try:
-                safe_api_call(client.cancel_order, symbol=symbol, orderId=o.get('orderId'))
-                cancelled += 1
-                time.sleep(inter_delay)
-            except Exception as e:
-                notify(f"⚠️ Cancel failed for {symbol} order {o.get('orderId')}: {e}")
-        if cancelled:
-            notify(f"❌ Cancelled {cancelled} open orders for {symbol}")
-        OPEN_ORDERS_CACHE['data'] = None
-    except Exception as e:
-        notify(f"⚠️ Failed to cancel orders: {e}")
-
 def monitor_and_roll(symbol, qty, entry_price, f):
     orig_qty = qty
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
@@ -979,26 +977,24 @@ def monitor_and_roll(symbol, qty, entry_price, f):
         try:
             time.sleep(SLEEP_BETWEEN_CHECKS)
             asset = symbol[:-len(QUOTE)]
-            price_now = None
-            # prefer WS cached price
-            with CACHE_LOCK:
-                t = None
-                if TICKER_MAP:
-                    t = TICKER_MAP.get(symbol)
-                if t:
+            price_now = get_tickers_cached()
+            # prefer cached single price
+            p = None
+            for t in price_now:
+                if t.get('symbol') == symbol:
                     try:
-                        price_now = float(t.get('lastPrice') or 0.0)
+                        p = float(t.get('lastPrice') or t.get('price') or 0.0)
                     except Exception:
-                        price_now = None
-            if price_now is None:
+                        p = None
+                    break
+            if p is None:
                 res = safe_api_call(client.get_symbol_ticker, symbol=symbol)
-                if res:
-                    price_now = float(res.get('price') or res.get('lastPrice') or 0.0)
-                else:
+                if not res:
                     notify("⚠️ monitor_and_roll: failed to fetch price, continuing.")
                     continue
+                p = float(res.get('price') or res.get('lastPrice') or 0.0)
+            price_now = p
 
-            # direction detection
             price_moving_up = price_now > last_price_seen
             last_price_seen = price_now
 
@@ -1014,14 +1010,13 @@ def monitor_and_roll(symbol, qty, entry_price, f):
 
             price_delta = price_now - entry_price
             rise_trigger_pct = price_now >= entry_price * (1 + ROLL_ON_RISE_PCT / 100.0)
-            rise_trigger_abs = price_delta >= max(ROLL_TRIGGER_DELTA_ABS, entry_price * (ROLL_ON_RISE_PCT/100.0))
+            rise_trigger_abs = price_delta >= max(ROLL_TRIGGER_DELTA_ABS, entry_price * (0.0075))
             near_trigger = (price_now >= curr_tp * (1 - 0.035)) and (price_now < curr_tp * 1.05)
             tick = f.get('tickSize', 0.0) or 0.0
             minimal_move = max(entry_price * 0.004, ROLL_TRIGGER_DELTA_ABS * 0.4, tick or 0.0)
             moved_enough = price_delta >= minimal_move
             now_ts = time.time()
             can_roll_time = (now_ts - last_roll_ts) >= ROLL_COOLDOWN_SECONDS
-
             passed_price_debounce = price_now >= (last_roll_price + ROLL_TRIGGER_DELTA_ABS)
 
             should_roll = ((near_trigger and moved_enough) or rise_trigger_pct or rise_trigger_abs)
@@ -1031,7 +1026,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                     last_roll_ts = now_ts
                     continue
 
-                notify(f"🔎 Roll triggered for {symbol}: price={price_now:.8f}, entry={entry_price:.8f}, curr_tp={curr_tp:.8f}")
+                notify(f"🔎 Roll triggered for {symbol}: price={price_now:.8f}, entry={entry_price:.8f}, curr_tp={curr_tp:.8f}, delta={price_delta:.6f}")
                 candidate_tp = curr_tp + ROLL_TP_STEP_ABS
                 candidate_sl = curr_sl + ROLL_SL_STEP_ABS
                 if candidate_sl > entry_price:
@@ -1090,7 +1085,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                     last_roll_price = price_now
                     notify(f"🔁 Rolled OCO: new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty} (roll #{roll_count})")
                 else:
-                    notify("⚠️ Roll attempt failed; will try fallback next loop.")
+                    notify("⚠️ Roll attempt failed; will try to re-place protective OCO next loop.")
                     time.sleep(0.4)
                     fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
                     if fallback:
@@ -1101,11 +1096,34 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                             TEMP_SKIP[symbol] = time.time() + 3600
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
+            logger.exception("monitor_and_roll")
             return False, entry_price, 0.0
 
-# =========================
+def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
+    try:
+        open_orders = get_open_orders_cached(symbol)
+        cancelled = 0
+        for o in open_orders:
+            if cancelled >= max_cancel:
+                logger.debug(f"Reached max_cancel ({max_cancel}) for {symbol}")
+                break
+            try:
+                safe_api_call(client.cancel_order, symbol=symbol, orderId=o.get('orderId'))
+                cancelled += 1
+                time.sleep(inter_delay)
+            except Exception as e:
+                logger.debug(f"Cancel failed for {symbol} order {o.get('orderId')}: {e}")
+        if cancelled:
+            notify(f"❌ Cancelled {cancelled} open orders for {symbol}")
+        with OPEN_ORDERS_CACHE['lock']:
+            OPEN_ORDERS_CACHE['data'] = None
+    except Exception as e:
+        notify(f"⚠️ Failed to cancel orders: {e}")
+        logger.exception("cancel_all_open_orders")
+
+# -------------------------
 # MAIN TRADE CYCLE
-# =========================
+# -------------------------
 ACTIVE_SYMBOL = None
 LAST_BUY_TS = 0.0
 
@@ -1117,7 +1135,9 @@ def trade_cycle():
 
     while True:
         try:
-            # housekeeping
+            # housekeeping flush notifications occasionally
+            _flush_notify_cache()
+
             now = time.time()
             for s, until in list(TEMP_SKIP.items()):
                 if now >= until:
@@ -1197,6 +1217,7 @@ def trade_cycle():
 
         except Exception as e:
             notify(f"❌ Unexpected error in trade_cycle: {e}")
+            logger.exception("trade_cycle")
             time.sleep(CYCLE_DELAY)
 
 # -------------------------
@@ -1220,11 +1241,6 @@ def _signal_handler(signum, frame):
     notify(f"Signal {signum} received - shutting down")
     stop_event.set()
     _save_dedupe()
-    try:
-        if TWM:
-            TWM.stop()
-    except Exception:
-        pass
     sys.exit(0)
 
 signal.signal(signal.SIGINT, _signal_handler)
@@ -1239,7 +1255,7 @@ def start_flask():
 # bootstrap
 # -------------------------
 if __name__ == "__main__":
-    notify("Booting cryptobot (LIVE final with WebSocket ticker if possible)")
+    notify("Booting cryptobot (LIVE final with keyword-arg API calls & notify dedupe)")
     acct_ok = safe_api_call(client.get_account)
     if not acct_ok:
         notify("❌ API validation failed - aborting")
