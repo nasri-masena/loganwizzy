@@ -274,7 +274,11 @@ def get_open_orders_cached(symbol=None):
         if symbol:
             return [o for o in data if o.get('symbol') == symbol]
         return data
-    data = safe_api_call(client.get_open_orders, symbol) if symbol else safe_api_call(client.get_open_orders)
+    # use lambda to avoid positional/keyword binding issues
+    if symbol:
+        data = safe_api_call(lambda: client.get_open_orders(symbol=symbol))
+    else:
+        data = safe_api_call(lambda: client.get_open_orders())
     if data is None:
         # return previous cached data if available (fail-open)
         return OPEN_ORDERS_CACHE['data'] or []
@@ -320,7 +324,7 @@ def get_price_cached(symbol):
         notify(f"⚠️ get_price_cached general error: {e}")
         return None
     # fallback single-symbol
-    res = safe_api_call(client.get_symbol_ticker, symbol=symbol)
+    res = safe_api_call(lambda: client.get_symbol_ticker(symbol=symbol))
     if not res:
         return None
     return float(res.get('price') or res.get('lastPrice') or 0.0)
@@ -339,7 +343,8 @@ def cleanup_recent_buys():
             del RECENT_BUYS[s]
 
 def orderbook_bullish(symbol, depth=5, min_imbalance=1.05, max_spread_pct=1.5):
-    ob = safe_api_call(client.get_order_book, symbol, limit=depth)
+    # use lambda wrapper to avoid bound/unbound method positional issues
+    ob = safe_api_call(lambda: client.get_order_book(symbol=symbol, limit=depth))
     if not ob:
         return False
     bids = ob.get('bids') or []
@@ -489,11 +494,11 @@ def pick_coin():
         time.sleep(REQUEST_SLEEP)
 
         # defensive rate-limit handling when fetching klines
-        kl5 = safe_api_call(client.get_klines, symbol=sym, interval='5m', limit=KLINES_5M_LIMIT)
+        kl5 = safe_api_call(lambda: client.get_klines(symbol=sym, interval='5m', limit=KLINES_5M_LIMIT))
         if not kl5 or len(kl5) < 3:
             continue
         time.sleep(REQUEST_SLEEP)
-        kl1 = safe_api_call(client.get_klines, symbol=sym, interval='1m', limit=KLINES_1M_LIMIT)
+        kl1 = safe_api_call(lambda: client.get_klines(symbol=sym, interval='1m', limit=KLINES_1M_LIMIT))
         if not kl1 or len(kl1) < 2:
             continue
 
@@ -542,9 +547,9 @@ def pick_coin():
             if rsi_val is not None and rsi_val > 68:
                 rsi_ok = False
 
-            # orderbook
+            # orderbook (use lambda safe wrapper)
             time.sleep(REQUEST_SLEEP)
-            ob = safe_api_call(client.get_order_book, symbol=sym, limit=OB_DEPTH)
+            ob = safe_api_call(lambda: client.get_order_book(symbol=sym, limit=OB_DEPTH))
             ob_ok = False
             ob_imbalance = 1.0
             ob_spread_pct = 100.0
@@ -709,7 +714,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
 
     price = get_price_cached(symbol)
     if price is None:
-        res = safe_api_call(client.get_symbol_ticker, symbol=symbol)
+        res = safe_api_call(lambda: client.get_symbol_ticker(symbol=symbol))
         if not res:
             notify(f"⚠️ Failed to fetch ticker for {symbol}.")
             return None, None
@@ -746,7 +751,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
 
     time.sleep(random.uniform(0.05, 0.25))
 
-    order_resp = safe_api_call(client.order_market_buy, symbol=symbol, quantity=qty_str)
+    order_resp = safe_api_call(lambda: client.order_market_buy(symbol=symbol, quantity=qty_str))
     if not order_resp:
         notify(f"❌ Market buy failed for {symbol} (no response).")
         return None, None
@@ -801,7 +806,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         qty_str = format_qty(sell_qty, f.get('stepSize', 0.0))
         price_str = format_price(tp_price, f.get('tickSize', 0.0))
 
-        order = safe_api_call(client.order_limit_sell, symbol=symbol, quantity=qty_str, price=price_str)
+        order = safe_api_call(lambda: client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str))
         if not order:
             notify(f"⚠️ Failed to place micro TP order for {symbol}.")
             return None, 0.0, None
@@ -822,7 +827,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         waited = 0.0
 
         while waited < max_wait:
-            status = safe_api_call(client.get_order, symbol=symbol, orderId=order_id)
+            status = safe_api_call(lambda: client.get_order(symbol=symbol, orderId=order_id))
             if not status:
                 break
 
@@ -895,7 +900,7 @@ def place_market_sell_fallback(symbol, qty, f):
     try:
         qty_str = format_qty(qty, f.get('stepSize', 0.0))
         notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
-        resp = safe_api_call(client.order_market_sell, symbol=symbol, quantity=qty_str)
+        resp = safe_api_call(lambda: client.order_market_sell(symbol=symbol, quantity=qty_str))
         if resp:
             notify(f"✅ Market sell fallback executed for {symbol}")
             try:
@@ -985,10 +990,11 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
 
     # Attempt 1: standard OCO
     for attempt in range(1, retries + 1):
-        oco = safe_api_call(client.create_oco_order,
-                            symbol=symbol, side='SELL', quantity=qty_str,
-                            price=tp_str, stopPrice=sp_str, stopLimitPrice=sl_str,
-                            stopLimitTimeInForce='GTC')
+        oco = safe_api_call(lambda: client.create_oco_order(
+            symbol=symbol, side='SELL', quantity=qty_str,
+            price=tp_str, stopPrice=sp_str, stopLimitPrice=sl_str,
+            stopLimitTimeInForce='GTC'
+        ))
         if oco:
             try:
                 OPEN_ORDERS_CACHE['data'] = None
@@ -1000,11 +1006,12 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
 
     # Attempt 2: alternative param names
     for attempt in range(1, retries + 1):
-        oco2 = safe_api_call(client.create_oco_order,
-                             symbol=symbol, side='SELL', quantity=qty_str,
-                             aboveType="LIMIT_MAKER", abovePrice=tp_str,
-                             belowType="STOP_LOSS_LIMIT", belowStopPrice=sp_str,
-                             belowPrice=sl_str, belowTimeInForce="GTC")
+        oco2 = safe_api_call(lambda: client.create_oco_order(
+            symbol=symbol, side='SELL', quantity=qty_str,
+            aboveType="LIMIT_MAKER", abovePrice=tp_str,
+            belowType="STOP_LOSS_LIMIT", belowStopPrice=sp_str,
+            belowPrice=sl_str, belowTimeInForce="GTC"
+        ))
         if oco2:
             try:
                 OPEN_ORDERS_CACHE['data'] = None
@@ -1016,7 +1023,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
     # Fallback: try placing TP limit and STOP_LOSS_LIMIT, else market sell
     notify("⚠️ All OCO attempts failed — falling back to separate TP (limit) + SL (stop-limit) or MARKET.")
 
-    tp_order = safe_api_call(client.order_limit_sell, symbol=symbol, quantity=qty_str, price=tp_str)
+    tp_order = safe_api_call(lambda: client.order_limit_sell(symbol=symbol, quantity=qty_str, price=tp_str))
     if tp_order:
         try:
             OPEN_ORDERS_CACHE['data'] = None
@@ -1027,9 +1034,10 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         notify("⚠️ Fallback TP limit not placed (no response).")
 
     try:
-        sl_order = safe_api_call(client.create_order,
-                                 symbol=symbol, side="SELL", type="STOP_LOSS_LIMIT",
-                                 stopPrice=sp_str, price=sl_str, timeInForce='GTC', quantity=qty_str)
+        sl_order = safe_api_call(lambda: client.create_order(
+            symbol=symbol, side="SELL", type="STOP_LOSS_LIMIT",
+            stopPrice=sp_str, price=sl_str, timeInForce='GTC', quantity=qty_str
+        ))
         if sl_order:
             try:
                 OPEN_ORDERS_CACHE['data'] = None
@@ -1065,7 +1073,7 @@ def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
                 notify(f"⚠️ Reached max_cancel ({max_cancel}) for {symbol}; leaving remaining orders.")
                 break
             try:
-                safe_api_call(client.cancel_order, symbol=symbol, orderId=o.get('orderId'))
+                safe_api_call(lambda: client.cancel_order(symbol=symbol, orderId=o.get('orderId')))
                 cancelled += 1
                 time.sleep(inter_delay)
             except Exception as e:
@@ -1111,7 +1119,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
             asset = symbol[:-len(QUOTE)]
             price_now = get_price_cached(symbol)
             if price_now is None:
-                res = safe_api_call(client.get_symbol_ticker, symbol=symbol)
+                res = safe_api_call(lambda: client.get_symbol_ticker(symbol=symbol))
                 if not res:
                     notify("⚠️ monitor_and_roll: failed to fetch price, continuing.")
                     continue
@@ -1358,8 +1366,8 @@ def trade_cycle():
                 ACTIVE_SYMBOL = symbol
                 LAST_BUY_TS = time.time()
                 ACTIVE_SYMBOL = None
-                total_profit_usd = 0.0
-                date_key, m = _update_metrics_for_profit(total_profit_usd)
+                total_profit_usdt = 0.0
+                date_key, m = _update_metrics_for_profit(total_profit_usdt)
                 _notify_daily_stats(date_key)
                 continue
 
@@ -1380,11 +1388,11 @@ def trade_cycle():
                 except Exception:
                     pass
 
-            total_profit_usd = profit_usd or 0.0
+            total_profit_usdt = profit_usd or 0.0
             if micro_order and micro_sold_qty and micro_tp_price:
                 try:
                     micro_profit = (micro_tp_price - entry_price) * micro_sold_qty
-                    total_profit_usd += micro_profit
+                    total_profit_usdt += micro_profit
                 except Exception:
                     pass
 
@@ -1392,7 +1400,7 @@ def trade_cycle():
             ent = RECENT_BUYS.get(symbol, {})
             ent['ts'] = now2
             ent['price'] = entry_price
-            ent['profit'] = total_profit_usd
+            ent['profit'] = total_profit_usdt
             if ent['profit'] is None:
                 ent['cooldown'] = REBUY_COOLDOWN
             elif ent['profit'] < 0:
@@ -1401,11 +1409,11 @@ def trade_cycle():
                 ent['cooldown'] = REBUY_COOLDOWN
             RECENT_BUYS[symbol] = ent
 
-            date_key, m = _update_metrics_for_profit(total_profit_usd)
+            date_key, m = _update_metrics_for_profit(total_profit_usdt)
             _notify_daily_stats(date_key)
 
-            if closed and total_profit_usd and total_profit_usd > 0:
-                send_profit_to_funding(total_profit_usd)
+            if closed and total_profit_usdt and total_profit_usdt > 0:
+                send_profit_to_funding(total_profit_usdt)
 
             RATE_LIMIT_BACKOFF = 0
 
