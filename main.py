@@ -23,7 +23,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 1.0
 PRICE_MAX = 3.0
-MIN_VOLUME = 5_000_000          # daily quote volume baseline
+MIN_VOLUME = 3_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 1.0
@@ -38,7 +38,7 @@ MOVEMENT_MIN_PCT = 1.0
 # runtime / pacing
 TRADE_USD = 7.0
 SLEEP_BETWEEN_CHECKS = 30
-CYCLE_DELAY = 10
+CYCLE_DELAY = 13
 COOLDOWN_AFTER_EXIT = 10
 
 # order / protection
@@ -50,7 +50,7 @@ BASE_SL_PCT = 2.0
 # micro-take profit
 MICRO_TP_PCT = 1.0
 MICRO_TP_FRACTION = 0.40
-MICRO_MAX_WAIT = 18.0
+MICRO_MAX_WAIT = 20.0
 
 # rolling config
 ROLL_ON_RISE_PCT = 0.5
@@ -58,7 +58,7 @@ ROLL_TRIGGER_PCT = 0.75
 ROLL_TRIGGER_DELTA_ABS = 0.007
 ROLL_TP_STEP_ABS = 0.015
 ROLL_SL_STEP_ABS = 0.004
-ROLL_COOLDOWN_SECONDS = 30
+ROLL_COOLDOWN_SECONDS = 60
 MAX_ROLLS_PER_POSITION = 3
 ROLL_POST_CANCEL_JITTER = (0.3, 0.8)
 
