@@ -109,7 +109,9 @@ RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BASE_SLEEP = 90
 RATE_LIMIT_BACKOFF_MAX = 300
 
-TICKER_CACHE = None
+# ticker cache: we maintain both a list (for compatibility) and a mapping for fast updates
+TICKER_LIST_CACHE = None   # list of ticker dicts (compatible shape)
+TICKER_MAP = {}            # symbol -> ticker dict
 LAST_FETCH = 0
 SYMBOL_INFO_CACHE = {}
 SYMBOL_INFO_TTL = 120
@@ -121,6 +123,11 @@ RECENT_BUYS = {}
 LAST_ORDER_HASH = {}
 STATE_LOCK = threading.RLock()
 CACHE_LOCK = threading.RLock()
+
+# WebSocket components
+TWM = None
+WS_RUNNING = False
+WS_LOCK = threading.RLock()
 
 # dedupe persistence
 def _load_dedupe():
@@ -195,6 +202,12 @@ def format_qty(qty: float, step: float) -> str:
         return "0"
 
 def safe_api_call(fn, *args, retries=3, backoff=0.25, **kwargs):
+    """
+    Centralized wrapper:
+      - Detects malformed param errors (code -1102) and avoids retrying
+      - Detects rate-limit (-1003) and sets exponential backoff
+      - Logs and returns None on persistent failure
+    """
     global RATE_LIMIT_BACKOFF
     last_err = None
     for attempt in range(1, retries + 1):
@@ -203,6 +216,7 @@ def safe_api_call(fn, *args, retries=3, backoff=0.25, **kwargs):
         except BinanceAPIException as e:
             err = str(e)
             last_err = err
+            # malformed params: don't retry
             if 'code=-1102' in err or 'Mandatory parameter' in err or "was empty/null" in err:
                 notify(f"⚠️ Binance malformed params (no-retry): {err}")
                 try:
@@ -211,6 +225,7 @@ def safe_api_call(fn, *args, retries=3, backoff=0.25, **kwargs):
                 except Exception:
                     pass
                 return None
+            # rate-limit: backoff and exit current attempt
             if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
                 RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
                                         RATE_LIMIT_BACKOFF_MAX)
@@ -248,24 +263,119 @@ def place_order_idempotent(api_method: str, params: dict, dedupe_ttl: int = 10):
         resp = exec_api_method(api_method, **params_clean)
         if resp is not None:
             LAST_ORDER_HASH[sym] = (h, now)
-            _save_dedupe()
+            # persist quickly (best-effort)
+            try:
+                _save_dedupe()
+            except Exception:
+                pass
         return resp
+
+# -------------------------
+# WebSocket ticker (preferred to avoid rate-limits)
+# -------------------------
+def _start_ws_ticker():
+    """
+    Start a ThreadedWebsocketManager mini-ticker socket (all symbols) if available.
+    Updates TICKER_MAP in real-time. Falls back silently if not available.
+    """
+    global TWM, WS_RUNNING, TICKER_LIST_CACHE, LAST_FETCH
+    try:
+        # import lazily and attempt to start
+        from binance import ThreadedWebsocketManager
+        notify("ℹ️ Attempting to start ThreadedWebsocketManager for tickers...")
+        TWM = ThreadedWebsocketManager(api_key=API_KEY, api_secret=API_SECRET)
+        TWM.start()
+
+        def _on_miniticker(msg):
+            # msg expected to include 's' (symbol), 'c' (close price), 'q' (quoteVolume), 'P' (priceChangePercent)
+            try:
+                # sometimes msg is wrapped in 'data' key
+                data = msg.get('data') if isinstance(msg, dict) and 'data' in msg else msg
+                symbol = data.get('s') or data.get('symbol')
+                if not symbol:
+                    return
+                # price
+                price = None
+                if data.get('c') is not None:
+                    price = float(data.get('c'))
+                elif data.get('close') is not None:
+                    price = float(data.get('close'))
+                # quote volume
+                qvol = 0.0
+                if data.get('q') is not None:
+                    try:
+                        qvol = float(data.get('q'))
+                    except Exception:
+                        qvol = 0.0
+                elif data.get('quoteVolume') is not None:
+                    try:
+                        qvol = float(data.get('quoteVolume'))
+                    except Exception:
+                        qvol = 0.0
+                # pct change
+                ch = 0.0
+                if data.get('P') is not None:
+                    try:
+                        ch = float(data.get('P'))
+                    except Exception:
+                        ch = 0.0
+                elif data.get('priceChangePercent') is not None:
+                    try:
+                        ch = float(data.get('priceChangePercent'))
+                    except Exception:
+                        ch = 0.0
+
+                ticker = {
+                    'symbol': symbol,
+                    'lastPrice': str(price if price is not None else 0.0),
+                    'quoteVolume': str(qvol),
+                    'priceChangePercent': str(ch)
+                }
+                with CACHE_LOCK:
+                    TICKER_MAP[symbol] = ticker
+                    TICKER_LIST_CACHE = list(TICKER_MAP.values())
+                    LAST_FETCH = time.time()
+            except Exception:
+                logger.debug("ws callback parse error", exc_info=True)
+
+        # start combined all-miniTicker stream if available
+        TWM.start_miniticker_socket(callback=_on_miniticker)
+        WS_RUNNING = True
+        notify("✅ WebSocket mini-ticker started (if supported by library).")
+    except Exception as e:
+        WS_RUNNING = False
+        notify(f"⚠️ WebSocket mini-ticker not available/failure: {e}")
+
+# start WebSocket in background (best-effort)
+try:
+    ws_thread = threading.Thread(target=_start_ws_ticker, daemon=True)
+    ws_thread.start()
+except Exception as e:
+    notify(f"⚠️ Failed to spawn ws thread: {e}")
 
 # -------------------------
 # caches
 # -------------------------
 def get_tickers_cached():
-    global TICKER_CACHE, LAST_FETCH
+    """
+    Returns list of tickers in shape similar to client.get_ticker()
+    Prefer WebSocket cache if available, else use REST with TTL.
+    """
+    global TICKER_LIST_CACHE, LAST_FETCH
     now = time.time()
-    if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
-        res = safe_api_call(client.get_ticker)
-        if res:
-            with CACHE_LOCK:
-                TICKER_CACHE = res
+    with CACHE_LOCK:
+        # prefer WS real-time cache if fresh
+        if WS_RUNNING and TICKER_LIST_CACHE and (now - LAST_FETCH) < max(1, CACHE_TTL):
+            return TICKER_LIST_CACHE
+        # fallback: refresh from REST if stale
+        if TICKER_LIST_CACHE is None or now - LAST_FETCH > CACHE_TTL:
+            res = safe_api_call(client.get_ticker)
+            if res:
+                TICKER_LIST_CACHE = res
                 LAST_FETCH = now
-        else:
-            notify("⚠️ get_tickers_cached failed - using cache")
-    return TICKER_CACHE or []
+            else:
+                notify("⚠️ get_tickers_cached failed - using stale cache if present")
+        return TICKER_LIST_CACHE or []
 
 def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
     now = time.time()
@@ -297,7 +407,7 @@ def get_open_orders_cached(symbol=None):
     return data
 
 # -------------------------
-# trading helpers (same as earlier)
+# trading helpers
 # -------------------------
 def get_free_asset(asset):
     try:
@@ -400,6 +510,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
         return None, None
     f = get_filters(info)
 
+    # Prefer WS tickers if available
     price = None
     tickers = get_tickers_cached()
     for t in tickers:
@@ -535,6 +646,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PC
         notify(f"📌 OCO placed for {symbol}")
         return {'tp': tp, 'sl': sp, 'method': 'oco', 'raw': oco}
 
+    # If OCO failed, try safer fallback flows
     notify("⚠️ OCO failed -> fallback to separate TP/SL")
     tp_order = place_order_idempotent('order_limit_sell', {"symbol": symbol, "quantity": qty_str, "price": tp_str}, dedupe_ttl=6)
     sl_order = place_order_idempotent('create_order', {"symbol": symbol, "side": "SELL", "type": "STOP_LOSS_LIMIT",
@@ -620,7 +732,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         return None, 0.0, None
 
 # -------------------------
-# PICKER (full from original, adapted)
+# PICKER (adapted)
 # -------------------------
 def pick_coin():
     # local helpers
@@ -815,8 +927,185 @@ def pick_coin():
     return (best['symbol'], best['last_price'], best['24h_vol'], best['24h_change'])
 
 # -------------------------
-# monitor_and_roll, pick are ready - trade cycle uses pick_coin
+# monitor_and_roll (kept from previous logic)
 # -------------------------
+def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
+    try:
+        open_orders = get_open_orders_cached(symbol)
+        cancelled = 0
+        for o in open_orders:
+            if cancelled >= max_cancel:
+                notify(f"⚠️ Reached max_cancel ({max_cancel}) for {symbol}; leaving remaining orders.")
+                break
+            try:
+                safe_api_call(client.cancel_order, symbol=symbol, orderId=o.get('orderId'))
+                cancelled += 1
+                time.sleep(inter_delay)
+            except Exception as e:
+                notify(f"⚠️ Cancel failed for {symbol} order {o.get('orderId')}: {e}")
+        if cancelled:
+            notify(f"❌ Cancelled {cancelled} open orders for {symbol}")
+        OPEN_ORDERS_CACHE['data'] = None
+    except Exception as e:
+        notify(f"⚠️ Failed to cancel orders: {e}")
+
+def monitor_and_roll(symbol, qty, entry_price, f):
+    orig_qty = qty
+    curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
+    curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
+
+    oco = place_oco_sell(symbol, qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+    if oco is None:
+        notify(f"❌ Initial OCO failed for {symbol}, aborting monitor.")
+        return False, entry_price, 0.0
+
+    last_tp = None
+    last_roll_ts = 0.0
+    last_roll_price = entry_price
+    roll_count = 0
+    last_price_seen = entry_price
+
+    def clip_tp(v, tick):
+        if not tick or tick == 0:
+            return v
+        return math.ceil(v / tick) * tick
+
+    def clip_sl(v, tick):
+        if not tick or tick == 0:
+            return v
+        return math.floor(v / tick) * tick
+
+    while True:
+        try:
+            time.sleep(SLEEP_BETWEEN_CHECKS)
+            asset = symbol[:-len(QUOTE)]
+            price_now = None
+            # prefer WS cached price
+            with CACHE_LOCK:
+                t = None
+                if TICKER_MAP:
+                    t = TICKER_MAP.get(symbol)
+                if t:
+                    try:
+                        price_now = float(t.get('lastPrice') or 0.0)
+                    except Exception:
+                        price_now = None
+            if price_now is None:
+                res = safe_api_call(client.get_symbol_ticker, symbol=symbol)
+                if res:
+                    price_now = float(res.get('price') or res.get('lastPrice') or 0.0)
+                else:
+                    notify("⚠️ monitor_and_roll: failed to fetch price, continuing.")
+                    continue
+
+            # direction detection
+            price_moving_up = price_now > last_price_seen
+            last_price_seen = price_now
+
+            free_qty = get_free_asset(asset)
+            available_for_sell = min(math.floor(free_qty / (f.get('stepSize') or 1e-8)) * (f.get('stepSize') or 1e-8), orig_qty)
+            open_orders = get_open_orders_cached(symbol)
+
+            if available_for_sell < math.floor(orig_qty * 0.05 / (f.get('stepSize') or 1e-8)) * (f.get('stepSize') or 1e-8) and len(open_orders) == 0:
+                exit_price = price_now
+                profit_usd = (exit_price - entry_price) * orig_qty
+                notify(f"✅ Position closed for {symbol}: exit={exit_price:.8f}, profit≈${profit_usd:.6f}")
+                return True, exit_price, profit_usd
+
+            price_delta = price_now - entry_price
+            rise_trigger_pct = price_now >= entry_price * (1 + ROLL_ON_RISE_PCT / 100.0)
+            rise_trigger_abs = price_delta >= max(ROLL_TRIGGER_DELTA_ABS, entry_price * (ROLL_ON_RISE_PCT/100.0))
+            near_trigger = (price_now >= curr_tp * (1 - 0.035)) and (price_now < curr_tp * 1.05)
+            tick = f.get('tickSize', 0.0) or 0.0
+            minimal_move = max(entry_price * 0.004, ROLL_TRIGGER_DELTA_ABS * 0.4, tick or 0.0)
+            moved_enough = price_delta >= minimal_move
+            now_ts = time.time()
+            can_roll_time = (now_ts - last_roll_ts) >= ROLL_COOLDOWN_SECONDS
+
+            passed_price_debounce = price_now >= (last_roll_price + ROLL_TRIGGER_DELTA_ABS)
+
+            should_roll = ((near_trigger and moved_enough) or rise_trigger_pct or rise_trigger_abs)
+            if should_roll and passed_price_debounce and price_moving_up and can_roll_time and available_for_sell >= f.get('minQty', 0.0):
+                if roll_count >= MAX_ROLLS_PER_POSITION:
+                    notify(f"⚠️ Reached max rolls ({MAX_ROLLS_PER_POSITION}) for {symbol}, will not roll further.")
+                    last_roll_ts = now_ts
+                    continue
+
+                notify(f"🔎 Roll triggered for {symbol}: price={price_now:.8f}, entry={entry_price:.8f}, curr_tp={curr_tp:.8f}")
+                candidate_tp = curr_tp + ROLL_TP_STEP_ABS
+                candidate_sl = curr_sl + ROLL_SL_STEP_ABS
+                if candidate_sl > entry_price:
+                    candidate_sl = entry_price
+
+                new_tp = clip_tp(candidate_tp, tick)
+                new_sl = clip_sl(candidate_sl, tick)
+                tick_step = tick or 0.0
+                if new_tp <= new_sl + tick_step:
+                    if tick_step > 0:
+                        new_tp = new_sl + tick_step * 2
+                    else:
+                        new_tp = new_sl + max(1e-8, ROLL_TP_STEP_ABS)
+                if new_tp <= curr_tp:
+                    if tick_step > 0:
+                        new_tp = math.ceil((curr_tp + tick_step) / tick_step) * tick_step
+                    else:
+                        new_tp = curr_tp + max(1e-8, ROLL_TP_STEP_ABS)
+
+                sell_qty = math.floor(available_for_sell / (f.get('stepSize') or 1e-8)) * (f.get('stepSize') or 1e-8)
+                if sell_qty <= 0 or sell_qty < f.get('minQty', 0.0):
+                    notify(f"⚠️ Roll skipped: sell_qty {sell_qty} too small or < minQty.")
+                    last_roll_ts = now_ts
+                    continue
+
+                min_notional = f.get('minNotional')
+                if min_notional:
+                    adjust_cnt = 0
+                    max_adj = 40
+                    while adjust_cnt < max_adj and sell_qty * new_tp < min_notional - 1e-12:
+                        if tick_step > 0:
+                            new_tp = clip_tp(new_tp + tick_step, tick_step)
+                        else:
+                            new_tp = new_tp + max(1e-8, new_tp * 0.001)
+                        adjust_cnt += 1
+                    if sell_qty * new_tp < min_notional - 1e-12:
+                        needed_qty = math.ceil(min_notional / new_tp / (f.get('stepSize') or 1e-8)) * (f.get('stepSize') or 1e-8)
+                        if needed_qty <= available_for_sell + 1e-12 and needed_qty > sell_qty:
+                            notify(f"ℹ️ Increasing sell_qty to {needed_qty} to meet minNotional for roll.")
+                            sell_qty = needed_qty
+                        else:
+                            notify(f"⚠️ Roll aborted: cannot meet minNotional for {symbol} even after TP bumps.")
+                            last_roll_ts = now_ts
+                            continue
+
+                last_roll_ts = now_ts
+                cancel_all_open_orders(symbol)
+                time.sleep(random.uniform(0.3, 0.8))
+
+                oco2 = place_oco_sell(symbol, sell_qty, entry_price, explicit_tp=new_tp, explicit_sl=new_sl)
+                if oco2:
+                    roll_count += 1
+                    last_tp = curr_tp
+                    curr_tp = new_tp
+                    curr_sl = new_sl
+                    last_roll_price = price_now
+                    notify(f"🔁 Rolled OCO: new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty} (roll #{roll_count})")
+                else:
+                    notify("⚠️ Roll attempt failed; will try fallback next loop.")
+                    time.sleep(0.4)
+                    fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+                    if fallback:
+                        notify("ℹ️ Fallback OCO re-placed after failed roll.")
+                    else:
+                        notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
+                        with STATE_LOCK:
+                            TEMP_SKIP[symbol] = time.time() + 3600
+        except Exception as e:
+            notify(f"⚠️ Error in monitor_and_roll: {e}")
+            return False, entry_price, 0.0
+
+# =========================
+# MAIN TRADE CYCLE
+# =========================
 ACTIVE_SYMBOL = None
 LAST_BUY_TS = 0.0
 
@@ -931,6 +1220,11 @@ def _signal_handler(signum, frame):
     notify(f"Signal {signum} received - shutting down")
     stop_event.set()
     _save_dedupe()
+    try:
+        if TWM:
+            TWM.stop()
+    except Exception:
+        pass
     sys.exit(0)
 
 signal.signal(signal.SIGINT, _signal_handler)
@@ -945,7 +1239,7 @@ def start_flask():
 # bootstrap
 # -------------------------
 if __name__ == "__main__":
-    notify("Booting cryptobot (LIVE final with pick_coin)")
+    notify("Booting cryptobot (LIVE final with WebSocket ticker if possible)")
     acct_ok = safe_api_call(client.get_account)
     if not acct_ok:
         notify("❌ API validation failed - aborting")
