@@ -373,8 +373,8 @@ def pick_coin():
             change_pct = float(t.get('priceChangePercent') or 0.0)
         except Exception:
             continue
-
-        # recent buy cooldown / re-buy avoidance
+        if qvol < 5_000_000:   # skip coins zenye volume ndogo
+            continue
         if last:
             if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
                 continue
