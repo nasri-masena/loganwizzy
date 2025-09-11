@@ -1,4 +1,4 @@
-imported os
+import os
 import math
 import time
 import re
