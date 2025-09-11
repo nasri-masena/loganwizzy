@@ -21,19 +21,19 @@ CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
 # price / liquidity filters
-PRICE_MIN = 1.0
-PRICE_MAX = 3.0
-MIN_VOLUME = 5_000_000          # daily quote volume baseline
+PRICE_MIN = 0.8
+PRICE_MAX = 4.0
+MIN_VOLUME = 3_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
-RECENT_PCT_MIN = 1.0
+RECENT_PCT_MIN = 0.8
 RECENT_PCT_MAX = 3.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
 MAX_24H_RISE_PCT = 7.0          # disallow > +5% 24h rise
-MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
+MAX_24H_CHANGE_ABS = 6.0        # require abs(24h change) <= 5.0
 
-MOVEMENT_MIN_PCT = 1.0
+MOVEMENT_MIN_PCT = 0.9
 
 KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
 KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
