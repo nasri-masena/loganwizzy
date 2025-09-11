@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import re
 import random
 import threading
 import requests
@@ -35,7 +36,7 @@ MAX_24H_CHANGE_ABS = 6.0        # require abs(24h change) <= 5.0
 
 MOVEMENT_MIN_PCT = 0.9
 
-KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
+KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "4"))
 KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
 EMA_SHORT = int(os.getenv("EMA_SHORT", "3"))
 EMA_LONG = int(os.getenv("EMA_LONG", "10"))
@@ -45,7 +46,7 @@ MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.05"))
 MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
 MIN_OB_LIQUIDITY = float(os.getenv("MIN_OB_LIQUIDITY", "5000.0"))
 TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "80"))
-REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.08"))
+REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.25"))
 MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.6"))
 MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.3"))
 MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", "1.2"))
@@ -104,7 +105,7 @@ REBUY_MAX_RISE_PCT = 5.0
 # rate-limit/backoff
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
-RATE_LIMIT_BASE_SLEEP = 90
+RATE_LIMIT_BASE_SLEEP = 120
 CACHE_TTL = 120
 
 # -------------------------
@@ -213,7 +214,6 @@ def get_filters(symbol_info):
 # -------------------------
 # TRANSFERS
 # -------------------------
-
 def send_profit_to_funding(amount, asset='USDT'):
     try:
         result = client.universal_transfer(
@@ -245,7 +245,7 @@ LAST_FETCH = 0
 SYMBOL_INFO_CACHE = {}
 SYMBOL_INFO_TTL = 120
 OPEN_ORDERS_CACHE = {'ts': 0, 'data': None}
-OPEN_ORDERS_TTL = 15
+OPEN_ORDERS_TTL = 60
 
 def safe_api_call(fn, *args, retries=3, backoff=0.6, **kwargs):
     global RATE_LIMIT_BACKOFF
@@ -255,26 +255,40 @@ def safe_api_call(fn, *args, retries=3, backoff=0.6, **kwargs):
             return fn(*args, **kwargs)
         except BinanceAPIException as e:
             err = str(e)
-            # detect common rate-limit pattern
+            # detect explicit IP-ban timestamp
+            m = re.search(r'IP banned until (\d+)', err)
+            if m:
+                try:
+                    until_ms = int(m.group(1))
+                    until_ts = until_ms / 1000.0
+                    wait = max(0, int(until_ts - time.time()))
+                    # clamp wait to configured max
+                    RATE_LIMIT_BACKOFF = min(wait if wait > 0 else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+                except Exception:
+                    RATE_LIMIT_BACKOFF = RATE_LIMIT_BACKOFF_MAX
+                notify(f"❗ Binance IP ban detected; backing off for ~{RATE_LIMIT_BACKOFF}s (until {time.ctime(time.time()+RATE_LIMIT_BACKOFF)})")
+                time.sleep(RATE_LIMIT_BACKOFF)
+                return None
+
+            # generic rate-limit detection
             if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
-                # escalate RATE_LIMIT_BACKOFF conservatively
                 RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
                                          RATE_LIMIT_BACKOFF_MAX)
                 notify(f"⚠️ Rate limit detected in safe_api_call: backing off {RATE_LIMIT_BACKOFF}s (err={err})")
                 time.sleep(max(RATE_LIMIT_BACKOFF, backoff))
                 attempt += 1
                 continue
-            else:
-                # other Binance error, retry a couple times
-                attempt += 1
-                time.sleep(backoff * attempt)
-                continue
-        except Exception as e:
+
+            # other Binance API error -> retry a few times
+            attempt += 1
+            time.sleep(backoff * attempt)
+            continue
+        except Exception:
             attempt += 1
             time.sleep(backoff * attempt)
             continue
     return None
-
+    
 def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
     now = time.time()
     ent = SYMBOL_INFO_CACHE.get(symbol)
@@ -289,12 +303,23 @@ def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
         return None
 
 def get_open_orders_cached(symbol=None):
+    global RATE_LIMIT_BACKOFF
     now = time.time()
+
+    # If we are in a RATE_LIMIT_BACKOFF window, avoid remote calls and return cached
+    if RATE_LIMIT_BACKOFF and OPEN_ORDERS_CACHE['data'] is not None and now - OPEN_ORDERS_CACHE['ts'] < RATE_LIMIT_BACKOFF:
+        data = OPEN_ORDERS_CACHE['data']
+        if symbol:
+            return [o for o in data if o.get('symbol') == symbol]
+        return data
+
+    # if still fresh cache, return it
     if OPEN_ORDERS_CACHE['data'] is not None and now - OPEN_ORDERS_CACHE['ts'] < OPEN_ORDERS_TTL:
         data = OPEN_ORDERS_CACHE['data']
         if symbol:
             return [o for o in data if o.get('symbol') == symbol]
         return data
+
     try:
         if symbol:
             data = client.get_open_orders(symbol=symbol)
@@ -303,23 +328,58 @@ def get_open_orders_cached(symbol=None):
         OPEN_ORDERS_CACHE['data'] = data
         OPEN_ORDERS_CACHE['ts'] = now
         return data
-    except Exception as e:
-        notify(f"⚠️ Failed to fetch open orders: {e}")
+    except BinanceAPIException as e:
+        err = str(e)
+        # handle explicit ban / rate-limit
+        m = re.search(r'IP banned until (\d+)', err)
+        if m:
+            try:
+                until_ms = int(m.group(1))
+                until_ts = until_ms / 1000.0
+                wait = max(0, int(until_ts - time.time()))
+                RATE_LIMIT_BACKOFF = min(wait if wait > 0 else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+            except Exception:
+                RATE_LIMIT_BACKOFF = RATE_LIMIT_BACKOFF_MAX
+            notify(f"❗ Binance IP ban detected in get_open_orders_cached; backing off ~{RATE_LIMIT_BACKOFF}s.")
+            time.sleep(RATE_LIMIT_BACKOFF)
+        elif '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
+            RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
+                                     RATE_LIMIT_BACKOFF_MAX)
+            notify(f"⚠️ Rate limit detected in get_open_orders_cached, backing off {RATE_LIMIT_BACKOFF}s.")
+            time.sleep(RATE_LIMIT_BACKOFF)
+        else:
+            notify(f"⚠️ Failed to fetch open orders: {e}")
         return OPEN_ORDERS_CACHE['data'] or []
 
 def get_tickers_cached():
     global TICKER_CACHE, LAST_FETCH, RATE_LIMIT_BACKOFF
     now = time.time()
+
+    # if we're currently in a backoff window, return cached data (if any)
     if RATE_LIMIT_BACKOFF and now - LAST_FETCH < RATE_LIMIT_BACKOFF:
         return TICKER_CACHE or []
+
+    # refresh cache only when expired / empty
     if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
         try:
             TICKER_CACHE = client.get_ticker()
             LAST_FETCH = now
             RATE_LIMIT_BACKOFF = 0
-        except Exception as e:
+        except BinanceAPIException as e:
             err = str(e)
-            if '-1003' in err or 'Too much request weight' in err:
+            # if explicit IP ban present, parse and set longer backoff
+            m = re.search(r'IP banned until (\d+)', err)
+            if m:
+                try:
+                    until_ms = int(m.group(1))
+                    until_ts = until_ms / 1000.0
+                    wait = max(0, int(until_ts - time.time()))
+                    RATE_LIMIT_BACKOFF = min(wait if wait > 0 else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+                except Exception:
+                    RATE_LIMIT_BACKOFF = RATE_LIMIT_BACKOFF_MAX
+                notify(f"❗ Binance IP ban detected in get_tickers_cached; backing off ~{RATE_LIMIT_BACKOFF}s.")
+                time.sleep(RATE_LIMIT_BACKOFF)
+            elif '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
                 RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
                                          RATE_LIMIT_BACKOFF_MAX)
                 notify(f"⚠️ Rate limit detected in get_tickers_cached, backing off for {RATE_LIMIT_BACKOFF}s.")
@@ -332,30 +392,69 @@ def get_tickers_cached():
 def get_price_cached(symbol):
     global TICKER_CACHE, LAST_FETCH, RATE_LIMIT_BACKOFF
     now = time.time()
-    try:
-        if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
-            try:
-                TICKER_CACHE = client.get_ticker()
-                LAST_FETCH = now
-                RATE_LIMIT_BACKOFF = 0
-            except Exception as e:
-                notify(f"⚠️ Failed to refresh tickers in get_price_cached: {e}")
-        if TICKER_CACHE:
-            for t in TICKER_CACHE:
-                if t.get('symbol') == symbol:
-                    try:
-                        return float(t.get('lastPrice') or t.get('price') or 0.0)
-                    except Exception:
-                        return None
-    except Exception as e:
-        notify(f"⚠️ get_price_cached general error: {e}")
+
+    # if we're in backoff and have fresh ticker data, use it
+    if RATE_LIMIT_BACKOFF and TICKER_CACHE is not None and now - LAST_FETCH < RATE_LIMIT_BACKOFF:
+        for t in TICKER_CACHE:
+            if t.get('symbol') == symbol:
+                try:
+                    return float(t.get('lastPrice') or t.get('price') or 0.0)
+                except Exception:
+                    return None
         return None
+
+    # try to use cached tickers if fresh enough
+    if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
+        try:
+            TICKER_CACHE = client.get_ticker()
+            LAST_FETCH = now
+            RATE_LIMIT_BACKOFF = 0
+        except BinanceAPIException as e:
+            err = str(e)
+            notify(f"⚠️ Failed to refresh tickers in get_price_cached: {err}")
+            # if rate-limited, set backoff and return cached value if available
+            if 'IP banned' in err or '-1003' in err or 'Too much request weight' in err:
+                m = re.search(r'IP banned until (\d+)', err)
+                if m:
+                    try:
+                        until_ms = int(m.group(1))
+                        until_ts = until_ms / 1000.0
+                        wait = max(0, int(until_ts - time.time()))
+                        RATE_LIMIT_BACKOFF = min(wait if wait > 0 else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+                    except Exception:
+                        RATE_LIMIT_BACKOFF = RATE_LIMIT_BACKOFF_MAX
+                else:
+                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
+                                             RATE_LIMIT_BACKOFF_MAX)
+                notify(f"⚠️ get_price_cached backing off for {RATE_LIMIT_BACKOFF}s due to rate-limit.")
+                time.sleep(min(RATE_LIMIT_BACKOFF, 1.0))  # small sleep here; caller may wait longer
+            # fall through to try cached data below
+
+    if TICKER_CACHE:
+        for t in TICKER_CACHE:
+            if t.get('symbol') == symbol:
+                try:
+                    return float(t.get('lastPrice') or t.get('price') or 0.0)
+                except Exception:
+                    return None
+
+    # last resort: single-symbol ticker (still guarded by safe_api_call normally)
     try:
         res = client.get_symbol_ticker(symbol=symbol)
         return float(res.get('price') or res.get('lastPrice') or 0.0)
-    except Exception as e:
-        notify(f"⚠️ get_price_cached fallback failed for {symbol}: {e}")
+    except BinanceAPIException as e:
+        err = str(e)
+        notify(f"⚠️ get_price_cached fallback failed for {symbol}: {err}")
+        # update backoff if needed
+        if 'IP banned' in err or '-1003' in err or 'Too much request weight' in err:
+            RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
+                                     RATE_LIMIT_BACKOFF_MAX)
+            notify(f"⚠️ get_price_cached fallback triggered backoff {RATE_LIMIT_BACKOFF}s.")
         return None
+    except Exception as e:
+        notify(f"⚠️ get_price_cached unexpected error for {symbol}: {e}")
+        return None
+        
 
 def cleanup_temp_skip():
     now = time.time()
@@ -1367,6 +1466,12 @@ def trade_cycle():
 
     while True:
         try:
+            # emergency guard: if we're in a long RATE_LIMIT_BACKOFF, pause the loop
+            if RATE_LIMIT_BACKOFF and RATE_LIMIT_BACKOFF >= 60:
+                notify(f"⏸ Emergency backoff active for {RATE_LIMIT_BACKOFF}s - pausing trade loop.")
+                time.sleep(RATE_LIMIT_BACKOFF)
+                continue
+
             cleanup_recent_buys()
 
             open_orders_global = get_open_orders_cached()
@@ -1417,7 +1522,8 @@ def trade_cycle():
                 continue
 
             try:
-                buy_res = place_safe_market_buy(symbol, usd_to_buy, require_orderbook=True)
+                # cheaper option: skip orderbook check at buy time to reduce weight (picker still checks OB)
+                buy_res = place_safe_market_buy(symbol, usd_to_buy, require_orderbook=False)
             except Exception as e:
                 err = str(e)
                 notify(f"❌ Exception during market buy attempt for {symbol}: {err}")
@@ -1532,7 +1638,7 @@ def trade_cycle():
             time.sleep(CYCLE_DELAY)
 
         time.sleep(30)
-
+        
 # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
