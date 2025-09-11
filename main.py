@@ -1,4 +1,4 @@
-import os
+imported os
 import math
 import time
 import re
@@ -23,7 +23,7 @@ QUOTE = "USDT"
 
 # price / liquidity filters
 PRICE_MIN = 0.9
-PRICE_MAX = 3.0
+PRICE_MAX = 4.0
 MIN_VOLUME = 5_000_000
 
 # recent move band — require clearer move but allow decent range
@@ -62,7 +62,7 @@ TOP_EVAL_RANDOM_POOL = int(os.getenv("TOP_EVAL_RANDOM_POOL", "30"))
 FINAL_CHOICES = int(os.getenv("FINAL_CHOICES", "3"))
 
 # runtime / pacing
-TRADE_USD = 7.0
+TRADE_USD = 10.0
 SLEEP_BETWEEN_CHECKS = 30
 CYCLE_DELAY = 15
 COOLDOWN_AFTER_EXIT = 10
