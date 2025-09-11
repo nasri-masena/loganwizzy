@@ -27,10 +27,10 @@ MIN_VOLUME = 5_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 1.0
-RECENT_PCT_MAX = 2.0            # require recent move between 1%..2%
+RECENT_PCT_MAX = 3.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
-MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
+MAX_24H_RISE_PCT = 7.0          # disallow > +5% 24h rise
 MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
 
 MOVEMENT_MIN_PCT = 1.0
@@ -41,14 +41,19 @@ EMA_SHORT = int(os.getenv("EMA_SHORT", "3"))
 EMA_LONG = int(os.getenv("EMA_LONG", "10"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 OB_DEPTH = int(os.getenv("OB_DEPTH", "5"))
-MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.1"))
-MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.5"))
-MIN_OB_LIQUIDITY = float(os.getenv("MIN_OB_LIQUIDITY", "3000.0"))  # quote liquidity
-TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "80"))    # how many top tickers to evaluate
-REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.08"))         # pause between heavy API calls
+MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.05"))
+MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
+MIN_OB_LIQUIDITY = float(os.getenv("MIN_OB_LIQUIDITY", "5000.0"))
+TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "80"))
+REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.08"))
 MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.6"))
 MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.3"))
-
+MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", "1.2"))
+MIN_VOL_RATIO_1M = float(os.getenv("MIN_VOL_RATIO_1M", "1.1"))
+MIN_OB_LIQUIDITY = float(os.getenv("MIN_OB_LIQUIDITY", "5000.0"))
+MIN_EMA_LIFT = float(os.getenv("MIN_EMA_LIFT", "0.0008"))
+TOP_EVAL_RANDOM_POOL = int(os.getenv("TOP_EVAL_RANDOM_POOL", "30"))
+FINAL_CHOICES = int(os.getenv("FINAL_CHOICES", "3"))
 
 # runtime / pacing
 TRADE_USD = 7.0
@@ -269,7 +274,7 @@ def safe_api_call(fn, *args, retries=3, backoff=0.6, **kwargs):
             time.sleep(backoff * attempt)
             continue
     return None
-    
+
 def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
     now = time.time()
     ent = SYMBOL_INFO_CACHE.get(symbol)
@@ -417,6 +422,14 @@ def pick_coin():
         rsi = 100 - (100 / (1 + rs))
         return rsi
 
+    # fallback config values (use global overrides if present)
+    TOP_POOL = globals().get('TOP_EVAL_RANDOM_POOL', globals().get('TOP_BY_24H_VOLUME', 50))
+    FINAL_CHOICES = globals().get('FINAL_CHOICES', 3)
+    MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.2)
+    MIN_VOL_RATIO_1M = globals().get('MIN_VOL_RATIO_1M', 1.1)
+    MIN_EMA_LIFT = globals().get('MIN_EMA_LIFT', 0.0008)
+    MIN_OB_LIQ = globals().get('MIN_OB_LIQUIDITY', globals().get('MIN_OB_LIQUIDITY', 3000.0))
+
     # cheap prefilter using cached tickers
     tickers = get_tickers_cached() or []
     now = time.time()
@@ -438,7 +451,7 @@ def pick_coin():
             continue
         if qvol < MIN_VOLUME:
             continue
-        # keep broad 24h change band but avoid enormous pumps
+        # keep broad 24h change band but avoid enormous pumps/dumps
         if ch < -5.0 or ch > 20.0:
             continue
 
@@ -456,13 +469,13 @@ def pick_coin():
     if not pre:
         return None
 
-    # sort and pick top slice to evaluate deeper
+    # sort and pick top slice to evaluate deeper (smaller pool = fewer API calls)
     pre.sort(key=lambda x: x[2], reverse=True)
-    candidates = pre[:TOP_BY_24H_VOLUME]
+    candidates = pre[:TOP_POOL]
 
     scored = []
     for sym, last_price, qvol, change_24h in candidates:
-        # short sleep between heavy calls to avoid bursts
+        # small pause to avoid bursts
         time.sleep(REQUEST_SLEEP)
 
         # fetch 5m klines
@@ -537,12 +550,19 @@ def pick_coin():
                     ob_imbalance = bid_sum / ask_sum
                     ob_spread_pct = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
                     bid_quote_liq = sum(float(b[0]) * float(b[1]) for b in bids[:OB_DEPTH])
-                    if bid_quote_liq >= MIN_OB_LIQUIDITY:
-                        ob_ok = (ob_imbalance >= MIN_OB_IMBALANCE) and (ob_spread_pct <= MAX_OB_SPREAD_PCT)
-                    else:
-                        ob_ok = False
+                    # require both imbalance and minimum bid quote liquidity, and not-too-large spread
+                    ob_ok = (ob_imbalance >= MIN_OB_IMBALANCE) and (ob_spread_pct <= MAX_OB_SPREAD_PCT) and (bid_quote_liq >= MIN_OB_LIQ)
 
-            # scoring (adjust weights as needed)
+            # gating checks (conservative)
+            # require volume spike on 5m and confirmation on 1m
+            vol_ok = (vol_ratio_5m >= MIN_VOL_RATIO) and (vol_ratio_1m >= MIN_VOL_RATIO_1M)
+            # require meaningful EMA uplift
+            ema_good = ema_ok and (ema_uplift >= MIN_EMA_LIFT)
+            # avoid too-large 24h pumps
+            if change_24h is not None and change_24h > MAX_24H_RISE_PCT:
+                continue
+
+            # scoring (weights adjustable)
             score = 0.0
             score += max(0.0, pct_5m) * 4.0
             score += max(0.0, pct_1m) * 2.0
@@ -556,8 +576,7 @@ def pick_coin():
             if last_price <= PRICE_MAX:
                 score += 6.0
 
-            strong_candidate = (pct_5m >= MIN_5M_PCT and pct_1m >= MIN_1M_PCT and vol_ratio_5m >= 1.4
-                                and ema_ok and rsi_ok and ob_ok)
+            strong_candidate = (pct_5m >= MIN_5M_PCT and pct_1m >= MIN_1M_PCT and vol_ok and ema_good and rsi_ok and ob_ok)
 
             scored.append({
                 "symbol": sym,
@@ -567,6 +586,7 @@ def pick_coin():
                 "pct_5m": pct_5m,
                 "pct_1m": pct_1m,
                 "vol_ratio_5m": vol_ratio_5m,
+                "vol_ratio_1m": vol_ratio_1m,
                 "ema_ok": ema_ok,
                 "ema_uplift": ema_uplift,
                 "rsi": rsi_val,
@@ -584,12 +604,19 @@ def pick_coin():
     if not scored:
         return None
 
+    # prefer strong candidates but randomize within top choices to increase variety
     scored.sort(key=lambda x: x['score'], reverse=True)
     strongs = [s for s in scored if s['strong_candidate']]
-    if strongs:
-        best = sorted(strongs, key=lambda x: x['score'], reverse=True)[0]
-    else:
+    pool = strongs if strongs else scored
+
+    top_n = min(FINAL_CHOICES, len(pool))
+    if top_n <= 0:
+        # fallback to highest-scored overall
         best = scored[0]
+    else:
+        top_slice = pool[:top_n]
+        best = random.choice(top_slice)
+
     return (best['symbol'], best['last_price'], best['24h_vol'], best['24h_change'])
     
 # -------------------------
