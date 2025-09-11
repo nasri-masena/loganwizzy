@@ -27,8 +27,8 @@ PRICE_MAX = 4.0
 MIN_VOLUME = 5_000_000
 
 # recent move band — require clearer move but allow decent range
-RECENT_PCT_MIN = 1.0
-RECENT_PCT_MAX = 6.0
+RECENT_PCT_MIN = 0.5
+RECENT_PCT_MAX = 5.0
 
 # 24h guardrails
 MAX_24H_RISE_PCT = 10.0
