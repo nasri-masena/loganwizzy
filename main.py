@@ -22,37 +22,42 @@ CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
 # price / liquidity filters
-PRICE_MIN = 0.8
-PRICE_MAX = 4.0
-MIN_VOLUME = 3_000_000          # daily quote volume baseline
+PRICE_MIN = 0.9
+PRICE_MAX = 3.0
+MIN_VOLUME = 5_000_000
 
-# require small recent move (we prefer coins that just started moving)
-RECENT_PCT_MIN = 0.8
-RECENT_PCT_MAX = 3.0            # require recent move between 1%..2%
+# recent move band — require clearer move but allow decent range
+RECENT_PCT_MIN = 1.0
+RECENT_PCT_MAX = 6.0
 
-# absolute 24h change guardrails (avoid extreme pump/dump)
-MAX_24H_RISE_PCT = 7.0          # disallow > +5% 24h rise
-MAX_24H_CHANGE_ABS = 6.0        # require abs(24h change) <= 5.0
+# 24h guardrails
+MAX_24H_RISE_PCT = 10.0
+MAX_24H_CHANGE_ABS = 12.0
 
-MOVEMENT_MIN_PCT = 0.9
+MOVEMENT_MIN_PCT = 1.2
 
-KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "4"))
-KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
+# klines
+KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))   # use slightly more 5m bars
+KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "3"))   # fewer 1m bars to be faster
+
+# indicators / OB
 EMA_SHORT = int(os.getenv("EMA_SHORT", "3"))
 EMA_LONG = int(os.getenv("EMA_LONG", "10"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 OB_DEPTH = int(os.getenv("OB_DEPTH", "5"))
 MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.05"))
-MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
-MIN_OB_LIQUIDITY = float(os.getenv("MIN_OB_LIQUIDITY", "5000.0"))
+MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.2"))  # allow a bit more spread
+MIN_OB_LIQUIDITY = float(os.getenv("MIN_OB_LIQUIDITY", "2500.0")) # lower so trades with ~$7 can fill
+
 TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "80"))
-REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.25"))
-MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.6"))
-MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.3"))
-MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", "1.2"))
-MIN_VOL_RATIO_1M = float(os.getenv("MIN_VOL_RATIO_1M", "1.1"))
-MIN_OB_LIQUIDITY = float(os.getenv("MIN_OB_LIQUIDITY", "5000.0"))
-MIN_EMA_LIFT = float(os.getenv("MIN_EMA_LIFT", "0.0008"))
+REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.10"))         # faster but spaced
+MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.8"))
+MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.4"))
+
+MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", "1.4"))          # require stronger vol spike
+MIN_VOL_RATIO_1M = float(os.getenv("MIN_VOL_RATIO_1M", "1.2"))
+MIN_EMA_LIFT = float(os.getenv("MIN_EMA_LIFT", "0.0010"))         # require small but meaningful EMA uplift
+
 TOP_EVAL_RANDOM_POOL = int(os.getenv("TOP_EVAL_RANDOM_POOL", "30"))
 FINAL_CHOICES = int(os.getenv("FINAL_CHOICES", "3"))
 
@@ -80,7 +85,7 @@ ROLL_TRIGGER_DELTA_ABS = 0.007
 ROLL_TP_STEP_ABS = 0.020
 ROLL_SL_STEP_ABS = 0.003
 ROLL_COOLDOWN_SECONDS = 60
-MAX_ROLLS_PER_POSITION = 3
+MAX_ROLLS_PER_POSITION = 5
 ROLL_POST_CANCEL_JITTER = (0.3, 0.8)
 
 # -------------------------
@@ -469,26 +474,41 @@ def cleanup_recent_buys():
         if now >= info['ts'] + cd:
             del RECENT_BUYS[s]
 
-def orderbook_bullish(symbol, depth=2, min_imbalance=1.02, max_spread_pct=1.0):
+def orderbook_bullish(symbol, depth=2, min_imbalance=None, max_spread_pct=None, min_bid_quote=None):
     try:
-        ob = client.get_order_book(symbol=symbol, limit=depth)
+        if min_imbalance is None:
+            min_imbalance = globals().get('MIN_OB_IMBALANCE', 1.05)
+        if max_spread_pct is None:
+            max_spread_pct = globals().get('MAX_OB_SPREAD_PCT', 1.2)
+        if min_bid_quote is None:
+            min_bid_quote = globals().get('MIN_OB_LIQUIDITY', 2000.0)
+
+        ob = safe_api_call(client.get_order_book, symbol=symbol, limit=depth)
+        if not ob:
+            return False
         bids = ob.get('bids') or []
         asks = ob.get('asks') or []
         if not bids or not asks:
             return False
+
         top_bid_p, top_bid_q = float(bids[0][0]), float(bids[0][1])
         top_ask_p, top_ask_q = float(asks[0][0]), float(asks[0][1])
+
+        # spread in percent
         spread_pct = (top_ask_p - top_bid_p) / (top_bid_p + 1e-12) * 100.0
+
         bid_sum = sum(float(b[1]) for b in bids[:depth]) + 1e-12
         ask_sum = sum(float(a[1]) for a in asks[:depth]) + 1e-12
         imbalance = bid_sum / ask_sum
-        return (imbalance >= min_imbalance) and (spread_pct <= max_spread_pct)
+
+        # compute approximate bid-side quote liquidity (price * qty)
+        bid_quote_liq = sum(float(b[0]) * float(b[1]) for b in bids[:depth]) if bids else 0.0
+        
+        return (imbalance >= float(min_imbalance)) and (spread_pct <= float(max_spread_pct)) and (bid_quote_liq >= float(min_bid_quote))
     except Exception:
         return False
 
-# -------------------------
-# PICKER (tweaked)
-# -------------------------
+
 def pick_coin():
     def pct_change(open_p, close_p):
         if open_p == 0:
@@ -509,7 +529,7 @@ def pick_coin():
             return None
         gains, losses = [], []
         for i in range(1, len(closes)):
-            diff = closes[i] - closes[i-1]
+            diff = closes[i] - closes[i - 1]
             gains.append(max(0.0, diff))
             losses.append(max(0.0, -diff))
         avg_gain = sum(gains[:period]) / period
@@ -521,13 +541,15 @@ def pick_coin():
         rsi = 100 - (100 / (1 + rs))
         return rsi
 
-    # fallback config values (use global overrides if present)
-    TOP_POOL = globals().get('TOP_EVAL_RANDOM_POOL', globals().get('TOP_BY_24H_VOLUME', 50))
+    # config fallbacks (use globals if present)
+    TOP_POOL = globals().get('TOP_EVAL_RANDOM_POOL', globals().get('TOP_BY_24H_VOLUME', 80))
     FINAL_CHOICES = globals().get('FINAL_CHOICES', 3)
-    MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.2)
-    MIN_VOL_RATIO_1M = globals().get('MIN_VOL_RATIO_1M', 1.1)
-    MIN_EMA_LIFT = globals().get('MIN_EMA_LIFT', 0.0008)
-    MIN_OB_LIQ = globals().get('MIN_OB_LIQUIDITY', globals().get('MIN_OB_LIQUIDITY', 3000.0))
+    MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.4)
+    MIN_VOL_RATIO_1M = globals().get('MIN_VOL_RATIO_1M', 1.2)
+    MIN_EMA_LIFT = globals().get('MIN_EMA_LIFT', 0.0010)
+    MIN_OB_LIQ = globals().get('MIN_OB_LIQUIDITY', 2000.0)
+    FAST_OB_DEPTH = 2
+    FAST_OB_SPREAD_ALLOW = max(1.5, globals().get('MAX_OB_SPREAD_PCT', 1.2) * 1.5)
 
     # cheap prefilter using cached tickers
     tickers = get_tickers_cached() or []
@@ -550,8 +572,8 @@ def pick_coin():
             continue
         if qvol < MIN_VOLUME:
             continue
-        # keep broad 24h change band but avoid enormous pumps/dumps
-        if ch < -5.0 or ch > 20.0:
+        # avoid enormous pumps/dumps
+        if ch is not None and (ch < -10.0 or ch > globals().get('MAX_24H_CHANGE_ABS', 12.0)):
             continue
 
         skip_until = TEMP_SKIP.get(sym)
@@ -568,28 +590,47 @@ def pick_coin():
     if not pre:
         return None
 
-    # sort and pick top slice to evaluate deeper (smaller pool = fewer API calls)
+    # sort by quote volume and evaluate top slice
     pre.sort(key=lambda x: x[2], reverse=True)
     candidates = pre[:TOP_POOL]
 
     scored = []
     for sym, last_price, qvol, change_24h in candidates:
-        # small pause to avoid bursts
-        time.sleep(REQUEST_SLEEP)
-
-        # fetch 5m klines
-        kl5 = safe_api_call(client.get_klines, symbol=sym, interval='5m', limit=KLINES_5M_LIMIT)
-        if not kl5 or len(kl5) < 3:
-            continue
-
-        time.sleep(REQUEST_SLEEP)
-
-        # fetch 1m klines
-        kl1 = safe_api_call(client.get_klines, symbol=sym, interval='1m', limit=KLINES_1M_LIMIT)
-        if not kl1 or len(kl1) < 2:
-            continue
-
         try:
+            # small pause to space heavy API calls
+            time.sleep(REQUEST_SLEEP)
+
+            # FAST cheap top-of-book pre-check (avoid klines if obviously illiquid or huge spread)
+            try:
+                ob_fast = safe_api_call(client.get_order_book, symbol=sym, limit=FAST_OB_DEPTH)
+                if not ob_fast:
+                    continue
+                bids_f = ob_fast.get('bids') or []
+                asks_f = ob_fast.get('asks') or []
+                if not bids_f or not asks_f:
+                    continue
+                top_bid = float(bids_f[0][0]); top_ask = float(asks_f[0][0])
+                spread_fast = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
+                # reject if extremely wide
+                if spread_fast > FAST_OB_SPREAD_ALLOW:
+                    continue
+            except Exception:
+                # if fast OB fails, skip symbol to avoid extra risk
+                continue
+
+            # fetch 5m klines (heavier)
+            kl5 = safe_api_call(client.get_klines, symbol=sym, interval='5m', limit=KLINES_5M_LIMIT)
+            if not kl5 or len(kl5) < 3:
+                continue
+
+            time.sleep(REQUEST_SLEEP)
+
+            # fetch 1m klines (optional but useful)
+            kl1 = safe_api_call(client.get_klines, symbol=sym, interval='1m', limit=KLINES_1M_LIMIT)
+            if not kl1 or len(kl1) < 2:
+                continue
+
+            # parse closes and volumes
             closes_5m = [float(k[4]) for k in kl5]
             vols_5m = []
             for k in kl5:
@@ -617,21 +658,36 @@ def pick_coin():
             avg_prev_1m = (sum(vols_1m[:-1]) / max(len(vols_1m[:-1]), 1)) if len(vols_1m) > 1 else vols_1m[-1]
             vol_ratio_1m = vols_1m[-1] / (avg_prev_1m + 1e-12)
 
+            # require at least two consecutive up closes on 5m (momentum confirmation)
+            last3 = closes_5m[-3:] if len(closes_5m) >= 3 else closes_5m
+            ups = 0
+            if len(last3) >= 2 and last3[1] > last3[0]:
+                ups += 1
+            if len(last3) >= 3 and last3[2] > last3[1]:
+                ups += 1
+            if ups < 2:
+                continue
+
             # EMA checks on 5m closes
             short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
             long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
-            ema_ok = False
             ema_uplift = 0.0
-            if short_ema and long_ema:
+            ema_ok = False
+            if short_ema is not None and long_ema is not None:
                 ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-                ema_ok = short_ema > long_ema * 1.0005
+                ema_ok = (short_ema > long_ema) and (ema_uplift >= MIN_EMA_LIFT)
+            if not ema_ok:
+                continue
 
-            rsi_val = compute_rsi_local(closes_5m[-(RSI_PERIOD+1):], RSI_PERIOD) if len(closes_5m) >= RSI_PERIOD+1 else None
+            # RSI sanity check
+            rsi_val = compute_rsi_local(closes_5m[-(RSI_PERIOD + 1):], RSI_PERIOD) if len(closes_5m) >= RSI_PERIOD + 1 else None
             rsi_ok = True
             if rsi_val is not None and rsi_val > 68:
                 rsi_ok = False
+            if not rsi_ok:
+                continue
 
-            # short sleep then orderbook
+            # short sleep then full orderbook check (heavier)
             time.sleep(REQUEST_SLEEP)
             ob = safe_api_call(client.get_order_book, symbol=sym, limit=OB_DEPTH)
 
@@ -649,33 +705,30 @@ def pick_coin():
                     ob_imbalance = bid_sum / ask_sum
                     ob_spread_pct = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
                     bid_quote_liq = sum(float(b[0]) * float(b[1]) for b in bids[:OB_DEPTH])
-                    # require both imbalance and minimum bid quote liquidity, and not-too-large spread
-                    ob_ok = (ob_imbalance >= MIN_OB_IMBALANCE) and (ob_spread_pct <= MAX_OB_SPREAD_PCT) and (bid_quote_liq >= MIN_OB_LIQ)
+                    ob_ok = (ob_imbalance >= globals().get('MIN_OB_IMBALANCE', 1.05)) and (ob_spread_pct <= globals().get('MAX_OB_SPREAD_PCT', 1.2)) and (bid_quote_liq >= MIN_OB_LIQ)
 
-            # gating checks (conservative)
-            # require volume spike on 5m and confirmation on 1m
+            # gating checks
             vol_ok = (vol_ratio_5m >= MIN_VOL_RATIO) and (vol_ratio_1m >= MIN_VOL_RATIO_1M)
-            # require meaningful EMA uplift
-            ema_good = ema_ok and (ema_uplift >= MIN_EMA_LIFT)
-            # avoid too-large 24h pumps
-            if change_24h is not None and change_24h > MAX_24H_RISE_PCT:
+            if not vol_ok:
+                continue
+            if change_24h is not None and change_24h > globals().get('MAX_24H_RISE_PCT', 10.0):
+                continue
+            if not ob_ok:
                 continue
 
-            # scoring (weights adjustable)
+            # scoring (bias toward clear 5m momentum + vol spike + EMA uplift)
             score = 0.0
-            score += max(0.0, pct_5m) * 4.0
+            score += max(0.0, pct_5m) * 6.0
             score += max(0.0, pct_1m) * 2.0
-            score += max(0.0, (vol_ratio_5m - 1.0)) * 3.0 * 100.0
-            score += ema_uplift * 5.0 * 100.0
+            score += max(0.0, (vol_ratio_5m - 1.0)) * 4.0 * 100.0
+            score += ema_uplift * 8.0 * 100.0
             if rsi_val is not None:
-                score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.5 * 0.2
-            score += max(0.0, change_24h) * 1.0 * 0.5
+                score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.2
+            score += max(0.0, change_24h) * 0.6
             if ob_ok:
-                score += 2.0 * 10.0
+                score += 25.0
             if last_price <= PRICE_MAX:
-                score += 6.0
-
-            strong_candidate = (pct_5m >= MIN_5M_PCT and pct_1m >= MIN_1M_PCT and vol_ok and ema_good and rsi_ok and ob_ok)
+                score += 4.0
 
             scored.append({
                 "symbol": sym,
@@ -694,7 +747,7 @@ def pick_coin():
                 "ob_spread_pct": ob_spread_pct,
                 "ob_bid_liq": bid_quote_liq,
                 "score": score,
-                "strong_candidate": strong_candidate
+                "strong_candidate": True
             })
         except Exception as e:
             notify(f"⚠️ pick_coin evaluate error {sym}: {e}")
@@ -703,18 +756,15 @@ def pick_coin():
     if not scored:
         return None
 
-    # prefer strong candidates but randomize within top choices to increase variety
+    # sort & choose with slight randomness among top choices
     scored.sort(key=lambda x: x['score'], reverse=True)
-    strongs = [s for s in scored if s['strong_candidate']]
-    pool = strongs if strongs else scored
-
+    pool = scored[:TOP_POOL] if len(scored) >= TOP_POOL else scored
+    # limit top choices and choose randomly for diversity
     top_n = min(FINAL_CHOICES, len(pool))
     if top_n <= 0:
-        # fallback to highest-scored overall
         best = scored[0]
     else:
-        top_slice = pool[:top_n]
-        best = random.choice(top_slice)
+        best = random.choice(pool[:top_n])
 
     return (best['symbol'], best['last_price'], best['24h_vol'], best['24h_change'])
     
