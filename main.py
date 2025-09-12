@@ -349,9 +349,9 @@ def pick_coin():
     cleanup_recent_buys()
     now = time.time()
 
-    TOP_CANDIDATES = 120
-    MIN_VOL_RATIO = 1.6
-    KLINES_LIMIT = 10
+    TOP_CANDIDATES = 100
+    MIN_VOL_RATIO = 1.4
+    KLINES_LIMIT = 8
 
     tickers = get_tickers_cached() or []
     prefiltered = []
