@@ -22,21 +22,21 @@ QUOTE = "USDT"
 
 # price / liquidity filters
 PRICE_MIN = 1.0
-PRICE_MAX = 3.0
-MIN_VOLUME = 3_500_000          # daily quote volume baseline
+PRICE_MAX = 4.0
+MIN_VOLUME = 3_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.8
 RECENT_PCT_MAX = 4.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
-MAX_24H_RISE_PCT = 7.0          # disallow > +5% 24h rise
-MAX_24H_CHANGE_ABS = 9.0        # require abs(24h change) <= 5.0
+MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
+MAX_24H_CHANGE_ABS = 7.0        # require abs(24h change) <= 5.0
 
-MOVEMENT_MIN_PCT = 1.0
+MOVEMENT_MIN_PCT = 1.1
 
 # runtime / pacing
-TRADE_USD = 10.0
+TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 30
 CYCLE_DELAY = 15
 COOLDOWN_AFTER_EXIT = 10
@@ -349,7 +349,7 @@ def pick_coin():
     cleanup_recent_buys()
     now = time.time()
 
-    TOP_CANDIDATES = 100
+    TOP_CANDIDATES = 120
     MIN_VOL_RATIO = 1.4
     KLINES_LIMIT = 8
 
