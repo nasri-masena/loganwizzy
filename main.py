@@ -23,7 +23,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 1.0
 PRICE_MAX = 4.0
-MIN_VOLUME = 5_000_000          # daily quote volume baseline
+MIN_VOLUME = 4_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.8
@@ -350,7 +350,7 @@ def pick_coin():
     now = time.time()
 
     TOP_CANDIDATES = 120
-    MIN_VOL_RATIO = 1.4
+    MIN_VOL_RATIO = 1.2
     KLINES_LIMIT = 8
 
     tickers = get_tickers_cached() or []
