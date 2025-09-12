@@ -23,15 +23,15 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 1.0
 PRICE_MAX = 3.0
-MIN_VOLUME = 4_000_000          # daily quote volume baseline
+MIN_VOLUME = 3_500_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
-RECENT_PCT_MIN = 1.0
-RECENT_PCT_MAX = 2.0            # require recent move between 1%..2%
+RECENT_PCT_MIN = 0.8
+RECENT_PCT_MAX = 4.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
-MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
-MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
+MAX_24H_RISE_PCT = 7.0          # disallow > +5% 24h rise
+MAX_24H_CHANGE_ABS = 9.0        # require abs(24h change) <= 5.0
 
 MOVEMENT_MIN_PCT = 1.0
 
