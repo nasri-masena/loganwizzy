@@ -1,7 +1,6 @@
 import os
 import math
 import time
-import re
 import random
 import threading
 import requests
@@ -21,77 +20,39 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
-# -------------------------
-# PICKER / MARKET TUNING
-# -------------------------
-PRICE_MIN = 0.9
+# price / liquidity filters
+PRICE_MIN = 9.0
 PRICE_MAX = 4.0
-MIN_VOLUME = 4_000_000          # <-- balanced: not too small, not too strict
+MIN_VOLUME = 4_000_000          # daily quote volume baseline
 
-# recent move band — require a clear but not tiny move
+# require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 1.0
-RECENT_PCT_MAX = 3.0
+RECENT_PCT_MAX = 2.0            # require recent move between 1%..2%
 
-# 24h guardrails
-MAX_24H_RISE_PCT = 10.0
-MAX_24H_CHANGE_ABS = 12.0
+# absolute 24h change guardrails (avoid extreme pump/dump)
+MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
+MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
 
-MOVEMENT_MIN_PCT = 1.2
+MOVEMENT_MIN_PCT = 1.0
 
-# -------------------------
-# KLINES / TIMING / REQUESTS
-# -------------------------
-KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
-KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "3"))
-
-REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.20"))   # <-- slightly relaxed to reduce rate-limit risk
-
-# -------------------------
-# INDICATORS / ORDERBOOK
-# -------------------------
-EMA_SHORT = int(os.getenv("EMA_SHORT", "3"))
-EMA_LONG = int(os.getenv("EMA_LONG", "10"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-
-OB_DEPTH = int(os.getenv("OB_DEPTH", "5"))
-MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.05"))
-MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.2"))
-MIN_OB_LIQUIDITY = float(os.getenv("MIN_OB_LIQUIDITY", "2500.0"))  # allow fills for small trades
-
-# -------------------------
-# VOLUME / SPIKE FILTERS
-# -------------------------
-MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.8"))
-MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.4"))
-
-MIN_VOL_RATIO = float(os.getenv("MIN_VOL_RATIO", "1.4"))
-MIN_VOL_RATIO_1M = float(os.getenv("MIN_VOL_RATIO_1M", "1.2"))
-MIN_EMA_LIFT = float(os.getenv("MIN_EMA_LIFT", "0.0010"))
-
-# -------------------------
-# POOL / FINAL CHOICE
-# -------------------------
-TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "60"))       # <-- evaluate top 60 by 24h quote vol
-TOP_EVAL_RANDOM_POOL = int(os.getenv("TOP_EVAL_RANDOM_POOL", "30"))
-FINAL_CHOICES = int(os.getenv("FINAL_CHOICES", "3"))              # choose randomly among top 3 to add variety
-
-# -------------------------
-# RUNTIME / ORDER SIZING (kept from previous defaults)
-# -------------------------
-TRADE_USD = 7.0
+# runtime / pacing
+TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 30
 CYCLE_DELAY = 15
 COOLDOWN_AFTER_EXIT = 10
 
+# order / protection
 TRIGGER_PROXIMITY = 0.06
 STEP_INCREMENT_PCT = 0.02
 BASE_TP_PCT = 2.5
 BASE_SL_PCT = 2.0
 
+# micro-take profit
 MICRO_TP_PCT = 1.0
 MICRO_TP_FRACTION = 0.50
 MICRO_MAX_WAIT = 20.0
 
+# rolling config
 ROLL_ON_RISE_PCT = 0.5
 ROLL_TRIGGER_PCT = 0.75
 ROLL_TRIGGER_DELTA_ABS = 0.007
@@ -100,14 +61,6 @@ ROLL_SL_STEP_ABS = 0.003
 ROLL_COOLDOWN_SECONDS = 60
 MAX_ROLLS_PER_POSITION = 3
 ROLL_POST_CANCEL_JITTER = (0.3, 0.8)
-
-# -------------------------
-# RATE LIMIT / CACHING
-# -------------------------
-RATE_LIMIT_BACKOFF = 0
-RATE_LIMIT_BACKOFF_MAX = 300
-RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 300
 
 # -------------------------
 # INIT / GLOBALS
@@ -127,6 +80,12 @@ RECENT_BUYS = {}
 REBUY_COOLDOWN = 60 * 60
 LOSS_COOLDOWN = 60 * 60 * 4
 REBUY_MAX_RISE_PCT = 5.0
+
+# rate-limit/backoff
+RATE_LIMIT_BACKOFF = 0
+RATE_LIMIT_BACKOFF_MAX = 300
+RATE_LIMIT_BASE_SLEEP = 90
+CACHE_TTL = 120
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -234,6 +193,7 @@ def get_filters(symbol_info):
 # -------------------------
 # TRANSFERS
 # -------------------------
+
 def send_profit_to_funding(amount, asset='USDT'):
     try:
         result = client.universal_transfer(
@@ -259,109 +219,39 @@ def send_profit_to_funding(amount, asset='USDT'):
 # -------------------------
 # CACHES & UTIL
 # -------------------------
+
 TICKER_CACHE = None
 LAST_FETCH = 0
 SYMBOL_INFO_CACHE = {}
 SYMBOL_INFO_TTL = 120
 OPEN_ORDERS_CACHE = {'ts': 0, 'data': None}
-OPEN_ORDERS_TTL = 120
-
-def safe_api_call(fn, *args, retries=3, backoff=0.6, **kwargs):
-    """
-    Robust wrapper for Binance API calls:
-     - Detects explicit IP ban timestamps and rate-limit (-1003).
-     - Escalates RATE_LIMIT_BACKOFF conservatively and sleeps.
-     - Returns None on unrecoverable / rate-limited errors so callers skip gracefully.
-    """
-    global RATE_LIMIT_BACKOFF
-    attempt = 0
-    while attempt < retries:
-        try:
-            return fn(*args, **kwargs)
-        except BinanceAPIException as e:
-            err = str(e)
-
-            # explicit "IP banned until <ms>" pattern (some Binance wrappers include this)
-            m = re.search(r'IP banned until (\d+)', err)
-            if m:
-                try:
-                    until_ms = int(m.group(1))
-                    until_ts = until_ms / 1000.0
-                    wait = max(0, int(until_ts - time.time()))
-                    RATE_LIMIT_BACKOFF = min(wait if wait > 0 else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
-                except Exception:
-                    RATE_LIMIT_BACKOFF = RATE_LIMIT_BACKOFF_MAX
-                notify(f"❗ Binance IP ban detected; backing off for ~{RATE_LIMIT_BACKOFF}s (until {time.ctime(time.time()+RATE_LIMIT_BACKOFF)})")
-                time.sleep(RATE_LIMIT_BACKOFF)
-                return None
-
-            # explicit rate-limit / request weight error
-            if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err or 'request weight' in err:
-                RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
-                notify(f"⚠️ Rate limit detected in safe_api_call: backing off {RATE_LIMIT_BACKOFF}s (err={err})")
-                # sleep a bit to allow Binance to recover; return None so caller skips this symbol/task
-                time.sleep(RATE_LIMIT_BACKOFF)
-                return None
-
-            # other BinanceAPIException: retry a few times with increasing backoff
-            attempt += 1
-            notify(f"⚠️ BinanceAPIException in safe_api_call (attempt {attempt}/{retries}): {err}")
-            time.sleep(backoff * attempt)
-            continue
-        except Exception as e:
-            attempt += 1
-            notify(f"⚠️ Exception in safe_api_call (attempt {attempt}/{retries}): {e}")
-            time.sleep(backoff * attempt)
-            continue
-    return None
+OPEN_ORDERS_TTL = 15
 
 def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
-    """
-    Cached symbol info. On failure returns None and notifies.
-    """
     now = time.time()
     ent = SYMBOL_INFO_CACHE.get(symbol)
     if ent and now - ent[1] < ttl:
         return ent[0]
     try:
-        info = safe_api_call(client.get_symbol_info, symbol)
-        if info:
-            SYMBOL_INFO_CACHE[symbol] = (info, now)
+        info = client.get_symbol_info(symbol)
+        SYMBOL_INFO_CACHE[symbol] = (info, now)
         return info
     except Exception as e:
         notify(f"⚠️ Failed to fetch symbol info for {symbol}: {e}")
         return None
 
 def get_open_orders_cached(symbol=None):
-    """
-    Return cached open orders when possible. Respect RATE_LIMIT_BACKOFF to avoid expensive calls during cooldown.
-    """
-    global RATE_LIMIT_BACKOFF
     now = time.time()
-
-    # If we're in a global backoff window, and cache is available, return cached immediately
-    if RATE_LIMIT_BACKOFF and OPEN_ORDERS_CACHE['data'] is not None and now - OPEN_ORDERS_CACHE['ts'] < RATE_LIMIT_BACKOFF:
-        data = OPEN_ORDERS_CACHE['data']
-        if symbol:
-            return [o for o in data if o.get('symbol') == symbol]
-        return data
-
-    # Respect normal TTL cache
     if OPEN_ORDERS_CACHE['data'] is not None and now - OPEN_ORDERS_CACHE['ts'] < OPEN_ORDERS_TTL:
         data = OPEN_ORDERS_CACHE['data']
         if symbol:
             return [o for o in data if o.get('symbol') == symbol]
         return data
-
-    # Otherwise attempt remote fetch through safe_api_call
     try:
         if symbol:
-            data = safe_api_call(client.get_open_orders, symbol=symbol)
+            data = client.get_open_orders(symbol=symbol)
         else:
-            data = safe_api_call(client.get_open_orders)
-        if data is None:
-            # safe_api_call signalled a rate limit / failure -> return cached if available
-            return OPEN_ORDERS_CACHE['data'] or []
+            data = client.get_open_orders()
         OPEN_ORDERS_CACHE['data'] = data
         OPEN_ORDERS_CACHE['ts'] = now
         return data
@@ -370,61 +260,38 @@ def get_open_orders_cached(symbol=None):
         return OPEN_ORDERS_CACHE['data'] or []
 
 def get_tickers_cached():
-    """
-    Cache the full ticker list and avoid refreshing while RATE_LIMIT_BACKOFF is active.
-    """
     global TICKER_CACHE, LAST_FETCH, RATE_LIMIT_BACKOFF
     now = time.time()
-
-    # if we're currently backing off, avoid refreshing; return cache if present
     if RATE_LIMIT_BACKOFF and now - LAST_FETCH < RATE_LIMIT_BACKOFF:
-        # short log for visibility
-        notify(f"⏸ Skipping ticker refresh due to RATE_LIMIT_BACKOFF ({RATE_LIMIT_BACKOFF}s).")
         return TICKER_CACHE or []
-
-    # refresh only when stale or empty
     if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
-        res = safe_api_call(client.get_ticker)
-        if res is None:
-            # safe_api_call returned None either due to rate-limit or repeated failures
+        try:
+            TICKER_CACHE = client.get_ticker()
+            LAST_FETCH = now
+            RATE_LIMIT_BACKOFF = 0
+        except Exception as e:
+            err = str(e)
+            if '-1003' in err or 'Too much request weight' in err:
+                RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
+                                         RATE_LIMIT_BACKOFF_MAX)
+                notify(f"⚠️ Rate limit detected in get_tickers_cached, backing off for {RATE_LIMIT_BACKOFF}s.")
+                time.sleep(RATE_LIMIT_BACKOFF)
+            else:
+                notify(f"⚠️ Failed to refresh tickers: {e}")
             return TICKER_CACHE or []
-        TICKER_CACHE = res
-        LAST_FETCH = now
-        # reset backoff on successful refresh
-        RATE_LIMIT_BACKOFF = 0
     return TICKER_CACHE
 
 def get_price_cached(symbol):
-    """
-    Try to use cached tickers first; if not available, attempt safe single-symbol query.
-    Respects RATE_LIMIT_BACKOFF to avoid extra calls when in cooldown.
-    """
     global TICKER_CACHE, LAST_FETCH, RATE_LIMIT_BACKOFF
     now = time.time()
-
-    # If in backoff and cache is recent-ish, use cache
-    if RATE_LIMIT_BACKOFF and TICKER_CACHE is not None and now - LAST_FETCH < RATE_LIMIT_BACKOFF:
-        for t in TICKER_CACHE:
-            if t.get('symbol') == symbol:
-                try:
-                    return float(t.get('lastPrice') or t.get('price') or 0.0)
-                except Exception:
-                    return None
-        return None
-
-    # Use cached ticker if still fresh
-    if TICKER_CACHE is not None and now - LAST_FETCH <= CACHE_TTL:
-        for t in TICKER_CACHE:
-            if t.get('symbol') == symbol:
-                try:
-                    return float(t.get('lastPrice') or t.get('price') or 0.0)
-                except Exception:
-                    return None
-
-    # Otherwise try to refresh the full ticker list via safe_api_call
-    res = safe_api_call(client.get_ticker)
-    if res is None:
-        # safe_api_call signalled rate-limit or failure; fall back to cached data if any
+    try:
+        if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
+            try:
+                TICKER_CACHE = client.get_ticker()
+                LAST_FETCH = now
+                RATE_LIMIT_BACKOFF = 0
+            except Exception as e:
+                notify(f"⚠️ Failed to refresh tickers in get_price_cached: {e}")
         if TICKER_CACHE:
             for t in TICKER_CACHE:
                 if t.get('symbol') == symbol:
@@ -432,29 +299,15 @@ def get_price_cached(symbol):
                         return float(t.get('lastPrice') or t.get('price') or 0.0)
                     except Exception:
                         return None
+    except Exception as e:
+        notify(f"⚠️ get_price_cached general error: {e}")
         return None
-
-    TICKER_CACHE = res
-    LAST_FETCH = now
-    RATE_LIMIT_BACKOFF = 0
-
-    for t in TICKER_CACHE:
-        if t.get('symbol') == symbol:
-            try:
-                return float(t.get('lastPrice') or t.get('price') or 0.0)
-            except Exception:
-                return None
-
-    # last resort: single-symbol safe call (use safe_api_call)
-    res2 = safe_api_call(client.get_symbol_ticker, symbol=symbol)
-    if res2:
-        try:
-            return float(res2.get('price') or res2.get('lastPrice') or 0.0)
-        except Exception:
-            return None
-    # final fallback: return None
-    return None
-    
+    try:
+        res = client.get_symbol_ticker(symbol=symbol)
+        return float(res.get('price') or res.get('lastPrice') or 0.0)
+    except Exception as e:
+        notify(f"⚠️ get_price_cached fallback failed for {symbol}: {e}")
+        return None
 
 def cleanup_temp_skip():
     now = time.time()
@@ -469,302 +322,223 @@ def cleanup_recent_buys():
         if now >= info['ts'] + cd:
             del RECENT_BUYS[s]
 
-def orderbook_bullish(symbol, depth=2, min_imbalance=None, max_spread_pct=None, min_bid_quote=None):
+def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
     try:
-        if min_imbalance is None:
-            min_imbalance = globals().get('MIN_OB_IMBALANCE', 1.05)
-        if max_spread_pct is None:
-            max_spread_pct = globals().get('MAX_OB_SPREAD_PCT', 1.2)
-        if min_bid_quote is None:
-            min_bid_quote = globals().get('MIN_OB_LIQUIDITY', 2000.0)
-
-        ob = safe_api_call(client.get_order_book, symbol=symbol, limit=depth)
-        if not ob:
-            return False
+        ob = client.get_order_book(symbol=symbol, limit=depth)
         bids = ob.get('bids') or []
         asks = ob.get('asks') or []
         if not bids or not asks:
             return False
-
         top_bid_p, top_bid_q = float(bids[0][0]), float(bids[0][1])
         top_ask_p, top_ask_q = float(asks[0][0]), float(asks[0][1])
-
-        # spread in percent
         spread_pct = (top_ask_p - top_bid_p) / (top_bid_p + 1e-12) * 100.0
-
         bid_sum = sum(float(b[1]) for b in bids[:depth]) + 1e-12
         ask_sum = sum(float(a[1]) for a in asks[:depth]) + 1e-12
         imbalance = bid_sum / ask_sum
-
-        # compute approximate bid-side quote liquidity (price * qty)
-        bid_quote_liq = sum(float(b[0]) * float(b[1]) for b in bids[:depth]) if bids else 0.0
-        
-        return (imbalance >= float(min_imbalance)) and (spread_pct <= float(max_spread_pct)) and (bid_quote_liq >= float(min_bid_quote))
+        return (imbalance >= min_imbalance) and (spread_pct <= max_spread_pct)
     except Exception:
         return False
 
+# -------------------------
+# PICKER (tweaked)
+# -------------------------
 
 def pick_coin():
-    
     global RATE_LIMIT_BACKOFF
-
-    def pct_change(open_p, close_p):
-        if open_p == 0:
-            return 0.0
-        return (close_p - open_p) / (open_p + 1e-12) * 100.0
-
-    def ema_local(values, period):
-        if not values or period <= 0:
-            return None
-        alpha = 2.0 / (period + 1.0)
-        e = float(values[0])
-        for v in values[1:]:
-            e = alpha * float(v) + (1 - alpha) * e
-        return e
-
-    def compute_rsi_local(closes, period=RSI_PERIOD):
-        if not closes or len(closes) < period + 1:
-            return None
-        gains, losses = [], []
-        for i in range(1, len(closes)):
-            diff = closes[i] - closes[i-1]
-            gains.append(max(0.0, diff))
-            losses.append(max(0.0, -diff))
-        avg_gain = sum(gains[:period]) / period
-        avg_loss = sum(losses[:period]) / period if sum(losses[:period]) != 0 else 1e-9
-        for i in range(period, len(gains)):
-            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-
-    # config fallbacks (use globals if present)
-    TOP_POOL = globals().get('TOP_EVAL_RANDOM_POOL', globals().get('TOP_BY_24H_VOLUME', 80))
-    FINAL_CHOICES = globals().get('FINAL_CHOICES', 3)
-    MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.4)
-    MIN_VOL_RATIO_1M = globals().get('MIN_VOL_RATIO_1M', 1.2)
-    MIN_EMA_LIFT = globals().get('MIN_EMA_LIFT', 0.0010)
-    MIN_OB_LIQ = globals().get('MIN_OB_LIQUIDITY', 2000.0)
-    FAST_OB_DEPTH = 2
-    FAST_OB_SPREAD_ALLOW = max(1.5, globals().get('MAX_OB_SPREAD_PCT', 1.2) * 1.5)
-
-    # small polite pause if global backoff is active (helps avoid immediate repeated heavy scans)
-    if RATE_LIMIT_BACKOFF:
-        notify(f"⏸ Global RATE_LIMIT_BACKOFF active ({RATE_LIMIT_BACKOFF}s) — delaying pick_coin briefly.")
-        time.sleep(min(RATE_LIMIT_BACKOFF, 3))
-
-    # cheap prefilter using cached tickers (get_tickers_cached respects RATE_LIMIT_BACKOFF)
-    tickers = get_tickers_cached() or []
+    cleanup_temp_skip()
+    cleanup_recent_buys()
     now = time.time()
-    pre = []
 
+    TOP_CANDIDATES = 120
+    MIN_VOL_RATIO = 1.4
+    KLINES_LIMIT = 8
+
+    tickers = get_tickers_cached() or []
+    prefiltered = []
+
+    MIN_QVOL = max(MIN_VOLUME, 300_000)
     for t in tickers:
         sym = t.get('symbol')
         if not sym or not sym.endswith(QUOTE):
-            continue
-        try:
-            last = float(t.get('lastPrice') or 0.0)
-            qvol = float(t.get('quoteVolume') or 0.0)
-            ch = float(t.get('priceChangePercent') or 0.0)
-        except Exception:
-            continue
-
-        # quick guards
-        if not (PRICE_MIN <= last <= PRICE_MAX):
-            continue
-        if qvol < MIN_VOLUME:
-            continue
-        # avoid enormous pumps/dumps
-        if ch is not None and (ch < -10.0 or ch > globals().get('MAX_24H_CHANGE_ABS', 12.0)):
             continue
 
         skip_until = TEMP_SKIP.get(sym)
         if skip_until and now < skip_until:
             continue
 
-        last_buy = RECENT_BUYS.get(sym)
-        if last_buy and now < last_buy['ts'] + REBUY_COOLDOWN:
-            continue
-
-        pre.append((sym, last, qvol, ch))
-
-    if not pre:
-        return None
-
-    # sort by quote volume and evaluate top slice (limit checks to TOP_POOL)
-    pre.sort(key=lambda x: x[2], reverse=True)
-    candidates = pre[:TOP_POOL]
-
-    scored = []
-    for sym, last_price, qvol, change_24h in candidates:
+        last = RECENT_BUYS.get(sym)
         try:
-            # small pause to space heavy calls
-            time.sleep(REQUEST_SLEEP)
-
-            # FAST cheap top-of-book pre-check: if this fails, skip early (cheap)
-            ob_fast = safe_api_call(client.get_order_book, symbol=sym, limit=FAST_OB_DEPTH)
-            if ob_fast is None:
-                # safe_api_call returned None => likely rate-limited or unrecoverable for now -> skip symbol
+            price = float(t.get('lastPrice') or 0.0)
+            qvol = float(t.get('quoteVolume') or 0.0)
+            change_pct = float(t.get('priceChangePercent') or 0.0)
+        except Exception:
+            continue
+        if qvol < 5_000_000:   # skip coins zenye volume ndogo
+            continue
+        if last:
+            if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
                 continue
-            bids_f = ob_fast.get('bids') or []
-            asks_f = ob_fast.get('asks') or []
-            if not bids_f or not asks_f:
-                continue
-            top_bid = float(bids_f[0][0]); top_ask = float(asks_f[0][0])
-            spread_fast = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
-            if spread_fast > FAST_OB_SPREAD_ALLOW:
-                # too wide a spread -> likely poor fill / high slippage, skip
+            last_price = last.get('price')
+            if last_price and price > last_price * (1 + REBUY_MAX_RISE_PCT / 100.0):
                 continue
 
-            # fetch 5m klines (heavy)
-            kl5 = safe_api_call(client.get_klines, symbol=sym, interval='5m', limit=KLINES_5M_LIMIT)
-            if kl5 is None or len(kl5) < 3:
-                continue
-
-            time.sleep(REQUEST_SLEEP)
-
-            # fetch 1m klines
-            kl1 = safe_api_call(client.get_klines, symbol=sym, interval='1m', limit=KLINES_1M_LIMIT)
-            if kl1 is None or len(kl1) < 2:
-                continue
-
-            # parse closes and volumes
-            closes_5m = [float(k[4]) for k in kl5]
-            vols_5m = []
-            for k in kl5:
-                if len(k) > 7 and k[7] is not None:
-                    vols_5m.append(float(k[7]))
-                else:
-                    vols_5m.append(float(k[5]) * float(k[4]))
-
-            closes_1m = [float(k[4]) for k in kl1]
-            vols_1m = []
-            for k in kl1:
-                if len(k) > 7 and k[7] is not None:
-                    vols_1m.append(float(k[7]))
-                else:
-                    vols_1m.append(float(k[5]) * float(k[4]))
-
-            open_5m = float(kl5[0][1])
-            pct_5m = pct_change(open_5m, closes_5m[-1])
-            open_1m = float(kl1[0][1])
-            pct_1m = pct_change(open_1m, closes_1m[-1])
-
-            avg_prev_5m = (sum(vols_5m[:-1]) / max(len(vols_5m[:-1]), 1)) if len(vols_5m) > 1 else vols_5m[-1]
-            vol_ratio_5m = vols_5m[-1] / (avg_prev_5m + 1e-12)
-
-            avg_prev_1m = (sum(vols_1m[:-1]) / max(len(vols_1m[:-1]), 1)) if len(vols_1m) > 1 else vols_1m[-1]
-            vol_ratio_1m = vols_1m[-1] / (avg_prev_1m + 1e-12)
-
-            # require at least two consecutive up closes on 5m (momentum confirmation)
-            last3 = closes_5m[-3:] if len(closes_5m) >= 3 else closes_5m
-            ups = 0
-            if len(last3) >= 2 and last3[1] > last3[0]:
-                ups += 1
-            if len(last3) >= 3 and last3[2] > last3[1]:
-                ups += 1
-            if ups < 2:
-                continue
-
-            # EMA checks on 5m closes
-            short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
-            long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
-            ema_uplift = 0.0
-            ema_ok = False
-            if short_ema is not None and long_ema is not None:
-                ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-                ema_ok = (short_ema > long_ema) and (ema_uplift >= MIN_EMA_LIFT)
-            if not ema_ok:
-                continue
-
-            # RSI sanity check
-            rsi_val = compute_rsi_local(closes_5m[-(RSI_PERIOD + 1):], RSI_PERIOD) if len(closes_5m) >= RSI_PERIOD + 1 else None
-            if rsi_val is not None and rsi_val > 68:
-                continue
-
-            # short sleep then full orderbook check (heavier)
-            time.sleep(REQUEST_SLEEP)
-            ob = safe_api_call(client.get_order_book, symbol=sym, limit=OB_DEPTH)
-            if ob is None:
-                # safe_api_call signalled rate-limit/unavailable -> skip symbol
-                continue
-
-            ob_ok = False
-            ob_imbalance = 1.0
-            ob_spread_pct = 100.0
-            bid_quote_liq = 0.0
-            bids = ob.get('bids') or []
-            asks = ob.get('asks') or []
-            if bids and asks:
-                top_bid = float(bids[0][0]); top_ask = float(asks[0][0])
-                bid_sum = sum(float(b[1]) for b in bids[:OB_DEPTH]) + 1e-12
-                ask_sum = sum(float(a[1]) for a in asks[:OB_DEPTH]) + 1e-12
-                ob_imbalance = bid_sum / ask_sum
-                ob_spread_pct = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
-                bid_quote_liq = sum(float(b[0]) * float(b[1]) for b in bids[:OB_DEPTH])
-                ob_ok = (ob_imbalance >= globals().get('MIN_OB_IMBALANCE', 1.05)) and (ob_spread_pct <= globals().get('MAX_OB_SPREAD_PCT', 1.2)) and (bid_quote_liq >= MIN_OB_LIQ)
-
-            # gating checks
-            vol_ok = (vol_ratio_5m >= MIN_VOL_RATIO) and (vol_ratio_1m >= MIN_VOL_RATIO_1M)
-            if not vol_ok:
-                continue
-            if change_24h is not None and change_24h > globals().get('MAX_24H_RISE_PCT', 10.0):
-                continue
-            if not ob_ok:
-                continue
-
-            # scoring (bias toward clear 5m momentum + vol spike + EMA uplift)
-            score = 0.0
-            score += max(0.0, pct_5m) * 6.0
-            score += max(0.0, pct_1m) * 2.0
-            score += max(0.0, (vol_ratio_5m - 1.0)) * 4.0 * 100.0
-            score += ema_uplift * 8.0 * 100.0
-            if rsi_val is not None:
-                score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.2
-            score += max(0.0, change_24h) * 0.6
-            if ob_ok:
-                score += 25.0
-            if last_price <= PRICE_MAX:
-                score += 4.0
-
-            scored.append({
-                "symbol": sym,
-                "last_price": last_price,
-                "24h_change": change_24h,
-                "24h_vol": qvol,
-                "pct_5m": pct_5m,
-                "pct_1m": pct_1m,
-                "vol_ratio_5m": vol_ratio_5m,
-                "vol_ratio_1m": vol_ratio_1m,
-                "ema_ok": ema_ok,
-                "ema_uplift": ema_uplift,
-                "rsi": rsi_val,
-                "ob_ok": ob_ok,
-                "ob_imbalance": ob_imbalance,
-                "ob_spread_pct": ob_spread_pct,
-                "ob_bid_liq": bid_quote_liq,
-                "score": score
-            })
-        except Exception as e:
-            notify(f"⚠️ pick_coin evaluate error {sym}: {e}")
+        # price boundary
+        if not (PRICE_MIN <= price <= PRICE_MAX):
             continue
 
-    if not scored:
+        # absolute 24h guard: avoid extreme pumps/dumps
+        if abs(change_pct) > MAX_24H_CHANGE_ABS:
+            continue
+        if change_pct > MAX_24H_RISE_PCT:
+            continue
+
+        # volume baseline and directional movement requirement
+        if qvol < MIN_QVOL:
+            continue
+        if abs(change_pct) < MOVEMENT_MIN_PCT:
+            continue
+
+        prefiltered.append((sym, price, qvol, change_pct))
+
+    if not prefiltered:
         return None
 
-    # sort & choose with slight randomness among top choices
-    scored.sort(key=lambda x: x['score'], reverse=True)
-    pool = scored[:TOP_POOL] if len(scored) >= TOP_POOL else scored
-    # limit top choices and choose randomly for diversity
-    top_n = min(FINAL_CHOICES, len(pool))
-    if top_n <= 0:
-        best = scored[0]
-    else:
-        best = random.choice(pool[:top_n])
+    prefiltered.sort(key=lambda x: x[2], reverse=True)
+    prefiltered = prefiltered[:TOP_CANDIDATES]
 
-    return (best['symbol'], best['last_price'], best['24h_vol'], best['24h_change'])
-    
+    candidates = []
+    for sym, price, qvol, change_pct in prefiltered:
+        try:
+            try:
+                klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
+            except Exception as e:
+                err = str(e)
+                if '-1003' in err or 'Too much request weight' in err:
+                    notify(f"⚠️ Rate limit while fetching klines for {sym}: {err}. Backing off.")
+                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
+                                             RATE_LIMIT_BACKOFF_MAX)
+                    time.sleep(RATE_LIMIT_BACKOFF)
+                    break
+                continue
+
+            if not klines or len(klines) < 6:
+                continue
+
+            vols = []
+            closes = []
+            for k in klines:
+                try:
+                    if len(k) > 7 and k[7] is not None:
+                        vols.append(float(k[7]))
+                    else:
+                        vols.append(float(k[5]) * float(k[4]))
+                except Exception:
+                    vols.append(0.0)
+                try:
+                    closes.append(float(k[4]))
+                except Exception:
+                    closes.append(0.0)
+
+            recent_vol = vols[-1] if vols else 0.0
+            if recent_vol <= 0:
+                continue
+
+            prev_slice = vols[-(KLINES_LIMIT-1):-1] if len(vols) >= 2 else vols[:-1]
+            avg_vol = (sum(prev_slice) / max(len(prev_slice), 1)) if prev_slice else recent_vol
+            vol_ratio = recent_vol / (avg_vol + 1e-9)
+
+            recent_pct = 0.0
+            if len(closes) >= 4 and closes[-4] > 0:
+                recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
+
+            # enforce target recent band (1%..2%)
+            if recent_pct < RECENT_PCT_MIN or recent_pct > RECENT_PCT_MAX:
+                continue
+
+            # volume spike requirement
+            if vol_ratio < MIN_VOL_RATIO:
+                continue
+
+            # require at least one consecutive up in last 3 closes
+            last3 = closes[-3:]
+            ups = 0
+            if last3[1] > last3[0]:
+                ups += 1
+            if last3[2] > last3[1]:
+                ups += 1
+            if ups < 1:
+                continue
+
+            # EMA confirmation
+            def ema_local(values, period):
+                if not values or period <= 0:
+                    return None
+                alpha = 2.0 / (period + 1.0)
+                e = float(values[0])
+                for v in values[1:]:
+                    e = alpha * float(v) + (1 - alpha) * e
+                return e
+
+            short_period = 3
+            long_period = 10
+            if len(closes) >= long_period:
+                short_ema = ema_local(closes[-short_period:], short_period)
+                long_ema = ema_local(closes[-long_period:], long_period)
+            elif len(closes) >= short_period:
+                short_ema = ema_local(closes[-short_period:], short_period)
+                long_ema = ema_local(closes, max(len(closes), 1))
+            else:
+                short_ema = None
+                long_ema = None
+
+            if short_ema is None or long_ema is None:
+                continue
+            if not (short_ema > long_ema * 1.0005):
+                continue
+
+            # RSI sanity
+            rsi_ok = True
+            if len(closes) >= 15:
+                gains = []
+                losses = []
+                for i in range(1, 15):
+                    diff = closes[-15 + i] - closes[-16 + i]
+                    if diff > 0:
+                        gains.append(diff)
+                    else:
+                        losses.append(abs(diff))
+                avg_gain = sum(gains) / 14.0 if gains else 0.0
+                avg_loss = sum(losses) / 14.0 if losses else 1e-9
+                rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
+                rsi = 100 - (100 / (1 + rs))
+                if rsi > 66:
+                    rsi_ok = False
+            if not rsi_ok:
+                continue
+
+            # orderbook bullishness quick check
+            try:
+                if not orderbook_bullish(sym, depth=5, min_imbalance=1.1, max_spread_pct=1.0):
+                    continue
+            except Exception:
+                continue
+
+            ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
+            score = (recent_pct * 12.0) + (math.log1p(qvol) * 0.4) + (vol_ratio * 6.0) + (ema_uplift * 80.0)
+
+            candidates.append((sym, price, qvol, change_pct, vol_ratio, recent_pct, score))
+
+        except Exception as e:
+            notify(f"⚠️ pick_coin processing error for {sym}: {e}")
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[-1], reverse=True)
+    best = candidates[0]
+    return (best[0], best[1], best[2], best[3])
+
 # -------------------------
 # MARKET BUY helpers
 # -------------------------
@@ -1513,12 +1287,6 @@ def trade_cycle():
 
     while True:
         try:
-            # emergency guard: if we're in a long RATE_LIMIT_BACKOFF, pause the loop
-            if RATE_LIMIT_BACKOFF and RATE_LIMIT_BACKOFF >= 60:
-                notify(f"⏸ Emergency backoff active for {RATE_LIMIT_BACKOFF}s - pausing trade loop.")
-                time.sleep(RATE_LIMIT_BACKOFF)
-                continue
-
             cleanup_recent_buys()
 
             open_orders_global = get_open_orders_cached()
@@ -1569,8 +1337,7 @@ def trade_cycle():
                 continue
 
             try:
-                # cheaper option: skip orderbook check at buy time to reduce weight (picker still checks OB)
-                buy_res = place_safe_market_buy(symbol, usd_to_buy, require_orderbook=False)
+                buy_res = place_safe_market_buy(symbol, usd_to_buy, require_orderbook=True)
             except Exception as e:
                 err = str(e)
                 notify(f"❌ Exception during market buy attempt for {symbol}: {err}")
@@ -1685,7 +1452,7 @@ def trade_cycle():
             time.sleep(CYCLE_DELAY)
 
         time.sleep(30)
-        
+
 # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
