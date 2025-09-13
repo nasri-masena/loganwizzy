@@ -25,7 +25,7 @@ QUOTE = "USDT"
 # PICKER / MARKET TUNING
 # -------------------------
 PRICE_MIN = 0.9
-PRICE_MAX = 3.0
+PRICE_MAX = 4.0
 MIN_VOLUME = 4_000_000          # <-- balanced: not too small, not too strict
 
 # recent move band — require a clear but not tiny move
@@ -44,7 +44,7 @@ MOVEMENT_MIN_PCT = 1.2
 KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
 KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "3"))
 
-REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.15"))   # <-- slightly relaxed to reduce rate-limit risk
+REQUEST_SLEEP = float(os.getenv("REQUEST_SLEEP", "0.20"))   # <-- slightly relaxed to reduce rate-limit risk
 
 # -------------------------
 # INDICATORS / ORDERBOOK
@@ -71,7 +71,7 @@ MIN_EMA_LIFT = float(os.getenv("MIN_EMA_LIFT", "0.0010"))
 # -------------------------
 # POOL / FINAL CHOICE
 # -------------------------
-TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "60"))       # <-- evaluate top 60 by 24h quote vol
+TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "80"))       # <-- evaluate top 60 by 24h quote vol
 TOP_EVAL_RANDOM_POOL = int(os.getenv("TOP_EVAL_RANDOM_POOL", "60"))
 FINAL_CHOICES = int(os.getenv("FINAL_CHOICES", "3"))              # choose randomly among top 3 to add variety
 
@@ -107,7 +107,7 @@ ROLL_POST_CANCEL_JITTER = (0.3, 0.8)
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 120
+CACHE_TTL = 300
 
 # -------------------------
 # INIT / GLOBALS
