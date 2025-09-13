@@ -71,8 +71,8 @@ MIN_EMA_LIFT = float(os.getenv("MIN_EMA_LIFT", "0.0010"))
 # -------------------------
 # POOL / FINAL CHOICE
 # -------------------------
-TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "80"))       # <-- evaluate top 60 by 24h quote vol
-TOP_EVAL_RANDOM_POOL = int(os.getenv("TOP_EVAL_RANDOM_POOL", "60"))
+TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "60"))       # <-- evaluate top 60 by 24h quote vol
+TOP_EVAL_RANDOM_POOL = int(os.getenv("TOP_EVAL_RANDOM_POOL", "30"))
 FINAL_CHOICES = int(os.getenv("FINAL_CHOICES", "3"))              # choose randomly among top 3 to add variety
 
 # -------------------------
@@ -264,7 +264,7 @@ LAST_FETCH = 0
 SYMBOL_INFO_CACHE = {}
 SYMBOL_INFO_TTL = 120
 OPEN_ORDERS_CACHE = {'ts': 0, 'data': None}
-OPEN_ORDERS_TTL = 60
+OPEN_ORDERS_TTL = 120
 
 def safe_api_call(fn, *args, retries=3, backoff=0.6, **kwargs):
     """
