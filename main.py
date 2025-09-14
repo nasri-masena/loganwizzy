@@ -71,7 +71,7 @@ KLINES_5M_LIMIT = 3
 KLINES_1M_LIMIT = 2
 
 # buy behavior: set to False for faster buys, True to require orderbook check before buy
-REQUIRE_ORDERBOOK_ON_BUY = False
+REQUIRE_ORDERBOOK_ON_BUY = True
 
 # balances / limits
 BUY_LOCK_SECONDS = 10          # allow quicker subsequent buys
