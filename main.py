@@ -21,7 +21,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
 # price / liquidity filters
-PRICE_MIN = 9.0
+PRICE_MIN = 0.9
 PRICE_MAX = 3.0
 MIN_VOLUME = 3_000_000          # daily quote volume baseline
 
