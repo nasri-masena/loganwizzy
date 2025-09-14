@@ -46,7 +46,6 @@ TRIGGER_PROXIMITY = 0.06
 STEP_INCREMENT_PCT = 0.02
 BASE_TP_PCT = 2.5
 BASE_SL_PCT = 2.0
-MAX_HOLD_SECONDS = 6 * 3600
 
 # micro-take profit
 MICRO_TP_PCT = 1.0
@@ -1100,18 +1099,17 @@ def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
 # -------------------------
 # MONITOR & ROLL (mostly same but uses improved place_oco_sell)
 # -------------------------
+
 def monitor_and_roll(symbol, qty, entry_price, f):
     orig_qty = qty
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
     curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
 
-    # place initial OCO protection
     oco = place_oco_sell(symbol, qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
     if oco is None:
         notify(f"❌ Initial OCO failed for {symbol}, aborting monitor.")
         return False, entry_price, 0.0
 
-    start_ts = time.time()
     last_tp = None
     last_roll_ts = 0.0
     roll_count = 0
@@ -1128,80 +1126,43 @@ def monitor_and_roll(symbol, qty, entry_price, f):
 
     while True:
         try:
-            # safety: force-exit if we've held the position too long (sniper)
-            elapsed = time.time() - start_ts
-            if MAX_HOLD_SECONDS and elapsed > MAX_HOLD_SECONDS:
-                notify(f"⏳ MAX_HOLD_SECONDS exceeded ({elapsed/3600:.2f}h) for {symbol}. Attempting emergency close.")
-                try:
-                    cancel_all_open_orders(symbol)
-                except Exception:
-                    pass
-
-                free_qty = get_free_asset(symbol[:-len(QUOTE)])
-                if free_qty and free_qty > 0:
-                    try:
-                        # ensure filters object available
-                        f_local = f if f else get_filters(get_symbol_info_cached(symbol) or {})
-                        place_market_sell_fallback(symbol, free_qty, f_local)
-                        notify(f"❗ Emergency market sell attempted for {symbol} after hold timeout.")
-                    except Exception as e:
-                        notify(f"❌ Emergency market sell failed for {symbol}: {e}")
-                # blacklist symbol for a while to avoid immediate re-buy
-                TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
-                return False, entry_price, 0.0
-
             time.sleep(SLEEP_BETWEEN_CHECKS)
-
-            # fetch latest price (use cached helper)
+            asset = symbol[:-len(QUOTE)]
             price_now = get_price_cached(symbol)
             if price_now is None:
-                # fallback to single-symbol API, but safe_api_call should handle rate-limits
-                res = safe_api_call(client.get_symbol_ticker, symbol=symbol)
-                if res:
-                    try:
-                        price_now = float(res.get('price') or res.get('lastPrice') or 0.0)
-                    except Exception:
-                        price_now = None
-                else:
-                    notify(f"⚠️ Could not fetch price for {symbol} (monitor). Retrying loop.")
+                try:
+                    price_now = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                except Exception as e:
+                    notify(f"⚠️ Failed to fetch price in monitor (fallback): {e}")
                     continue
 
-            # compute available qty and current open orders
-            asset = symbol[:-len(QUOTE)]
             free_qty = get_free_asset(asset)
             available_for_sell = min(round_step(free_qty, f.get('stepSize', 0.0)), orig_qty)
             open_orders = get_open_orders_cached(symbol)
 
-            # if nothing left and no open orders => position closed
-            if available_for_sell < round_step(orig_qty * 0.05, f.get('stepSize', 0.0)) and (not open_orders or len(open_orders) == 0):
+            if available_for_sell < round_step(orig_qty * 0.05, f.get('stepSize', 0.0)) and len(open_orders) == 0:
                 exit_price = price_now
                 profit_usd = (exit_price - entry_price) * orig_qty
                 notify(f"✅ Position closed for {symbol}: exit={exit_price:.8f}, profit≈${profit_usd:.6f}")
                 return True, exit_price, profit_usd
 
-            # triggers for rolling
             price_delta = price_now - entry_price
             rise_trigger_pct = price_now >= entry_price * (1 + ROLL_ON_RISE_PCT / 100.0)
-            rise_trigger_abs = price_delta >= max(ROLL_TRIGGER_DELTA_ABS, entry_price * (ROLL_TRIGGER_PCT / 100.0))
+            rise_trigger_abs = price_delta >= max(ROLL_TRIGGER_DELTA_ABS, entry_price * (ROLL_TRIGGER_PCT/100.0))
             near_trigger = (price_now >= curr_tp * (1 - TRIGGER_PROXIMITY)) and (price_now < curr_tp * 1.05)
-
             tick = f.get('tickSize', 0.0) or 0.0
             minimal_move = max(entry_price * 0.004, ROLL_TRIGGER_DELTA_ABS * 0.4, tick or 0.0)
             moved_enough = price_delta >= minimal_move
             now_ts = time.time()
             can_roll = (now_ts - last_roll_ts) >= ROLL_COOLDOWN_SECONDS
 
-            # Decide to roll if near TP (and moved enough) OR if price made a clear rise
             if ((near_trigger and moved_enough) or rise_trigger_pct or rise_trigger_abs) and available_for_sell >= f.get('minQty', 0.0) and can_roll:
                 if roll_count >= MAX_ROLLS_PER_POSITION:
-                    notify(f"⚠️ Reached max rolls ({MAX_ROLLS_PER_POSITION}) for {symbol}; will not roll further.")
+                    notify(f"⚠️ Reached max rolls ({MAX_ROLLS_PER_POSITION}) for {symbol}, will not roll further.")
                     last_roll_ts = now_ts
                     continue
 
-                notify(f"🔎 Roll triggered for {symbol}: price={price_now:.8f}, entry={entry_price:.8f}, curr_tp={curr_tp:.8f} "
-                       f"(near={near_trigger},pct_trigger={rise_trigger_pct},abs_trigger={rise_trigger_abs})")
-
-                # propose new TP/SL steps
+                notify(f"🔎 Roll triggered for {symbol}: price={price_now:.8f}, entry={entry_price:.8f}, curr_tp={curr_tp:.8f}, delta={price_delta:.6f} (near={near_trigger},pct={rise_trigger_pct},abs={rise_trigger_abs})")
                 candidate_tp = curr_tp + ROLL_TP_STEP_ABS
                 candidate_sl = curr_sl + ROLL_SL_STEP_ABS
                 if candidate_sl > entry_price:
@@ -1210,28 +1171,23 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                 new_tp = clip_tp(candidate_tp, tick)
                 new_sl = clip_sl(candidate_sl, tick)
                 tick_step = tick or 0.0
-
-                # ensure TP/SL separation at least a tick or small absolute step
                 if new_tp <= new_sl + tick_step:
                     if tick_step > 0:
                         new_tp = new_sl + tick_step * 2
                     else:
                         new_tp = new_sl + max(1e-8, ROLL_TP_STEP_ABS)
-
                 if new_tp <= curr_tp:
                     if tick_step > 0:
                         new_tp = math.ceil((curr_tp + tick_step) / tick_step) * tick_step
                     else:
                         new_tp = curr_tp + max(1e-8, ROLL_TP_STEP_ABS)
 
-                # compute sell qty for roll (use available_for_sell)
                 sell_qty = round_step(available_for_sell, f.get('stepSize', 0.0))
                 if sell_qty <= 0 or sell_qty < f.get('minQty', 0.0):
                     notify(f"⚠️ Roll skipped: sell_qty {sell_qty} too small or < minQty.")
                     last_roll_ts = now_ts
                     continue
 
-                # ensure minNotional satisfied for OCO / TP
                 min_notional = f.get('minNotional')
                 if min_notional:
                     adjust_cnt = 0
@@ -1242,9 +1198,8 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                         else:
                             new_tp = new_tp + max(1e-8, new_tp * 0.001)
                         adjust_cnt += 1
-
                     if sell_qty * new_tp < min_notional - 1e-12:
-                        # try increasing sell_qty if possible
+                        # try increasing sell_qty if free asset available
                         needed_qty = ceil_step(min_notional / new_tp, f.get('stepSize'))
                         if needed_qty <= available_for_sell + 1e-12 and needed_qty > sell_qty:
                             notify(f"ℹ️ Increasing sell_qty to {needed_qty} to meet minNotional for roll.")
@@ -1254,50 +1209,31 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                             last_roll_ts = now_ts
                             continue
 
-                # mark the roll attempt time
                 last_roll_ts = now_ts
-
-                # cancel previous protective orders before placing new OCO
                 cancel_all_open_orders(symbol)
                 time.sleep(random.uniform(*ROLL_POST_CANCEL_JITTER))
 
-                # attempt to place the new OCO with explicit TP/SL
-                oco2 = place_oco_sell(symbol, sell_qty, entry_price, explicit_tp=new_tp, explicit_sl=new_sl)
+                oco2 = place_oco_sell(symbol, sell_qty, entry_price,
+                                      explicit_tp=new_tp, explicit_sl=new_sl)
                 if oco2:
                     roll_count += 1
                     last_tp = curr_tp
                     curr_tp = new_tp
                     curr_sl = new_sl
-                    notify(f"🔁 Rolled OCO success: new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty}")
+                    notify(f"🔁 Rolled OCO (abs-step): new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty}")
                 else:
-                    notify("⚠️ Roll attempt failed; trying fallback to re-place base protection.")
+                    notify("⚠️ Roll attempt failed; previous orders are cancelled. Will try to re-place protective OCO next loop.")
                     time.sleep(0.4)
                     fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
                     if fallback:
                         notify("ℹ️ Fallback OCO re-placed after failed roll.")
                     else:
-                        notify("❌ Fallback OCO also failed; TEMP skipping symbol and cancelling monitoring.")
+                        notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
                         TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
-
-            # small loop continue; monitor continues
         except Exception as e:
-            notify(f"⚠️ Error in monitor_and_roll for {symbol}: {e}")
-            # on unexpected error, attempt safe fallback once
-            try:
-                cancel_all_open_orders(symbol)
-            except Exception:
-                pass
-            try:
-                free_qty = get_free_asset(symbol[:-len(QUOTE)])
-                if free_qty and free_qty > 0:
-                    f_local = f if f else get_filters(get_symbol_info_cached(symbol) or {})
-                    place_market_sell_fallback(symbol, free_qty, f_local)
-                    notify(f"ℹ️ Emergency fallback market sell attempted for {symbol} after error.")
-            except Exception as e2:
-                notify(f"❌ Emergency fallback sell also failed: {e2}")
-            TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+            notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-            
+
 # =========================
 # DAILY METRICS (unchanged)
 # =========================
