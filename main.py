@@ -72,7 +72,6 @@ W_WEIGHT_ORDER = 5
 # -------------------------
 # PICKER CONFIG (used by your pick_coin)
 # -------------------------
-# tuning knobs used by the pick_coin function (your version)
 REQUEST_SLEEP = 0.12
 TOP_EVAL_RANDOM_POOL = 80
 FINAL_CHOICES = 3
@@ -87,10 +86,7 @@ OB_DEPTH = 5
 EMA_SHORT = 3
 EMA_LONG = 10
 RSI_PERIOD = 14
-KLINES_5M_LIMIT = 8
-KLINES_1M_LIMIT = 8
 TOP_POOL = TOP_EVAL_RANDOM_POOL
-FINAL_CHOICES = FINAL_CHOICES
 MIN_OB_IMBALANCE = 1.05
 MAX_OB_SPREAD_PCT = 1.2
 
@@ -113,7 +109,7 @@ REBUY_MAX_RISE_PCT = 5.0
 
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
-RATE_LIMIT_BASE_SLEEP = 30   # lowered to 30s initial
+RATE_LIMIT_BASE_SLEEP = 30
 CACHE_TTL = 300
 
 weight_counter = {'start_ts': time.time(), 'used': 0}
@@ -980,8 +976,8 @@ def pick_coin():
         try:
             time.sleep(REQUEST_SLEEP)
 
-            # fast orderbook
-            ob_fast = safe_api_call('ob_fast_'+sym, client.get_order_book, args=[sym, FAST_OB_DEPTH], weight=W_WEIGHT_ORDERBOOK, allow_fail=True)
+            # fast orderbook (use lambda to ensure keyword args)
+            ob_fast = safe_api_call('ob_fast_'+sym, (lambda sym=sym, lim=FAST_OB_DEPTH: client.get_order_book(symbol=sym, limit=lim)), weight=W_WEIGHT_ORDERBOOK, allow_fail=True)
             if ob_fast is None:
                 continue
             bids_f = ob_fast.get('bids') or []
@@ -993,12 +989,12 @@ def pick_coin():
             if spread_fast > max(1.5, MAX_OB_SPREAD_PCT * 1.5):
                 continue
 
-            kl5 = safe_api_call('kl5_'+sym, client.get_klines, args=[sym, '5m', KLINES_5M_LIMIT], weight=W_WEIGHT_KLINES, allow_fail=True)
+            kl5 = safe_api_call('kl5_'+sym, (lambda sym=sym, intv='5m', lim=KLINES_5M_LIMIT: client.get_klines(symbol=sym, interval=intv, limit=lim)), weight=W_WEIGHT_KLINES, allow_fail=True)
             if kl5 is None or len(kl5) < 3:
                 continue
 
             time.sleep(REQUEST_SLEEP)
-            kl1 = safe_api_call('kl1_'+sym, client.get_klines, args=[sym, '1m', KLINES_1M_LIMIT], weight=W_WEIGHT_KLINES, allow_fail=True)
+            kl1 = safe_api_call('kl1_'+sym, (lambda sym=sym, intv='1m', lim=KLINES_1M_LIMIT: client.get_klines(symbol=sym, interval=intv, limit=lim)), weight=W_WEIGHT_KLINES, allow_fail=True)
             if kl1 is None or len(kl1) < 2:
                 continue
 
@@ -1053,7 +1049,7 @@ def pick_coin():
                 continue
 
             time.sleep(REQUEST_SLEEP)
-            ob = safe_api_call('ob_full_'+sym, client.get_order_book, args=[sym, OB_DEPTH], weight=W_WEIGHT_ORDERBOOK, allow_fail=True)
+            ob = safe_api_call('ob_full_'+sym, (lambda sym=sym, lim=OB_DEPTH: client.get_order_book(symbol=sym, limit=lim)), weight=W_WEIGHT_ORDERBOOK, allow_fail=True)
             if ob is None:
                 continue
 
@@ -1182,7 +1178,9 @@ def monitor_and_roll(symbol, qty, entry_price, f):
             price_now = get_price_cached(symbol)
             if price_now is None:
                 try:
-                    price_now = float(safe_api_call('symbol_ticker_fallback_'+symbol, lambda sym: client.get_symbol_ticker(symbol=sym), args=[symbol], weight=W_WEIGHT_TICKER, allow_fail=True).get('price'))
+                    pf = safe_api_call('symbol_ticker_fallback_'+symbol, (lambda sym=symbol: client.get_symbol_ticker(symbol=sym)), weight=W_WEIGHT_TICKER, allow_fail=True)
+                    if pf:
+                        price_now = float(pf.get('price'))
                 except Exception as e:
                     notify(f"⚠️ Failed to fetch price in monitor (fallback): {e}")
                     continue
@@ -1446,11 +1444,11 @@ def trade_cycle():
             finally:
                 ACTIVE_SYMBOL = None
 
-            total_profit_usd = profit_usd or 0.0
+            total_profit_usdt = profit_usd or 0.0
             if micro_order and micro_sold_qty and micro_tp_price:
                 try:
                     micro_profit = (micro_tp_price - entry_price) * micro_sold_qty
-                    total_profit_usd += micro_profit
+                    total_profit_usdt += micro_profit
                 except Exception:
                     pass
 
@@ -1458,7 +1456,7 @@ def trade_cycle():
             ent = RECENT_BUYS.get(symbol, {})
             ent['ts'] = now2
             ent['price'] = entry_price
-            ent['profit'] = total_profit_usd
+            ent['profit'] = total_profit_usdt
             if ent['profit'] is None:
                 ent['cooldown'] = REBUY_COOLDOWN
             elif ent['profit'] < 0:
@@ -1467,11 +1465,11 @@ def trade_cycle():
                 ent['cooldown'] = REBUY_COOLDOWN
             RECENT_BUYS[symbol] = ent
 
-            date_key, m = _update_metrics_for_profit(total_profit_usd)
+            date_key, m = _update_metrics_for_profit(total_profit_usdt)
             _notify_daily_stats(date_key)
 
-            if closed and total_profit_usd and total_profit_usd > 0:
-                send_profit_to_funding(total_profit_usd)
+            if closed and total_profit_usdt and total_profit_usdt > 0:
+                send_profit_to_funding(total_profit_usdt)
 
             RATE_LIMIT_BACKOFF = 0
 
@@ -1498,11 +1496,15 @@ def trade_cycle():
 def send_profit_to_funding(amount, asset='USDT'):
     try:
         def _transfer():
-            return client.universal_transfer(
-                type='MAIN_FUNDING' if hasattr(client, 'universal_transfer') else 'SPOT_TO_FUNDING',
-                asset=asset,
-                amount=str(round(amount, 6))
-            )
+            # attempt universal_transfer if available; otherwise try legacy param
+            if hasattr(client, 'universal_transfer'):
+                return client.universal_transfer(
+                    type='MAIN_FUNDING',
+                    asset=asset,
+                    amount=str(round(amount, 6))
+                )
+            # fallback placeholder - SDK may differ per version
+            return client.transfer_spot_to_funding(asset=asset, amount=str(round(amount, 6)))
         result = safe_api_call('transfer', _transfer, weight=W_WEIGHT_ORDER, allow_fail=True)
         notify(f"💸 Profit ${amount:.6f} transferred to funding wallet.")
         return result
