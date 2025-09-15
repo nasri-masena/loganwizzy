@@ -71,7 +71,7 @@ KLINES_5M_LIMIT = 3
 KLINES_1M_LIMIT = 2
 
 # buy behavior: set to False for faster buys, True to require orderbook check before buy
-REQUIRE_ORDERBOOK_ON_BUY = True
+REQUIRE_ORDERBOOK_ON_BUY = False
 
 # balances / limits
 BUY_LOCK_SECONDS = 10          # allow quicker subsequent buys
@@ -439,7 +439,7 @@ def pick_coin():
     cleanup_recent_buys()
     now = time.time()
 
-    TOP_CANDIDATES = 80
+    TOP_CANDIDATES = 120
     MIN_VOL_RATIO = 1.4
     KLINES_LIMIT = KLINES_5M_LIMIT
 
