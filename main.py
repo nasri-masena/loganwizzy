@@ -38,7 +38,7 @@ MOVEMENT_MIN_PCT = 1.0
 # runtime / pacing
 TRADE_USD = 10.0
 SLEEP_BETWEEN_CHECKS = 30
-CYCLE_DELAY = 12
+CYCLE_DELAY = 15
 COOLDOWN_AFTER_EXIT = 10
 
 # order / protection
