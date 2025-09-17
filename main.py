@@ -23,7 +23,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.9
 PRICE_MAX = 4.0
-MIN_VOLUME = 3_000_000          # daily quote volume baseline
+MIN_VOLUME = 5_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 1.0
@@ -36,9 +36,9 @@ MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
 MOVEMENT_MIN_PCT = 1.0
 
 # runtime / pacing
-TRADE_USD = 8.0
+TRADE_USD = 10.0
 SLEEP_BETWEEN_CHECKS = 30
-CYCLE_DELAY = 15
+CYCLE_DELAY = 12
 COOLDOWN_AFTER_EXIT = 10
 
 # order / protection
@@ -193,7 +193,6 @@ def get_filters(symbol_info):
 # -------------------------
 # TRANSFERS
 # -------------------------
-
 def send_profit_to_funding(amount, asset='USDT'):
     try:
         result = client.universal_transfer(
@@ -342,203 +341,232 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # -------------------------
 # PICKER (tweaked)
 # -------------------------
-
 def pick_coin():
     global RATE_LIMIT_BACKOFF
-    cleanup_temp_skip()
-    cleanup_recent_buys()
-    now = time.time()
 
-    TOP_CANDIDATES = 120
-    MIN_VOL_RATIO = 1.4
-    KLINES_LIMIT = 8
+    try:
+        now = time.time()
 
-    tickers = get_tickers_cached() or []
-    prefiltered = []
+        # configuration tuned for low REST pressure
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 150)
+        DEEP_EVAL = 12
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.12)
+        KLINES_LIMIT = 8
+        MIN_VOL_RATIO = 1.4
 
-    MIN_QVOL = max(MIN_VOLUME, 300_000)
-    for t in tickers:
-        sym = t.get('symbol')
-        if not sym or not sym.endswith(QUOTE):
-            continue
+        tickers = get_tickers_cached() or []
+        prefiltered = []
 
-        skip_until = TEMP_SKIP.get(sym)
-        if skip_until and now < skip_until:
-            continue
-
-        last = RECENT_BUYS.get(sym)
-        try:
-            price = float(t.get('lastPrice') or 0.0)
-            qvol = float(t.get('quoteVolume') or 0.0)
-            change_pct = float(t.get('priceChangePercent') or 0.0)
-        except Exception:
-            continue
-        if qvol < 5_000_000:   # skip coins zenye volume ndogo
-            continue
-        if last:
-            if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
-                continue
-            last_price = last.get('price')
-            if last_price and price > last_price * (1 + REBUY_MAX_RISE_PCT / 100.0):
+        # quick prefilter (cheap: uses cached tickers only)
+        for t in tickers:
+            sym = t.get('symbol')
+            if not sym or not sym.endswith(QUOTE):
                 continue
 
-        # price boundary
-        if not (PRICE_MIN <= price <= PRICE_MAX):
-            continue
+            # skip temporarily blacklisted symbols
+            skip_until = TEMP_SKIP.get(sym)
+            if skip_until and now < skip_until:
+                continue
 
-        # absolute 24h guard: avoid extreme pumps/dumps
-        if abs(change_pct) > MAX_24H_CHANGE_ABS:
-            continue
-        if change_pct > MAX_24H_RISE_PCT:
-            continue
-
-        # volume baseline and directional movement requirement
-        if qvol < MIN_QVOL:
-            continue
-        if abs(change_pct) < MOVEMENT_MIN_PCT:
-            continue
-
-        prefiltered.append((sym, price, qvol, change_pct))
-
-    if not prefiltered:
-        return None
-
-    prefiltered.sort(key=lambda x: x[2], reverse=True)
-    prefiltered = prefiltered[:TOP_CANDIDATES]
-
-    candidates = []
-    for sym, price, qvol, change_pct in prefiltered:
-        try:
+            last_buy = RECENT_BUYS.get(sym)
             try:
-                klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
-            except Exception as e:
-                err = str(e)
-                if '-1003' in err or 'Too much request weight' in err:
-                    notify(f"⚠️ Rate limit while fetching klines for {sym}: {err}. Backing off.")
-                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
-                                             RATE_LIMIT_BACKOFF_MAX)
-                    time.sleep(RATE_LIMIT_BACKOFF)
-                    break
-                continue
-
-            if not klines or len(klines) < 6:
-                continue
-
-            vols = []
-            closes = []
-            for k in klines:
-                try:
-                    if len(k) > 7 and k[7] is not None:
-                        vols.append(float(k[7]))
-                    else:
-                        vols.append(float(k[5]) * float(k[4]))
-                except Exception:
-                    vols.append(0.0)
-                try:
-                    closes.append(float(k[4]))
-                except Exception:
-                    closes.append(0.0)
-
-            recent_vol = vols[-1] if vols else 0.0
-            if recent_vol <= 0:
-                continue
-
-            prev_slice = vols[-(KLINES_LIMIT-1):-1] if len(vols) >= 2 else vols[:-1]
-            avg_vol = (sum(prev_slice) / max(len(prev_slice), 1)) if prev_slice else recent_vol
-            vol_ratio = recent_vol / (avg_vol + 1e-9)
-
-            recent_pct = 0.0
-            if len(closes) >= 4 and closes[-4] > 0:
-                recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
-
-            # enforce target recent band (1%..2%)
-            if recent_pct < RECENT_PCT_MIN or recent_pct > RECENT_PCT_MAX:
-                continue
-
-            # volume spike requirement
-            if vol_ratio < MIN_VOL_RATIO:
-                continue
-
-            # require at least one consecutive up in last 3 closes
-            last3 = closes[-3:]
-            ups = 0
-            if last3[1] > last3[0]:
-                ups += 1
-            if last3[2] > last3[1]:
-                ups += 1
-            if ups < 1:
-                continue
-
-            # EMA confirmation
-            def ema_local(values, period):
-                if not values or period <= 0:
-                    return None
-                alpha = 2.0 / (period + 1.0)
-                e = float(values[0])
-                for v in values[1:]:
-                    e = alpha * float(v) + (1 - alpha) * e
-                return e
-
-            short_period = 3
-            long_period = 10
-            if len(closes) >= long_period:
-                short_ema = ema_local(closes[-short_period:], short_period)
-                long_ema = ema_local(closes[-long_period:], long_period)
-            elif len(closes) >= short_period:
-                short_ema = ema_local(closes[-short_period:], short_period)
-                long_ema = ema_local(closes, max(len(closes), 1))
-            else:
-                short_ema = None
-                long_ema = None
-
-            if short_ema is None or long_ema is None:
-                continue
-            if not (short_ema > long_ema * 1.0005):
-                continue
-
-            # RSI sanity
-            rsi_ok = True
-            if len(closes) >= 15:
-                gains = []
-                losses = []
-                for i in range(1, 15):
-                    diff = closes[-15 + i] - closes[-16 + i]
-                    if diff > 0:
-                        gains.append(diff)
-                    else:
-                        losses.append(abs(diff))
-                avg_gain = sum(gains) / 14.0 if gains else 0.0
-                avg_loss = sum(losses) / 14.0 if losses else 1e-9
-                rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
-                rsi = 100 - (100 / (1 + rs))
-                if rsi > 66:
-                    rsi_ok = False
-            if not rsi_ok:
-                continue
-
-            # orderbook bullishness quick check
-            try:
-                if not orderbook_bullish(sym, depth=5, min_imbalance=1.1, max_spread_pct=1.0):
-                    continue
+                price = float(t.get('lastPrice') or 0.0)
+                qvol = float(t.get('quoteVolume') or 0.0)
+                change_pct = float(t.get('priceChangePercent') or 0.0)
             except Exception:
                 continue
 
-            ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-            score = (recent_pct * 12.0) + (math.log1p(qvol) * 0.4) + (vol_ratio * 6.0) + (ema_uplift * 80.0)
+            # quick volume / price / change filters
+            if not (PRICE_MIN <= price <= PRICE_MAX):
+                continue
+            if qvol < max(MIN_VOLUME, 300_000):
+                continue
+            if abs(change_pct) > MAX_24H_CHANGE_ABS:
+                continue
+            if change_pct > MAX_24H_RISE_PCT:
+                continue
 
-            candidates.append((sym, price, qvol, change_pct, vol_ratio, recent_pct, score))
+            # recent re-buy guard
+            if last_buy:
+                cooldown = last_buy.get('cooldown', REBUY_COOLDOWN)
+                if now < last_buy['ts'] + cooldown:
+                    continue
+                last_price = last_buy.get('price')
+                if last_price and price > last_price * (1 + REBUY_MAX_RISE_PCT / 100.0):
+                    continue
 
-        except Exception as e:
-            notify(f"⚠️ pick_coin processing error for {sym}: {e}")
-            continue
+            prefiltered.append((sym, price, qvol, change_pct))
 
-    if not candidates:
+        if not prefiltered:
+            return None
+
+        # rank by quote volume, keep top N to control expensive work
+        prefiltered.sort(key=lambda x: x[2], reverse=True)
+        top_pool = prefiltered[:TOP_CANDIDATES]
+
+        # if many, sample a small subset for deep evaluation (fast, lowers weight)
+        if len(top_pool) > DEEP_EVAL:
+            sampled = random.sample(top_pool, DEEP_EVAL)
+        else:
+            sampled = list(top_pool)
+
+        candidates = []
+
+        # helper: EMA
+        def ema_local(values, period):
+            if not values or period <= 0:
+                return None
+            alpha = 2.0 / (period + 1.0)
+            e = float(values[0])
+            for v in values[1:]:
+                e = alpha * float(v) + (1 - alpha) * e
+            return e
+
+        # helper: RSI (simple)
+        def compute_rsi(closes, period=14):
+            if not closes or len(closes) < period + 1:
+                return None
+            gains = []
+            losses = []
+            for i in range(1, len(closes)):
+                diff = closes[i] - closes[i-1]
+                gains.append(max(0.0, diff))
+                losses.append(max(0.0, -diff))
+            avg_gain = sum(gains[:period]) / period
+            avg_loss = sum(losses[:period]) / period if sum(losses[:period]) != 0 else 1e-9
+            for i in range(period, len(gains)):
+                avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+                avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+            rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
+            return 100 - (100 / (1 + rs))
+
+        # deep-evaluate each sampled candidate
+        for sym, last_price, qvol, change_pct in sampled:
+            try:
+                time.sleep(REQUEST_SLEEP)  # small throttle between heavy calls
+
+                # fetch 5m klines (cheap relative to many other endpoints)
+                try:
+                    klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
+                except Exception as e:
+                    err = str(e)
+                    # detect rate-limit and back off globally
+                    if '-1003' in err or 'Too much request weight' in err or 'Way too much request weight' in err:
+                        RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
+                                                 RATE_LIMIT_BACKOFF_MAX)
+                        notify(f"⚠️ Rate limit while fetching klines for {sym}: {err}. Backing off {RATE_LIMIT_BACKOFF}s.")
+                        time.sleep(RATE_LIMIT_BACKOFF)
+                        break
+                    continue
+
+                if not klines or len(klines) < 4:
+                    continue
+
+                closes = []
+                vols = []
+                for k in klines:
+                    try:
+                        closes.append(float(k[4]))
+                    except Exception:
+                        closes.append(0.0)
+                    try:
+                        if len(k) > 7 and k[7] is not None:
+                            vols.append(float(k[7]))
+                        else:
+                            vols.append(float(k[5]) * float(k[4]))
+                    except Exception:
+                        vols.append(0.0)
+
+                if not closes or len(closes) < 3:
+                    continue
+
+                recent_vol = vols[-1]
+                prev_avg = (sum(vols[:-1]) / max(1, len(vols[:-1]))) if len(vols) > 1 else recent_vol
+                vol_ratio = recent_vol / (prev_avg + 1e-12)
+
+                # recent price change over last 3-4 bars
+                recent_pct = 0.0
+                if len(closes) >= 4 and closes[-4] > 0:
+                    recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
+
+                # require recent_pct in the target band
+                if recent_pct < RECENT_PCT_MIN or recent_pct > RECENT_PCT_MAX:
+                    continue
+
+                if vol_ratio < MIN_VOL_RATIO:
+                    continue
+
+                # at least one upward momentum in last 3 closes
+                last3 = closes[-3:]
+                ups = 0
+                if len(last3) >= 2 and last3[1] > last3[0]:
+                    ups += 1
+                if len(last3) >= 3 and last3[2] > last3[1]:
+                    ups += 1
+                if ups < 1:
+                    continue
+
+                # EMA confirmation
+                short_period = 3
+                long_period = 10
+                short_ema = ema_local(closes[-short_period:], short_period) if len(closes) >= short_period else None
+                long_ema = ema_local(closes[-long_period:], long_period) if len(closes) >= long_period else ema_local(closes, max(len(closes),1))
+                if short_ema is None or long_ema is None:
+                    continue
+                ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
+                if not (short_ema > long_ema * 1.0005):
+                    continue
+
+                # RSI check (avoid heavily overbought)
+                rsi_val = compute_rsi(closes, period=14)
+                if rsi_val is not None and rsi_val > 68:
+                    continue
+
+                # light orderbook check (cheap)
+                try:
+                    if not orderbook_bullish(sym, depth=5, min_imbalance=1.05, max_spread_pct=1.2):
+                        continue
+                except Exception:
+                    continue
+
+                # score
+                score = 0.0
+                score += max(0.0, recent_pct) * 12.0
+                score += math.log1p(qvol) * 0.4
+                score += (vol_ratio - 1.0) * 6.0
+                score += ema_uplift * 80.0
+                if rsi_val is not None:
+                    score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
+                score += max(0.0, change_pct) * 0.6
+
+                candidates.append({
+                    'symbol': sym,
+                    'price': last_price,
+                    'qvol': qvol,
+                    'change': change_pct,
+                    'recent_pct': recent_pct,
+                    'vol_ratio': vol_ratio,
+                    'ema_uplift': ema_uplift,
+                    'rsi': rsi_val,
+                    'score': score
+                })
+
+            except Exception as e:
+                notify(f"⚠️ pick_coin deep-eval error for {sym}: {e}")
+                continue
+
+        if not candidates:
+            return None
+
+        # pick best scoring candidate
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        best = candidates[0]
+        return (best['symbol'], best['price'], best['qvol'], best['change'])
+
+    except Exception as e:
+        notify(f"⚠️ pick_coin unexpected error: {e}")
         return None
-
-    candidates.sort(key=lambda x: x[-1], reverse=True)
-    best = candidates[0]
-    return (best[0], best[1], best[2], best[3])
-
+        
 # -------------------------
 # MARKET BUY helpers
 # -------------------------
@@ -1276,7 +1304,7 @@ def _notify_daily_stats(date_key):
 
 ACTIVE_SYMBOL = None
 LAST_BUY_TS = 0.0
-BUY_LOCK_SECONDS = 60
+BUY_LOCK_SECONDS = 45
 
 def trade_cycle():
     global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS, RATE_LIMIT_BACKOFF
