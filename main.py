@@ -348,8 +348,8 @@ def pick_coin():
         now = time.time()
 
         # tuned defaults (can be overridden via globals())
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 80)
-        DEEP_EVAL = globals().get('DEEP_EVAL', 6)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        DEEP_EVAL = globals().get('DEEP_EVAL', 4)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.12)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         MIN_VOL_RATIO = 1.4
@@ -586,7 +586,7 @@ def pick_coin():
     except Exception as e:
         notify(f"⚠️ pick_coin unexpected error: {e}")
         return None
-        
+
 # -------------------------
 # MARKET BUY helpers
 # -------------------------
@@ -1360,7 +1360,7 @@ def trade_cycle():
                     notify(f"⏸ Backing off due to prior rate-limit for {RATE_LIMIT_BACKOFF}s.")
                     time.sleep(RATE_LIMIT_BACKOFF)
                 else:
-                    time.sleep(180)
+                    time.sleep(30)
                 continue
 
             symbol, price, volume, change = candidate
