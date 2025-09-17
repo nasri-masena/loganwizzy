@@ -341,6 +341,8 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # -------------------------
 # PICKER (tweaked)
 # -------------------------
+RATE_LIMIT_BACKOFF = 0
+
 def pick_coin():
     global RATE_LIMIT_BACKOFF
 
