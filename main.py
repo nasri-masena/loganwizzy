@@ -23,7 +23,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.9
 PRICE_MAX = 4.0
-MIN_VOLUME = 4_000_000          # daily quote volume baseline
+MIN_VOLUME = 2_500_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 1.0
@@ -85,7 +85,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 350
+CACHE_TTL = 300
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -348,9 +348,9 @@ def pick_coin():
         now = time.time()
 
         # tuned defaults (can be overridden via globals())
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 150)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 80)
         DEEP_EVAL = globals().get('DEEP_EVAL', 6)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.25)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.12)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         MIN_VOL_RATIO = 1.4
 
