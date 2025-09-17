@@ -23,7 +23,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.9
 PRICE_MAX = 4.0
-MIN_VOLUME = 5_000_000          # daily quote volume baseline
+MIN_VOLUME = 4_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 1.0
@@ -85,7 +85,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 300
+CACHE_TTL = 350
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -347,12 +347,39 @@ def pick_coin():
     try:
         now = time.time()
 
-        # configuration tuned for low REST pressure
+        # tuned defaults (can be overridden via globals())
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 150)
-        DEEP_EVAL = 12
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.12)
-        KLINES_LIMIT = 8
+        DEEP_EVAL = globals().get('DEEP_EVAL', 6)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.25)
+        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         MIN_VOL_RATIO = 1.4
+
+        # persistent lightweight klines cache stored on the function object
+        if not hasattr(pick_coin, "_klines_cache"):
+            pick_coin._klines_cache = {}  # key -> (ts, ttl, data)
+
+        def get_klines_cached(symbol, interval='5m', limit=KLINES_LIMIT, ttl=6):
+            key = f"klines::{symbol}::{interval}::{limit}"
+            ent = pick_coin._klines_cache.get(key)
+            now_local = time.time()
+            if ent and now_local - ent[0] < ent[1]:
+                return ent[2]
+            try:
+                data = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+                pick_coin._klines_cache[key] = (now_local, ttl, data)
+                return data
+            except Exception as e:
+                err = str(e)
+                # bubble-up rate-limit quickly to let trade_cycle backoff
+                if '-1003' in err or 'Too much request weight' in err or 'Way too much request weight' in err:
+                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
+                                             RATE_LIMIT_BACKOFF_MAX)
+                    notify(f"⚠️ Rate limit while fetching klines for {symbol}: {err}. Backing off {RATE_LIMIT_BACKOFF}s.")
+                    # return a special indicator (None) so caller handles backoff
+                else:
+                    # light notify (avoid spam)
+                    notify(f"⚠️ get_klines_cached failed for {symbol}: {err}")
+                return None
 
         tickers = get_tickers_cached() or []
         prefiltered = []
@@ -404,7 +431,7 @@ def pick_coin():
         prefiltered.sort(key=lambda x: x[2], reverse=True)
         top_pool = prefiltered[:TOP_CANDIDATES]
 
-        # if many, sample a small subset for deep evaluation (fast, lowers weight)
+        # sample a small subset for deeper evaluation (reduces weight)
         if len(top_pool) > DEEP_EVAL:
             sampled = random.sample(top_pool, DEEP_EVAL)
         else:
@@ -445,19 +472,12 @@ def pick_coin():
             try:
                 time.sleep(REQUEST_SLEEP)  # small throttle between heavy calls
 
-                # fetch 5m klines (cheap relative to many other endpoints)
-                try:
-                    klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
-                except Exception as e:
-                    err = str(e)
-                    # detect rate-limit and back off globally
-                    if '-1003' in err or 'Too much request weight' in err or 'Way too much request weight' in err:
-                        RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
-                                                 RATE_LIMIT_BACKOFF_MAX)
-                        notify(f"⚠️ Rate limit while fetching klines for {sym}: {err}. Backing off {RATE_LIMIT_BACKOFF}s.")
-                        time.sleep(RATE_LIMIT_BACKOFF)
-                        break
-                    continue
+                # fetch 5m klines via cache
+                klines = get_klines_cached(sym, interval='5m', limit=KLINES_LIMIT, ttl=6)
+                if klines is None:
+                    # None indicates error or rate-limit -> stop deep-eval so trade_cycle backoffs
+                    # return None to let outer logic handle backoff/sleep
+                    return None
 
                 if not klines or len(klines) < 4:
                     continue
