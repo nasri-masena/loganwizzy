@@ -27,11 +27,11 @@ MIN_VOLUME = 2_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.8
-RECENT_PCT_MAX = 3.0            # require recent move between 0.8%..3.0%
+RECENT_PCT_MAX = 3.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
-MAX_24H_RISE_PCT = 5.0
-MAX_24H_CHANGE_ABS = 5.0
+MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
+MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
 
 MOVEMENT_MIN_PCT = 1.0
 
@@ -66,14 +66,6 @@ ROLL_COOLDOWN_SECONDS = 60
 MAX_ROLLS_PER_POSITION = 3
 ROLL_POST_CANCEL_JITTER = (0.3, 0.8)
 
-# additional safety for repeated roll failures
-ROLL_FAILURE_WINDOW = 600         # seconds window to count failures
-ROLL_FAILURE_THRESHOLD = 3        # failures within window -> TEMP skip
-SKIP_SECONDS_ON_REPEATED_ROLL_FAIL = 60 * 30  # 30 minutes
-
-# small-notional skip (avoid repeated tiny order attempts)
-SKIP_SECONDS_ON_SMALL_NOTIONAL = 60 * 20  # 20 minutes
-
 # -------------------------
 # INIT / GLOBALS
 # -------------------------
@@ -98,9 +90,6 @@ RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
 CACHE_TTL = 300
-
-# track roll failures per symbol
-ROLL_FAILURES = {}  # symbol -> [(ts1), (ts2), ...]
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -357,21 +346,23 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # PICKER (tweaked)
 # -------------------------
 def pick_coin():
+    # uses top-level CONFIG constants (EMA_UPLIFT_MIN_PCT, SCORE_MIN_THRESHOLD, TOP_CANDIDATES etc.)
     global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
 
     try:
         t0 = time.time()
         now = t0
 
-        # tunables (can be overridden via globals if you want)
-        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 60))
-        DEEP_EVAL = int(globals().get('DEEP_EVAL', 8))
-        REQUEST_SLEEP = float(globals().get('REQUEST_SLEEP', 0.10))
-        KLINES_LIMIT = int(globals().get('KLINES_LIMIT', 6))
-        MIN_VOL_RATIO = float(globals().get('MIN_VOL_RATIO', 1.5))
+        # load tunables (use top-level values if present, otherwise safe defaults)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        DEEP_EVAL = globals().get('DEEP_EVAL', 8)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.10)
+        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
+        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.5)
 
-        EMA_UPLIFT_MIN = float(globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT))
-        SCORE_MIN = float(globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD))
+        # use config constants defined at top
+        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT)
+        SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD)
 
         tickers = get_tickers_cached() or []
         prefiltered = []
@@ -599,7 +590,7 @@ def pick_coin():
     except Exception as e:
         notify(f"⚠️ pick_coin unexpected error: {e}")
         return None
-
+        
 # -------------------------
 # MARKET BUY helpers
 # -------------------------
@@ -964,26 +955,24 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
 
     # BEFORE trying OCO: ensure minNotional satisfied
     min_notional = f.get('minNotional')
-    if min_notional and qty * tp < min_notional - 1e-12:
-        # try to increase qty first (safer) if holdings allow
-        needed_qty = ceil_step(min_notional / tp, f['stepSize'])
-        if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
-            notify(f"ℹ️ Increasing qty from {qty} to {needed_qty} to meet minNotional (qty*tp >= {min_notional}).")
-            qty = needed_qty
-        else:
-            # attempt to bump TP to meet notional (but avoid crazy pumps)
-            attempts = 0
-            while attempts < 40 and qty * tp < min_notional - 1e-12:
-                if f.get('tickSize') and f.get('tickSize') > 0:
-                    tp = clip_ceil(tp + f['tickSize'], f['tickSize'])
-                else:
-                    tp = tp + max(1e-8, tp * 0.001)
-                attempts += 1
-            if qty * tp < min_notional - 1e-12:
-                # can't meet minNotional: skip and TEMP skip to avoid repeated tiny attempts
-                notify(f"⚠️ Cannot meet minNotional for OCO on {symbol} (qty*tp={qty*tp:.8f} < {min_notional}). TEMP skipping symbol for {SKIP_SECONDS_ON_SMALL_NOTIONAL}s.")
-                TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_SMALL_NOTIONAL
-                return None
+    if min_notional:
+        # try increasing qty first (safer) if holdings allow
+        if qty * tp < min_notional - 1e-12:
+            needed_qty = ceil_step(min_notional / tp, f['stepSize'])
+            if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
+                notify(f"ℹ️ Increasing qty from {qty} to {needed_qty} to meet minNotional (qty*tp >= {min_notional}).")
+                qty = needed_qty
+            else:
+                # attempt to bump TP to meet notional (but avoid crazy pumps)
+                attempts = 0
+                while attempts < 40 and qty * tp < min_notional - 1e-12:
+                    if f.get('tickSize') and f.get('tickSize') > 0:
+                        tp = clip_ceil(tp + f['tickSize'], f['tickSize'])
+                    else:
+                        tp = tp + max(1e-8, tp * 0.001)
+                    attempts += 1
+                if qty * tp < min_notional - 1e-12:
+                    notify(f"⚠️ Cannot meet minNotional for OCO on {symbol} (qty*tp={qty*tp:.8f} < {min_notional}). Will attempt fallback flow.")
 
     qty_str = format_qty(qty, f['stepSize'])
     tp_str = format_price(tp, f['tickSize'])
@@ -1160,11 +1149,10 @@ def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
         notify(f"⚠️ Failed to cancel orders: {e}")
 
 # -------------------------
-# MONITOR & ROLL (with extra failure safeguards)
+# MONITOR & ROLL (mostly same but uses improved place_oco_sell)
 # -------------------------
 
 def monitor_and_roll(symbol, qty, entry_price, f):
-    global ROLL_FAILURES
     orig_qty = qty
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
     curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
@@ -1191,8 +1179,6 @@ def monitor_and_roll(symbol, qty, entry_price, f):
     while True:
         try:
             time.sleep(SLEEP_BETWEEN_CHECKS)
-            cleanup_temp_skip()
-
             asset = symbol[:-len(QUOTE)]
             price_now = get_price_cached(symbol)
             if price_now is None:
@@ -1265,11 +1251,15 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                             new_tp = new_tp + max(1e-8, new_tp * 0.001)
                         adjust_cnt += 1
                     if sell_qty * new_tp < min_notional - 1e-12:
-                        # cannot meet minNotional for this roll — TEMP skip to avoid repeated tiny attempts
-                        notify(f"⚠️ Roll aborted: cannot meet minNotional for {symbol} even after TP bumps. TEMP skipping {SKIP_SECONDS_ON_SMALL_NOTIONAL}s.")
-                        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_SMALL_NOTIONAL
-                        last_roll_ts = now_ts
-                        continue
+                        # try increasing sell_qty if free asset available
+                        needed_qty = ceil_step(min_notional / new_tp, f.get('stepSize'))
+                        if needed_qty <= available_for_sell + 1e-12 and needed_qty > sell_qty:
+                            notify(f"ℹ️ Increasing sell_qty to {needed_qty} to meet minNotional for roll.")
+                            sell_qty = needed_qty
+                        else:
+                            notify(f"⚠️ Roll aborted: cannot meet minNotional for {symbol} even after TP bumps.")
+                            last_roll_ts = now_ts
+                            continue
 
                 last_roll_ts = now_ts
                 cancel_all_open_orders(symbol)
@@ -1278,39 +1268,20 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                 oco2 = place_oco_sell(symbol, sell_qty, entry_price,
                                       explicit_tp=new_tp, explicit_sl=new_sl)
                 if oco2:
-                    # success: clear roll-fail history for symbol
-                    ROLL_FAILURES.pop(symbol, None)
                     roll_count += 1
                     last_tp = curr_tp
                     curr_tp = new_tp
                     curr_sl = new_sl
                     notify(f"🔁 Rolled OCO (abs-step): new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty}")
                 else:
-                    notify("⚠️ Roll attempt failed; previous orders are cancelled. Recording failure.")
-                    # record failure timestamp
-                    arr = ROLL_FAILURES.get(symbol, [])
-                    arr = [ts for ts in arr if now_ts - ts <= ROLL_FAILURE_WINDOW]
-                    arr.append(now_ts)
-                    ROLL_FAILURES[symbol] = arr
-                    if len(arr) >= ROLL_FAILURE_THRESHOLD:
-                        notify(f"⚠️ Detected {len(arr)} OCO failures for {symbol} within window — TEMP skipping for {SKIP_SECONDS_ON_REPEATED_ROLL_FAIL//60}min.")
-                        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_REPEATED_ROLL_FAIL
-                        # stop rolling for this position; try to re-place protective OCO next loop or exit
-                        time.sleep(0.4)
-                        fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-                        if fallback:
-                            notify("ℹ️ Fallback OCO re-placed after multiple failed rolls.")
-                        else:
-                            notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
-                            TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+                    notify("⚠️ Roll attempt failed; previous orders are cancelled. Will try to re-place protective OCO next loop.")
+                    time.sleep(0.4)
+                    fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+                    if fallback:
+                        notify("ℹ️ Fallback OCO re-placed after failed roll.")
                     else:
-                        time.sleep(0.4)
-                        fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-                        if fallback:
-                            notify("ℹ️ Fallback OCO re-placed after failed roll.")
-                        else:
-                            notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
-                            TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+                        notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
+                        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
@@ -1352,7 +1323,7 @@ def _notify_daily_stats(date_key):
     )
 
 # -------------------------
-# MAIN TRADE CYCLE
+# MAIN TRADE CYCLE (unchanged structure)
 # -------------------------
 
 ACTIVE_SYMBOL = None
@@ -1501,7 +1472,7 @@ def trade_cycle():
             ent = RECENT_BUYS.get(symbol, {})
             ent['ts'] = now2
             ent['price'] = entry_price
-            ent['profit'] = total_profit_usdt = total_profit_usd
+            ent['profit'] = total_profit_usd
             if ent['profit'] is None:
                 ent['cooldown'] = REBUY_COOLDOWN
             elif ent['profit'] < 0:
