@@ -4,7 +4,7 @@ import time
 import random
 import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
 from flask import Flask
 from binance.client import Client
@@ -27,11 +27,11 @@ MIN_VOLUME = 2_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.8
-RECENT_PCT_MAX = 3.0            # require recent move between 1%..2%
+RECENT_PCT_MAX = 3.0            # require recent move between 0.8%..3.0%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
-MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
-MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
+MAX_24H_RISE_PCT = 5.0
+MAX_24H_CHANGE_ABS = 5.0
 
 MOVEMENT_MIN_PCT = 1.0
 
@@ -66,13 +66,14 @@ ROLL_COOLDOWN_SECONDS = 60
 MAX_ROLLS_PER_POSITION = 3
 ROLL_POST_CANCEL_JITTER = (0.3, 0.8)
 
-# Rolling tracker to prevent runaway rolling per symbol
-ROLLS_TRACK = {}           # symbol -> {'count': int, 'first_ts': float, 'last_ts': float}
-ROLLS_TRACK_WINDOW = 60 * 60  # 1 hour window to count rolls
-ROLLS_TRACK_MAX = 6        # hard max rolls per symbol per window before temp-skip
-ROLLS_TEMP_SKIP = 60 * 30  # 30 minutes temp-skip if exceeded
+# additional safety for repeated roll failures
+ROLL_FAILURE_WINDOW = 600         # seconds window to count failures
+ROLL_FAILURE_THRESHOLD = 3        # failures within window -> TEMP skip
+SKIP_SECONDS_ON_REPEATED_ROLL_FAIL = 60 * 30  # 30 minutes
 
-VERBOSE_NOTIFICATIONS = False
+# small-notional skip (avoid repeated tiny order attempts)
+SKIP_SECONDS_ON_SMALL_NOTIONAL = 60 * 20  # 20 minutes
+
 # -------------------------
 # INIT / GLOBALS
 # -------------------------
@@ -97,6 +98,9 @@ RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
 CACHE_TTL = 300
+
+# track roll failures per symbol
+ROLL_FAILURES = {}  # symbol -> [(ts1), (ts2), ...]
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -353,23 +357,21 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # PICKER (tweaked)
 # -------------------------
 def pick_coin():
-    # uses top-level CONFIG constants (EMA_UPLIFT_MIN_PCT, SCORE_MIN_THRESHOLD, TOP_CANDIDATES etc.)
     global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
 
     try:
         t0 = time.time()
         now = t0
 
-        # load tunables (use top-level values if present, otherwise safe defaults)
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
-        DEEP_EVAL = globals().get('DEEP_EVAL', 8)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.10)
-        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.5)
+        # tunables (can be overridden via globals if you want)
+        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 60))
+        DEEP_EVAL = int(globals().get('DEEP_EVAL', 8))
+        REQUEST_SLEEP = float(globals().get('REQUEST_SLEEP', 0.10))
+        KLINES_LIMIT = int(globals().get('KLINES_LIMIT', 6))
+        MIN_VOL_RATIO = float(globals().get('MIN_VOL_RATIO', 1.5))
 
-        # use config constants defined at top
-        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT)
-        SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD)
+        EMA_UPLIFT_MIN = float(globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT))
+        SCORE_MIN = float(globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD))
 
         tickers = get_tickers_cached() or []
         prefiltered = []
@@ -587,12 +589,17 @@ def pick_coin():
         # pick best scoring candidate
         candidates.sort(key=lambda x: x['score'], reverse=True)
         best = candidates[0]
+
+        # optional debug about pick duration
+        took = time.time() - t0
+        notify(f"ℹ️ pick_coin finished in {took:.2f}s, evaluated={len(sampled)}, candidates={len(candidates)}, best_score={best.get('score', 0):.2f}")
+
         return (best['symbol'], best['price'], best['qvol'], best['change'])
 
     except Exception as e:
         notify(f"⚠️ pick_coin unexpected error: {e}")
         return None
-        
+
 # -------------------------
 # MARKET BUY helpers
 # -------------------------
@@ -677,19 +684,10 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
     if require_orderbook:
         try:
             if not orderbook_bullish(symbol, depth=5, min_imbalance=1.1, max_spread_pct=0.6):
-                notify(f"⚠️ Orderbook sio bullish kwa {symbol}; market buy imekataliwa.")
+                notify(f"⚠️ Orderbook not bullish for {symbol}; aborting market buy.")
                 return None, None
         except Exception as e:
             notify(f"⚠️ Orderbook check error for {symbol}: {e}")
-
-    # quick safety: if minNotional exists and usd_amount < minNotional, skip early
-    if f.get('minNotional'):
-        try:
-            if float(usd_amount) < float(f['minNotional']) - 1e-12:
-                notify(f"⚠️ Skipping {symbol}: buy amount ${usd_amount:.6f} < minNotional {f['minNotional']}.")
-                return None, None
-        except Exception:
-            pass
 
     price = get_price_cached(symbol)
     if price is None:
@@ -759,7 +757,6 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
     free_after = get_free_asset(asset)
     free_after_clip = round_step(free_after, f.get('stepSize', 0.0))
 
-    # reconcile executed qty with actual free balance
     if free_after_clip >= f.get('minQty', 0.0) and (executed_qty <= 0 or abs(free_after_clip - executed_qty) / (executed_qty + 1e-9) > 0.02):
         notify(f"ℹ️ Adjusting executed qty from parsed {executed_qty} to actual free balance {free_after_clip}")
         executed_qty = free_after_clip
@@ -771,30 +768,14 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
         notify(f"❌ Executed quantity too small after reconciliation for {symbol}: {executed_qty}")
         return None, None
 
-    # ensure position will be sellable later (minNotional)
-    if f.get('minNotional'):
-        est_notional = executed_qty * (avg_price or price)
-        if est_notional < f['minNotional'] - 1e-12:
-            notify(f"⚠️ Bought {symbol} but estimated notional ${est_notional:.6f} < minNotional {f['minNotional']}. Attempting to clean up (market sell).")
-            try:
-                fallback = place_market_sell_fallback(symbol, executed_qty, f)
-                if fallback:
-                    notify(f"✅ Tumefanya market sell ya tiny buy kwa {symbol}.")
-                else:
-                    notify(f"❌ Failed cleaning tiny buy for {symbol}. TEMP skipping symbol.")
-                    TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
-            except Exception as e:
-                notify(f"❌ Exception while trying to clean tiny buy for {symbol}: {e}")
-            return None, None
-
     if free_after_clip < max(1e-8, executed_qty * 0.5):
         notify(f"⚠️ After buy free balance {free_after_clip} is much smaller than expected executed {executed_qty}. Skipping symbol for a while.")
         TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
         return None, None
-    
-    notify(f"✅ Coin {symbol} imeuzwa: bei={exit_price:.8f}, faida≈${profit_usd:.6f}")
+
+    notify(f"✅ BUY {symbol}: qty={executed_qty} ~price={avg_price:.8f} notional≈${executed_qty*avg_price:.6f}")
     return executed_qty, avg_price
-    
+
 # -------------------------
 # Micro TP helper (unchanged mostly)
 # -------------------------
@@ -822,7 +803,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
 
         try:
             order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str)
-            notify(f"📍 Micro TP tume-set kwa {symbol} 🔥 sell {qty_str} @ {price_str}")
+            notify(f"📍 Micro TP placed for {symbol}: sell {qty_str} @ {price_str}")
             try:
                 OPEN_ORDERS_CACHE['data'] = None
             except Exception:
@@ -890,7 +871,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
                     if profit_to_send and profit_to_send > 0.0:
                         try:
                             send_profit_to_funding(profit_to_send)
-                            notify(f"💸 Faida ya Micro TP ${profit_to_send:.6f} kwa {symbol} imetumwa kwenye funding.")
+                            notify(f"💸 Micro TP profit ${profit_to_send:.6f} for {symbol} sent to funding.")
                         except Exception as e:
                             notify(f"⚠️ Failed to transfer micro profit for {symbol}: {e}")
                     else:
@@ -920,7 +901,7 @@ def place_market_sell_fallback(symbol, qty, f):
         qty_str = format_qty(qty, f.get('stepSize', 0.0))
         notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
         resp = client.order_market_sell(symbol=symbol, quantity=qty_str)
-        notify(f"✅ {symbol} imeuzwa direct kwa market 🚀")
+        notify(f"✅ Market sell fallback executed for {symbol}")
         try:
             OPEN_ORDERS_CACHE['data'] = None
         except Exception:
@@ -933,6 +914,7 @@ def place_market_sell_fallback(symbol, qty, f):
 # -------------------------
 # OCO SELL with robust fallbacks & minNotional & qty adjustment
 # -------------------------
+
 def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
@@ -980,21 +962,28 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         notify(f"ℹ️ Adjusting sell qty down from {qty} to available {new_qty} to avoid insufficient balance.")
         qty = new_qty
 
-    # EARLY minNotional guard: try to adjust qty, else abort early to avoid repeated OCO failures
+    # BEFORE trying OCO: ensure minNotional satisfied
     min_notional = f.get('minNotional')
-    if min_notional:
-        try:
-            if qty * tp < min_notional - 1e-12:
-                needed_qty = ceil_step(min_notional / float(tp), f['stepSize'])
-                if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
-                    qty = needed_qty
-                    notify(f"ℹ️ Increased qty to {qty} to meet minNotional before OCO.")
+    if min_notional and qty * tp < min_notional - 1e-12:
+        # try to increase qty first (safer) if holdings allow
+        needed_qty = ceil_step(min_notional / tp, f['stepSize'])
+        if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
+            notify(f"ℹ️ Increasing qty from {qty} to {needed_qty} to meet minNotional (qty*tp >= {min_notional}).")
+            qty = needed_qty
+        else:
+            # attempt to bump TP to meet notional (but avoid crazy pumps)
+            attempts = 0
+            while attempts < 40 and qty * tp < min_notional - 1e-12:
+                if f.get('tickSize') and f.get('tickSize') > 0:
+                    tp = clip_ceil(tp + f['tickSize'], f['tickSize'])
                 else:
-                    notify(f"⚠️ Cannot meet minNotional for OCO on {symbol} (qty*tp={qty*tp:.8f} < {min_notional}) — aborting OCO.")
-                    return None
-        except Exception:
-            # if numeric issue, continue and let API return specific error
-            pass
+                    tp = tp + max(1e-8, tp * 0.001)
+                attempts += 1
+            if qty * tp < min_notional - 1e-12:
+                # can't meet minNotional: skip and TEMP skip to avoid repeated tiny attempts
+                notify(f"⚠️ Cannot meet minNotional for OCO on {symbol} (qty*tp={qty*tp:.8f} < {min_notional}). TEMP skipping symbol for {SKIP_SECONDS_ON_SMALL_NOTIONAL}s.")
+                TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_SMALL_NOTIONAL
+                return None
 
     qty_str = format_qty(qty, f['stepSize'])
     tp_str = format_price(tp, f['tickSize'])
@@ -1021,6 +1010,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
             return {'tp': tp, 'sl': sp, 'method': 'oco', 'raw': oco}
         except BinanceAPIException as e:
             err = str(e)
+            code = getattr(e, 'code', None)
             notify(f"⚠️ OCO SELL attempt {attempt} (standard) failed: {err}")
             if 'aboveType' in err or '-1102' in err or 'Mandatory parameter' in err:
                 notify("ℹ️ Detected 'aboveType' style requirement; will attempt alternative param names.")
@@ -1048,7 +1038,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
             notify(f"⚠️ Unexpected error on OCO attempt: {e}")
             time.sleep(0.2)
 
-    # Attempt 2: alternative param names
+    # Attempt 2: alternative param names (some clients require different param schema)
     for attempt in range(1, retries + 1):
         try:
             oco2 = client.create_oco_order(
@@ -1066,7 +1056,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                 OPEN_ORDERS_CACHE['data'] = None
             except Exception:
                 pass
-            notify(f"📌 OCO Sell imewekwa ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty_str}")
+            notify(f"📌 OCO SELL placed (alt params) ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty_str}")
             return {'tp': tp, 'sl': sp, 'method': 'oco_abovebelow', 'raw': oco2}
         except BinanceAPIException as e:
             err = str(e)
@@ -1093,7 +1083,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
             notify(f"⚠️ Unexpected error on OCO alt attempt: {e}")
             time.sleep(0.2)
 
-    # Fallbacks: separate TP + SL or market
+    # Fallback: try placing TP limit and STOP_LOSS_LIMIT, else market sell
     notify("⚠️ All OCO attempts failed — falling back to separate TP (limit) + SL (stop-limit) or MARKET.")
 
     tp_order = None
@@ -1105,10 +1095,14 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         except Exception:
             pass
         notify(f"📈 TP LIMIT placed (fallback): {tp_str}, qty={qty_str}")
+    except BinanceAPIException as e:
+        err = str(e)
+        notify(f"❌ Fallback TP limit failed: {err}")
     except Exception as e:
         notify(f"❌ Fallback TP limit failed: {e}")
 
     try:
+        # STOP_LOSS_LIMIT: requires stopPrice (trigger) and price (limit)
         sl_order = client.create_order(
             symbol=symbol,
             side="SELL",
@@ -1123,13 +1117,16 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
         except Exception:
             pass
         notify(f"📉 SL STOP_LOSS_LIMIT placed (fallback): trigger={sp_str}, limit={sl_str}, qty={qty_str}")
+    except BinanceAPIException as e:
+        err = str(e)
+        notify(f"❌ Fallback SL stop-limit failed: {err}")
     except Exception as e:
         notify(f"❌ Fallback SL stop-limit failed: {e}")
 
     if (tp_order or sl_order):
         return {'tp': tp, 'sl': sp, 'method': 'fallback_separate', 'raw': {'tp': tp_order, 'sl': sl_order}}
 
-    # Final fallback: market sell
+    # Final fallback: try market sell to avoid being stuck
     fallback_market = place_market_sell_fallback(symbol, qty, f)
     if fallback_market:
         return {'tp': tp, 'sl': sp, 'method': 'market_fallback', 'raw': fallback_market}
@@ -1137,11 +1134,11 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
     notify("❌ All attempts to protect position failed (no TP/SL placed). TEMP skipping symbol.")
     TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
     return None
-    
 
 # -------------------------
 # CANCEL HELPERS (unchanged)
 # -------------------------
+
 def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
     try:
         open_orders = get_open_orders_cached(symbol)
@@ -1163,11 +1160,11 @@ def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
         notify(f"⚠️ Failed to cancel orders: {e}")
 
 # -------------------------
-# MONITOR & ROLL (mostly same but uses improved place_oco_sell)
+# MONITOR & ROLL (with extra failure safeguards)
 # -------------------------
-def monitor_and_roll(symbol, qty, entry_price, f):
-    global TEMP_SKIP, ROLLS_TRACK
 
+def monitor_and_roll(symbol, qty, entry_price, f):
+    global ROLL_FAILURES
     orig_qty = qty
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
     curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
@@ -1194,6 +1191,8 @@ def monitor_and_roll(symbol, qty, entry_price, f):
     while True:
         try:
             time.sleep(SLEEP_BETWEEN_CHECKS)
+            cleanup_temp_skip()
+
             asset = symbol[:-len(QUOTE)]
             price_now = get_price_cached(symbol)
             if price_now is None:
@@ -1207,11 +1206,10 @@ def monitor_and_roll(symbol, qty, entry_price, f):
             available_for_sell = min(round_step(free_qty, f.get('stepSize', 0.0)), orig_qty)
             open_orders = get_open_orders_cached(symbol)
 
-            # exit if nothing left and no open protective orders
             if available_for_sell < round_step(orig_qty * 0.05, f.get('stepSize', 0.0)) and len(open_orders) == 0:
                 exit_price = price_now
                 profit_usd = (exit_price - entry_price) * orig_qty
-                notify(f"✅ {symbol} imeuzwa 💰 faida≈${profit_usd:.6f}")
+                notify(f"✅ Position closed for {symbol}: exit={exit_price:.8f}, profit≈${profit_usd:.6f}")
                 return True, exit_price, profit_usd
 
             price_delta = price_now - entry_price
@@ -1225,22 +1223,12 @@ def monitor_and_roll(symbol, qty, entry_price, f):
             can_roll = (now_ts - last_roll_ts) >= ROLL_COOLDOWN_SECONDS
 
             if ((near_trigger and moved_enough) or rise_trigger_pct or rise_trigger_abs) and available_for_sell >= f.get('minQty', 0.0) and can_roll:
-                # initialize/refresh roll-tracker for symbol
-                rt = ROLLS_TRACK.get(symbol)
-                if not rt or now_ts - rt['first_ts'] > ROLLS_TRACK_WINDOW:
-                    ROLLS_TRACK[symbol] = {'count': 0, 'first_ts': now_ts, 'last_ts': now_ts}
-                    rt = ROLLS_TRACK[symbol]
-
-                if rt['count'] >= ROLLS_TRACK_MAX:
-                    notify(f"❌ Symbol {symbol} exceeded allowed rolls ({rt['count']}) in window; TEMP skipping {symbol} for {ROLLS_TEMP_SKIP}s.")
-                    TEMP_SKIP[symbol] = time.time() + ROLLS_TEMP_SKIP
-                    continue
-
                 if roll_count >= MAX_ROLLS_PER_POSITION:
-                    notify(f"⚠️ Tumefika idadi ya max rolls ({MAX_ROLLS_PER_POSITION}) kwa {symbol}, hatuta-roll zaidi.")
+                    notify(f"⚠️ Reached max rolls ({MAX_ROLLS_PER_POSITION}) for {symbol}, will not roll further.")
                     last_roll_ts = now_ts
                     continue
-                #trigger notification
+
+                notify(f"🔎 Roll triggered for {symbol}: price={price_now:.8f}, entry={entry_price:.8f}, curr_tp={curr_tp:.8f}, delta={price_delta:.6f} (near={near_trigger},pct={rise_trigger_pct},abs={rise_trigger_abs})")
                 candidate_tp = curr_tp + ROLL_TP_STEP_ABS
                 candidate_sl = curr_sl + ROLL_SL_STEP_ABS
                 if candidate_sl > entry_price:
@@ -1266,7 +1254,6 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                     last_roll_ts = now_ts
                     continue
 
-                # enforce minNotional for roll
                 min_notional = f.get('minNotional')
                 if min_notional:
                     adjust_cnt = 0
@@ -1278,47 +1265,56 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                             new_tp = new_tp + max(1e-8, new_tp * 0.001)
                         adjust_cnt += 1
                     if sell_qty * new_tp < min_notional - 1e-12:
-                        needed_qty = ceil_step(min_notional / new_tp, f.get('stepSize'))
-                        if needed_qty <= available_for_sell + 1e-12 and needed_qty > sell_qty:
-                            notify(f"ℹ️ Increasing sell_qty to {needed_qty} to meet minNotional for roll.")
-                            sell_qty = needed_qty
-                        else:
-                            notify(f"⚠️ Roll aborted: cannot meet minNotional for {symbol} even after TP bumps.")
-                            # increment track so we don't keep retrying immediately
-                            ROLLS_TRACK[symbol]['count'] += 1
-                            ROLLS_TRACK[symbol]['last_ts'] = now_ts
-                            last_roll_ts = now_ts
-                            continue
+                        # cannot meet minNotional for this roll — TEMP skip to avoid repeated tiny attempts
+                        notify(f"⚠️ Roll aborted: cannot meet minNotional for {symbol} even after TP bumps. TEMP skipping {SKIP_SECONDS_ON_SMALL_NOTIONAL}s.")
+                        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_SMALL_NOTIONAL
+                        last_roll_ts = now_ts
+                        continue
 
-                # proceed with rolling; update trackers
-                ROLLS_TRACK[symbol]['count'] += 1
-                ROLLS_TRACK[symbol]['last_ts'] = now_ts
                 last_roll_ts = now_ts
-
                 cancel_all_open_orders(symbol)
                 time.sleep(random.uniform(*ROLL_POST_CANCEL_JITTER))
 
                 oco2 = place_oco_sell(symbol, sell_qty, entry_price,
                                       explicit_tp=new_tp, explicit_sl=new_sl)
                 if oco2:
+                    # success: clear roll-fail history for symbol
+                    ROLL_FAILURES.pop(symbol, None)
                     roll_count += 1
                     last_tp = curr_tp
                     curr_tp = new_tp
                     curr_sl = new_sl
-                    notify(f"🔁 OCO ime-roll 🔥 TP mpya={curr_tp:.8f}, SL mpya={curr_sl:.8f}, qty={sell_qty} (roll {ROLLS_TRACK[symbol]['count']})")
+                    notify(f"🔁 Rolled OCO (abs-step): new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty}")
                 else:
-                    notify("⚠️ Roll failed; old orders cancelled. Protective OCO coming next loop 💥")
-                    time.sleep(0.4)
-                    fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-                    if fallback:
-                        notify("ℹ️ OCO fallback imewekwa tena baada ya roll kushindikana.")
+                    notify("⚠️ Roll attempt failed; previous orders are cancelled. Recording failure.")
+                    # record failure timestamp
+                    arr = ROLL_FAILURES.get(symbol, [])
+                    arr = [ts for ts in arr if now_ts - ts <= ROLL_FAILURE_WINDOW]
+                    arr.append(now_ts)
+                    ROLL_FAILURES[symbol] = arr
+                    if len(arr) >= ROLL_FAILURE_THRESHOLD:
+                        notify(f"⚠️ Detected {len(arr)} OCO failures for {symbol} within window — TEMP skipping for {SKIP_SECONDS_ON_REPEATED_ROLL_FAIL//60}min.")
+                        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_REPEATED_ROLL_FAIL
+                        # stop rolling for this position; try to re-place protective OCO next loop or exit
+                        time.sleep(0.4)
+                        fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+                        if fallback:
+                            notify("ℹ️ Fallback OCO re-placed after multiple failed rolls.")
+                        else:
+                            notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
+                            TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
                     else:
-                        notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
-                        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+                        time.sleep(0.4)
+                        fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+                        if fallback:
+                            notify("ℹ️ Fallback OCO re-placed after failed roll.")
+                        else:
+                            notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
+                            TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-            
+
 # =========================
 # DAILY METRICS (unchanged)
 # =========================
@@ -1348,41 +1344,15 @@ def _notify_daily_stats(date_key):
     profit_val = m['profit']
     profit_str = f"+{profit_val:.2f} USDT" if profit_val >= 0 else f"{profit_val:.2f} USDT"
     notify(
-        f"📊 Mahesabu ya leo ({date_key}):\n\n"
+        f"📊 Stats ya leo ({date_key}):\n\n"
         f"Coins zilizochaguliwa leo: {m['picks']}\n\n"
         f"Zilizofanikiwa (TP/Profit): {m['wins']}\n\n"
         f"Zilizopoteza: {m['losses']}\n\n"
         f"Jumla profit: {profit_str}"
     )
-def daily_stats_scheduler(hour=3, minute=0):
-    try:
-        while True:
-            now = datetime.now()
-            # next run today at hour:minute
-            next_run = datetime(year=now.year, month=now.month, day=now.day, hour=hour, minute=minute, second=0)
-            if next_run <= now:
-                # already past today -> schedule for tomorrow
-                next_run = next_run + timedelta(days=1)
-            sleep_seconds = (next_run - now).total_seconds()
 
-            # sleep until next_run (this can be a long sleep; it's OK in a daemon thread)
-            time.sleep(sleep_seconds)
-
-            # when awakened at scheduled time, compute date_key for "yesterday"
-            try:
-                yesterday = (datetime.now() - timedelta(days=1)).date().isoformat()
-                # call notifier once for yesterday only
-                _notify_daily_stats(yesterday)
-            except Exception as e:
-                notify(f"⚠️ daily_stats_scheduler error while notifying: {e}")
-
-            # small jitter to avoid edge-case double-run if scheduler woke slightly early/late
-            time.sleep(2)
-    except Exception as e:
-        notify(f"⚠️ daily_stats_scheduler fatal error: {e}")
-        
 # -------------------------
-# MAIN TRADE CYCLE (unchanged structure)
+# MAIN TRADE CYCLE
 # -------------------------
 
 ACTIVE_SYMBOL = None
@@ -1402,14 +1372,12 @@ def trade_cycle():
 
             open_orders_global = get_open_orders_cached()
             if open_orders_global:
-                if VERBOSE_NOTIFICATIONS:
-                    notify("⏳ Still waiting for previous trade(s) to finish (open orders present)...")
+                notify("⏳ Still waiting for previous trade(s) to finish (open orders present)...")
                 time.sleep(300)
                 continue
 
             if ACTIVE_SYMBOL is not None:
-                if VERBOSE_NOTIFICATIONS:
-                    notify(f"⏳ Active trade in progress for {ACTIVE_SYMBOL}, skipping new buys.")
+                notify(f"⏳ Active trade in progress for {ACTIVE_SYMBOL}, skipping new buys.")
                 time.sleep(CYCLE_DELAY)
                 continue
 
@@ -1420,18 +1388,16 @@ def trade_cycle():
 
             candidate = pick_coin()
             if not candidate:
-                if VERBOSE_NOTIFICATIONS:
-                    notify("⚠️ No eligible coin found. Sleeping...")
+                notify("⚠️ No eligible coin found. Sleeping...")
                 if RATE_LIMIT_BACKOFF:
-                    if VERBOSE_NOTIFICATIONS:
-                        notify(f"⏸ Backing off due to prior rate-limit for {RATE_LIMIT_BACKOFF}s.")
+                    notify(f"⏸ Backing off due to prior rate-limit for {RATE_LIMIT_BACKOFF}s.")
                     time.sleep(RATE_LIMIT_BACKOFF)
                 else:
                     time.sleep(30)
                 continue
 
             symbol, price, volume, change = candidate
-            notify(f"🎯 Nimechagua {symbol} kununua kwenye market (change 24h={change}%, vol≈{volume})")
+            notify(f"🎯 Selected {symbol} for market buy (24h change={change}%, vol≈{volume})")
 
             last = RECENT_BUYS.get(symbol)
             if last:
@@ -1535,7 +1501,7 @@ def trade_cycle():
             ent = RECENT_BUYS.get(symbol, {})
             ent['ts'] = now2
             ent['price'] = entry_price
-            ent['profit'] = total_profit_usd
+            ent['profit'] = total_profit_usdt = total_profit_usd
             if ent['profit'] is None:
                 ent['cooldown'] = REBUY_COOLDOWN
             elif ent['profit'] < 0:
@@ -1584,12 +1550,8 @@ def start_flask():
 # -------------------------
 # RUN
 # -------------------------
+
 if __name__ == "__main__":
-    # start trade loop
     bot_thread = threading.Thread(target=trade_cycle, daemon=True)
     bot_thread.start()
-
-    # start daily stats scheduler (3:00 local time)
-    daily_thread = threading.Thread(target=daily_stats_scheduler, daemon=True)
-    daily_thread.start()
     start_flask()
