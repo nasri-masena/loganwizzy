@@ -30,7 +30,7 @@ MIN_VOLUME = 500_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.6
-RECENT_PCT_MAX = 5.0            # require recent move between 1%..2%
+RECENT_PCT_MAX = 4.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
 MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
@@ -40,7 +40,7 @@ MOVEMENT_MIN_PCT = 1.0
 
 # picker tuning
 EMA_UPLIFT_MIN_PCT = 0.0008        # fractional uplift threshold (0.001 = 0.1%)
-SCORE_MIN_THRESHOLD = 13.0        # floor score required to accept a candidate
+SCORE_MIN_THRESHOLD = 10.0        # floor score required to accept a candidate
 
 # runtime / pacing
 TRADE_USD = 10.0
@@ -506,21 +506,18 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # PICKER (tweaked)
 # -------------------------
 def pick_coin():
-    """
-    Picker with verbose per-symbol debug explaining why a sampled symbol was skipped.
-    Returns (symbol, price, qvol, change, closes) or None.
-    """
+    
     global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
 
     try:
         t0 = time.time()
         now = t0
 
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 80)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.6)
+        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.4)
 
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD)
@@ -576,8 +573,6 @@ def pick_coin():
             sampled = random.sample(top_pool, DEEP_EVAL)
         else:
             sampled = list(top_pool)
-
-        notify(f"DEBUG pick_coin: tickers={len(tickers)} prefiltered={len(prefiltered)} top_pool={len(top_pool)} sampled={len(sampled)}")
 
         candidates = []
 
@@ -735,18 +730,9 @@ def pick_coin():
                         score = tmp_score
                     except Exception:
                         score = 0.0
-
-                # report debug for this sampled symbol
-                notify(
-                    f"DBG {sym}: price={last_price:.6f} qvol={qvol:.1f} recent_pct={recent_pct:.3f} "
-                    f"vol_ratio={vol_ratio:.3f} vol_f={vol_f:.4f} ema_uplift={ema_uplift if ema_uplift is not None else 'NA'} "
-                    f"rsi={rsi_val if rsi_val is not None else 'NA'} score={score:.2f} reasons={','.join(reasons) if reasons else 'OK'}"
-                )
-
                 # skip if any reason present
                 if reasons:
                     continue
-
                 # passed all checks -> append candidate
                 candidates.append({
                     'symbol': sym,
@@ -772,9 +758,7 @@ def pick_coin():
         best = candidates[0]
 
         took = time.time() - t0
-        notify(f"DEBUG candidate scores: {[ (c['symbol'], round(c['score'],1)) for c in candidates[:6] ]}")
         notify(f"ℹ️ pick_coin finished in {took:.2f}s, evaluated={len(sampled)}, candidates={len(candidates)}, best_score={best.get('score', 0):.2f}")
-
         return (best['symbol'], best['price'], best['qvol'], best['change'], best.get('closes'))
 
     except Exception as e:
