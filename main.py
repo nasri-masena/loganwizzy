@@ -390,21 +390,32 @@ def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
         return None
         
 # simple orderbook cache to reduce request weight
-ORDERBOOK_CACHE = {}   # symbol -> (ob, ts)
-ORDERBOOK_CACHE_TTL = 1.0  # seconds
+# thread-safe OPEN_ORDERS cache + helper
+OPEN_ORDERS_LOCK = threading.Lock()
 
-def get_order_book_cached(symbol, limit=5, ttl=ORDERBOOK_CACHE_TTL):
+def get_open_orders_cached(symbol=None):
     now = time.time()
-    ent = ORDERBOOK_CACHE.get((symbol, limit))
-    if ent and now - ent[1] < ttl:
-        return ent[0]
+    with OPEN_ORDERS_LOCK:
+        if OPEN_ORDERS_CACHE.get('data') is not None and now - OPEN_ORDERS_CACHE.get('ts', 0) < OPEN_ORDERS_TTL:
+            data = OPEN_ORDERS_CACHE['data']
+            if symbol:
+                return [o for o in (data or []) if o.get('symbol') == symbol]
+            return data or []
+
     try:
-        ob = client.get_order_book(symbol=symbol, limit=limit)
-        ORDERBOOK_CACHE[(symbol, limit)] = (ob, now)
-        return ob
+        if symbol:
+            data = client.get_open_orders(symbol=symbol)
+        else:
+            data = client.get_open_orders()
+        with OPEN_ORDERS_LOCK:
+            OPEN_ORDERS_CACHE['data'] = data
+            OPEN_ORDERS_CACHE['ts'] = now
+        return data or []
     except Exception as e:
-        # don't notify too loudly here; return None so callers handle it
-        return None
+        notify(f"⚠️ Failed to fetch open orders: {e}")
+        # on failure return last cached (if any) to avoid breaking callers
+        with OPEN_ORDERS_LOCK:
+            return OPEN_ORDERS_CACHE.get('data') or []
         
 # per-symbol price cache
 PER_SYMBOL_PRICE_CACHE = {}  # symbol -> (price, ts)
