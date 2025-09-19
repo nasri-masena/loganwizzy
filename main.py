@@ -26,7 +26,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 2_000_000          # daily quote volume baseline
+MIN_VOLUME = 500_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.6
@@ -43,7 +43,7 @@ EMA_UPLIFT_MIN_PCT = 0.0008        # fractional uplift threshold (0.001 = 0.1%)
 SCORE_MIN_THRESHOLD = 13.0        # floor score required to accept a candidate
 
 # runtime / pacing
-TRADE_USD = 8.0
+TRADE_USD = 10.0
 SLEEP_BETWEEN_CHECKS = 30
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
@@ -53,6 +53,13 @@ TRIGGER_PROXIMITY = 0.06
 STEP_INCREMENT_PCT = 0.02
 BASE_TP_PCT = 2.5
 BASE_SL_PCT = 2.0
+
+# --- Pre-buy / orderbook confirmation config ---
+REQUIRE_ORDERBOOK_BEFORE_BUY = False     # if True, picker requires OB bullish before accepting candidate
+PREBUY_BREAKOUT_MARGIN = 0.0007          # fractional margin above recent highs (0.0007 = 0.07%)
+PREBUY_OB_DEPTH = 5                      # number of orderbook levels to sample for pre-buy check
+PREBUY_MIN_IMBALANCE = 1.08              # minimal bids/asks imbalance (bid_sum / ask_sum) required
+PREBUY_MAX_SPREAD = 1.0                  # max allowed spread (%) at pre-buy confirmation
 
 # micro-take profit
 MICRO_TP_PCT = 1.0
@@ -97,7 +104,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 180
+CACHE_TTL = 240
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -500,23 +507,19 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # -------------------------
 def pick_coin():
     """
-    Faster, stricter picker that returns (symbol, price, qvol, change, closes)
-    - Designed to evaluate fewer symbols (TOP_CANDIDATES small) so it's quick.
+    Picker that performs a lightweight pre-buy confirmation (breakout +/- optional orderbook)
+    before accepting a candidate. Returns (symbol, price, qvol, change, closes) or None.
     """
-    global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
-
-    try:
-        t0 = time.time()
-        now = t0
-
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)   # smaller pool -> faster
-        DEEP_EVAL = globals().get('DEEP_EVAL', 3)              # evaluate fewer deeply
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)   # small throttle
+    global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYSANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        DEEP_EVAL = globals().get('DEEP_EVAL', 3)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.6)    # stricter volume surge
+        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.6)
 
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD)
+
+        REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', False)
 
         tickers = get_tickers_cached() or []
         prefiltered = []
@@ -567,6 +570,8 @@ def pick_coin():
             sampled = random.sample(top_pool, DEEP_EVAL)
         else:
             sampled = list(top_pool)
+
+        notify(f"DEBUG pick_coin: tickers={len(tickers)} prefiltered={len(prefiltered)} top_pool={len(top_pool)} sampled={len(sampled)}")
 
         candidates = []
 
@@ -646,12 +651,11 @@ def pick_coin():
                 if vol_ratio < MIN_VOL_RATIO:
                     continue
 
-                # volatility guard (avoid very choppy coins)
                 vol_f = compute_recent_volatility(closes) or 0.0
                 if vol_f > 0.08:
                     continue
 
-                # require breakout: last close above recent highs (small margin)
+                # require breakout (closes)
                 if len(closes) >= 4:
                     if not (closes[-1] > max(closes[:-1]) * 1.0007):
                         continue
@@ -681,11 +685,16 @@ def pick_coin():
                 if rsi_val is not None and (rsi_val > 65 or rsi_val < 25):
                     continue
 
+                # pre-buy confirmation (breakout already checked; optional orderbook)
                 try:
-                    if not orderbook_bullish(sym, depth=5, min_imbalance=1.06, max_spread_pct=1.2):
+                    if not pre_buy_confirmation(sym, closes, require_breakout=True, require_orderbook=REQUIRE_OB_IN_PICK):
+                        # skip candidate if pre-buy check fails
                         continue
                 except Exception:
                     continue
+
+                # final orderbook sanity if REQUIRE_OB_IN_PICK is False but we still want some OB check:
+                # (kept minimal to avoid extra weight) - currently skipped
 
                 score = 0.0
                 score += max(0.0, recent_pct) * 12.0
@@ -723,6 +732,7 @@ def pick_coin():
         best = candidates[0]
 
         took = time.time() - t0
+        notify(f"DEBUG candidate scores: {[ (c['symbol'], round(c['score'],1)) for c in candidates[:6] ]}")
         notify(f"ℹ️ pick_coin finished in {took:.2f}s, evaluated={len(sampled)}, candidates={len(candidates)}, best_score={best.get('score', 0):.2f}")
 
         return (best['symbol'], best['price'], best['qvol'], best['change'], best.get('closes'))
