@@ -517,7 +517,7 @@ def pick_coin():
 
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.04)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.25)
 
