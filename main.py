@@ -507,8 +507,8 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # -------------------------
 def pick_coin():
     """
-    Picker that performs a lightweight pre-buy confirmation (breakout +/- optional orderbook)
-    before accepting a candidate. Returns (symbol, price, qvol, change, closes) or None.
+    Picker with verbose per-symbol debug explaining why a sampled symbol was skipped.
+    Returns (symbol, price, qvol, change, closes) or None.
     """
     global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
 
@@ -611,6 +611,7 @@ def pick_coin():
             try:
                 time.sleep(REQUEST_SLEEP)
 
+                # fetch klines
                 try:
                     klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
                 except Exception as e:
@@ -620,9 +621,11 @@ def pick_coin():
                         RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
                         notify(f"⚠️ Rate limit while fetching klines for {sym}: {err}. Backing off {RATE_LIMIT_BACKOFF}s.")
                         return None
+                    notify(f"DEBUG {sym}: klines fetch failed: {err}")
                     continue
 
                 if not klines or len(klines) < 4:
+                    notify(f"DEBUG {sym}: insufficient klines ({len(klines) if klines else 0})")
                     continue
 
                 closes = []
@@ -641,8 +644,10 @@ def pick_coin():
                         vols.append(0.0)
 
                 if not closes or len(closes) < 3:
+                    notify(f"DEBUG {sym}: insufficient closes ({len(closes)})")
                     continue
 
+                # compute metrics
                 recent_vol = vols[-1]
                 prev_avg = (sum(vols[:-1]) / max(1, len(vols[:-1]))) if len(vols) > 1 else recent_vol
                 vol_ratio = recent_vol / (prev_avg + 1e-12)
@@ -651,21 +656,39 @@ def pick_coin():
                 if len(closes) >= 4 and closes[-4] > 0:
                     recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
 
-                if recent_pct < RECENT_PCT_MIN or recent_pct > RECENT_PCT_MAX:
-                    continue
-
-                if vol_ratio < MIN_VOL_RATIO:
-                    continue
-
                 vol_f = compute_recent_volatility(closes) or 0.0
+
+                # EMAs / breakout / RSI
+                short_period = 3
+                long_period = 10
+                short_ema = ema_local(closes[-short_period:], short_period) if len(closes) >= short_period else None
+                long_ema = ema_local(closes[-long_period:], long_period) if len(closes) >= long_period else ema_local(closes, max(len(closes), 1))
+                ema_uplift = None
+                if short_ema is not None and long_ema is not None:
+                    ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
+
+                rsi_val = compute_rsi_local(closes, period=14)
+
+                # orderbook quick check (only if required in pick)
+                ob_ok = None
+                if REQUIRE_OB_IN_PICK:
+                    try:
+                        ob_ok = orderbook_bullish(sym, depth=5, min_imbalance=1.06, max_spread_pct=1.2)
+                    except Exception:
+                        ob_ok = False
+
+                # gather fail reasons
+                reasons = []
+                if recent_pct < RECENT_PCT_MIN:
+                    reasons.append(f"recent_pct<{RECENT_PCT_MIN:.3f} ({recent_pct:.3f})")
+                if recent_pct > RECENT_PCT_MAX:
+                    reasons.append(f"recent_pct>{RECENT_PCT_MAX:.3f} ({recent_pct:.3f})")
+                if vol_ratio < MIN_VOL_RATIO:
+                    reasons.append(f"vol_ratio<{MIN_VOL_RATIO:.2f} ({vol_ratio:.2f})")
                 if vol_f > 0.08:
-                    continue
-
-                # require breakout (closes)
-                if len(closes) >= 4:
-                    if not (closes[-1] > max(closes[:-1]) * 1.0007):
-                        continue
-
+                    reasons.append(f"volatility_high ({vol_f:.4f})")
+                if len(closes) >= 4 and not (closes[-1] > max(closes[:-1]) * (1.0 + PREBUY_BREAKOUT_MARGIN if 'PREBUY_BREAKOUT_MARGIN' in globals() else 0.0007)):
+                    reasons.append("no_breakout")
                 last3 = closes[-3:]
                 ups = 0
                 if len(last3) >= 2 and last3[1] > last3[0]:
@@ -673,44 +696,58 @@ def pick_coin():
                 if len(last3) >= 3 and last3[2] > last3[1]:
                     ups += 1
                 if ups < 1:
-                    continue
-
-                short_period = 3
-                long_period = 10
-                short_ema = ema_local(closes[-short_period:], short_period) if len(closes) >= short_period else None
-                long_ema = ema_local(closes[-long_period:], long_period) if len(closes) >= long_period else ema_local(closes, max(len(closes), 1))
-                if short_ema is None or long_ema is None:
-                    continue
-                ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-                if ema_uplift < EMA_UPLIFT_MIN * 1.2:
-                    continue
-                if not (short_ema > long_ema * 1.0005):
-                    continue
-
-                rsi_val = compute_rsi_local(closes, period=14)
+                    reasons.append("not_enough_recent_ups")
+                if ema_uplift is None:
+                    reasons.append("ema_na")
+                else:
+                    if ema_uplift < EMA_UPLIFT_MIN * 1.2:
+                        reasons.append(f"ema_uplift_low ({ema_uplift:.6f} < {EMA_UPLIFT_MIN*1.2:.6f})")
+                    if not (short_ema > long_ema * 1.0005):
+                        reasons.append("ema_not_above")
                 if rsi_val is not None and (rsi_val > 65 or rsi_val < 25):
-                    continue
+                    reasons.append(f"rsi_bad ({rsi_val:.1f})")
+                if REQUIRE_OB_IN_PICK and not ob_ok:
+                    reasons.append("orderbook_not_bullish")
 
-                # pre-buy confirmation (breakout already checked; optional orderbook)
-                try:
-                    if not pre_buy_confirmation(sym, closes, require_breakout=True, require_orderbook=REQUIRE_OB_IN_PICK):
-                        # skip candidate if pre-buy check fails
-                        continue
-                except Exception:
-                    continue
-
+                # compute score only if basic checks passed (so we can log score too)
                 score = 0.0
-                score += max(0.0, recent_pct) * 12.0
-                score += math.log1p(qvol) * 0.5
-                score += (vol_ratio - 1.0) * 8.0
-                score += ema_uplift * 100.0
-                if rsi_val is not None:
-                    score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
-                score += max(0.0, change_pct) * 0.6
+                if not reasons:
+                    score += max(0.0, recent_pct) * 12.0
+                    score += math.log1p(qvol) * 0.5
+                    score += (vol_ratio - 1.0) * 8.0
+                    score += (ema_uplift or 0.0) * 100.0
+                    if rsi_val is not None:
+                        score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
+                    score += max(0.0, change_pct) * 0.6
+                    if score < SCORE_MIN:
+                        reasons.append(f"score<{SCORE_MIN:.1f} ({score:.2f})")
+                else:
+                    # for debug, still compute rough score to show why it failed margins
+                    try:
+                        tmp_score = 0.0
+                        tmp_score += max(0.0, recent_pct) * 12.0
+                        tmp_score += math.log1p(qvol) * 0.5
+                        tmp_score += (vol_ratio - 1.0) * 8.0
+                        tmp_score += (ema_uplift or 0.0) * 100.0
+                        if rsi_val is not None:
+                            tmp_score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
+                        tmp_score += max(0.0, change_pct) * 0.6
+                        score = tmp_score
+                    except Exception:
+                        score = 0.0
 
-                if score < SCORE_MIN:
+                # report debug for this sampled symbol
+                notify(
+                    f"DBG {sym}: price={last_price:.6f} qvol={qvol:.1f} recent_pct={recent_pct:.3f} "
+                    f"vol_ratio={vol_ratio:.3f} vol_f={vol_f:.4f} ema_uplift={ema_uplift if ema_uplift is not None else 'NA'} "
+                    f"rsi={rsi_val if rsi_val is not None else 'NA'} score={score:.2f} reasons={','.join(reasons) if reasons else 'OK'}"
+                )
+
+                # skip if any reason present
+                if reasons:
                     continue
 
+                # passed all checks -> append candidate
                 candidates.append({
                     'symbol': sym,
                     'price': last_price,
