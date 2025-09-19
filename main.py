@@ -26,7 +26,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 1_000_000          # daily quote volume baseline
+MIN_VOLUME = 2_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.6
@@ -39,8 +39,8 @@ MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
 MOVEMENT_MIN_PCT = 1.0
 
 # picker tuning
-EMA_UPLIFT_MIN_PCT = 0.001        # fractional uplift threshold (0.001 = 0.1%)
-SCORE_MIN_THRESHOLD = 15.0        # floor score required to accept a candidate
+EMA_UPLIFT_MIN_PCT = 0.0008        # fractional uplift threshold (0.001 = 0.1%)
+SCORE_MIN_THRESHOLD = 13.0        # floor score required to accept a candidate
 
 # runtime / pacing
 TRADE_USD = 8.0
