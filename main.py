@@ -24,13 +24,13 @@ CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
 # price / liquidity filters
-PRICE_MIN = 0.9
-PRICE_MAX = 4.0
-MIN_VOLUME = 2_000_000          # daily quote volume baseline
+PRICE_MIN = 0.8
+PRICE_MAX = 3.0
+MIN_VOLUME = 1_000_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
-RECENT_PCT_MIN = 0.8
-RECENT_PCT_MAX = 3.0            # require recent move between 1%..2%
+RECENT_PCT_MIN = 0.6
+RECENT_PCT_MAX = 5.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
 MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
@@ -97,7 +97,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 300
+CACHE_TTL = 120
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -509,11 +509,11 @@ def pick_coin():
         t0 = time.time()
         now = t0
 
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 30)   # smaller pool -> faster
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 80)   # smaller pool -> faster
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)              # evaluate fewer deeply
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)   # small throttle
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.8)    # stricter volume surge
+        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.6)    # stricter volume surge
 
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD)
