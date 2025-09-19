@@ -104,7 +104,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 240
+CACHE_TTL = 300
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -513,11 +513,11 @@ def pick_coin():
         t0 = time.time()
         now = t0
 
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 80)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.4)
+        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.25)
 
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD)
