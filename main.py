@@ -194,7 +194,7 @@ def format_qty(qty: float, step: float) -> str:
             return str(math.floor(qty))
         except Exception:
             return "0"
-            
+
 def round_step(n, step):
     try:
         if not step or step == 0:
@@ -233,7 +233,7 @@ def safe_api_call(func):
             notify(f"⚠️ Unexpected API error in {func.__name__}: {e}")
             raise
     return wrapper
-    
+
 # -------------------------
 # BALANCES / FILTERS
 # -------------------------
@@ -364,7 +364,7 @@ def pre_buy_confirmation(symbol, closes, require_breakout=True, require_orderboo
         return True
     except Exception:
         return False
-        
+
 # -------------------------
 # CACHES & UTIL
 # -------------------------
@@ -388,35 +388,24 @@ def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
     except Exception as e:
         notify(f"⚠️ Failed to fetch symbol info for {symbol}: {e}")
         return None
+        
+# simple orderbook cache to reduce request weight
+ORDERBOOK_CACHE = {}   # symbol -> (ob, ts)
+ORDERBOOK_CACHE_TTL = 1.0  # seconds
 
-# Thread-safe OPEN_ORDERS_CACHE access
-OPEN_ORDERS_LOCK = threading.Lock()
-
-def get_open_orders_cached(symbol=None):
-    """
-    Thread-safe cached open orders fetch.
-    """
+def get_order_book_cached(symbol, limit=5, ttl=ORDERBOOK_CACHE_TTL):
     now = time.time()
-    with OPEN_ORDERS_LOCK:
-        if OPEN_ORDERS_CACHE.get('data') is not None and now - OPEN_ORDERS_CACHE.get('ts', 0) < OPEN_ORDERS_TTL:
-            data = OPEN_ORDERS_CACHE['data']
-            if symbol:
-                return [o for o in (data or []) if o.get('symbol') == symbol]
-            return data or []
+    ent = ORDERBOOK_CACHE.get((symbol, limit))
+    if ent and now - ent[1] < ttl:
+        return ent[0]
     try:
-        if symbol:
-            data = client.get_open_orders(symbol=symbol)
-        else:
-            data = client.get_open_orders()
-        with OPEN_ORDERS_LOCK:
-            OPEN_ORDERS_CACHE['data'] = data
-            OPEN_ORDERS_CACHE['ts'] = now
-        return data or []
+        ob = client.get_order_book(symbol=symbol, limit=limit)
+        ORDERBOOK_CACHE[(symbol, limit)] = (ob, now)
+        return ob
     except Exception as e:
-        notify(f"⚠️ Failed to fetch open orders: {e}")
-        with OPEN_ORDERS_LOCK:
-            return OPEN_ORDERS_CACHE.get('data') or []
-            
+        # don't notify too loudly here; return None so callers handle it
+        return None
+        
 # per-symbol price cache
 PER_SYMBOL_PRICE_CACHE = {}  # symbol -> (price, ts)
 PRICE_CACHE_TTL = 2.0  # seconds
@@ -471,7 +460,7 @@ def get_price_cached(symbol):
     except Exception as e:
         notify(f"⚠️ get_price_cached fallback failed for {symbol}: {e}")
         return None
-        
+
 def cleanup_temp_skip():
     now = time.time()
     for s, until in list(TEMP_SKIP.items()):
@@ -506,7 +495,9 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # PICKER (tweaked)
 # -------------------------
 def pick_coin():
-    
+    """
+    Cleaner picker (no per-symbol debug). Returns (symbol, price, qvol, change, closes) or None.
+    """
     global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
 
     try:
@@ -606,7 +597,6 @@ def pick_coin():
             try:
                 time.sleep(REQUEST_SLEEP)
 
-                # fetch klines
                 try:
                     klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
                 except Exception as e:
@@ -616,11 +606,9 @@ def pick_coin():
                         RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
                         notify(f"⚠️ Rate limit while fetching klines for {sym}: {err}. Backing off {RATE_LIMIT_BACKOFF}s.")
                         return None
-                    notify(f"DEBUG {sym}: klines fetch failed: {err}")
                     continue
 
                 if not klines or len(klines) < 4:
-                    notify(f"DEBUG {sym}: insufficient klines ({len(klines) if klines else 0})")
                     continue
 
                 closes = []
@@ -639,10 +627,8 @@ def pick_coin():
                         vols.append(0.0)
 
                 if not closes or len(closes) < 3:
-                    notify(f"DEBUG {sym}: insufficient closes ({len(closes)})")
                     continue
 
-                # compute metrics
                 recent_vol = vols[-1]
                 prev_avg = (sum(vols[:-1]) / max(1, len(vols[:-1]))) if len(vols) > 1 else recent_vol
                 vol_ratio = recent_vol / (prev_avg + 1e-12)
@@ -653,37 +639,11 @@ def pick_coin():
 
                 vol_f = compute_recent_volatility(closes) or 0.0
 
-                # EMAs / breakout / RSI
-                short_period = 3
-                long_period = 10
-                short_ema = ema_local(closes[-short_period:], short_period) if len(closes) >= short_period else None
-                long_ema = ema_local(closes[-long_period:], long_period) if len(closes) >= long_period else ema_local(closes, max(len(closes), 1))
-                ema_uplift = None
-                if short_ema is not None and long_ema is not None:
-                    ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
+                # require breakout (closes)
+                if len(closes) >= 4:
+                    if not (closes[-1] > max(closes[:-1]) * (1.0 + PREBUY_BREAKOUT_MARGIN)):
+                        continue
 
-                rsi_val = compute_rsi_local(closes, period=14)
-
-                # orderbook quick check (only if required in pick)
-                ob_ok = None
-                if REQUIRE_OB_IN_PICK:
-                    try:
-                        ob_ok = orderbook_bullish(sym, depth=5, min_imbalance=1.06, max_spread_pct=1.2)
-                    except Exception:
-                        ob_ok = False
-
-                # gather fail reasons
-                reasons = []
-                if recent_pct < RECENT_PCT_MIN:
-                    reasons.append(f"recent_pct<{RECENT_PCT_MIN:.3f} ({recent_pct:.3f})")
-                if recent_pct > RECENT_PCT_MAX:
-                    reasons.append(f"recent_pct>{RECENT_PCT_MAX:.3f} ({recent_pct:.3f})")
-                if vol_ratio < MIN_VOL_RATIO:
-                    reasons.append(f"vol_ratio<{MIN_VOL_RATIO:.2f} ({vol_ratio:.2f})")
-                if vol_f > 0.08:
-                    reasons.append(f"volatility_high ({vol_f:.4f})")
-                if len(closes) >= 4 and not (closes[-1] > max(closes[:-1]) * (1.0 + PREBUY_BREAKOUT_MARGIN if 'PREBUY_BREAKOUT_MARGIN' in globals() else 0.0007)):
-                    reasons.append("no_breakout")
                 last3 = closes[-3:]
                 ups = 0
                 if len(last3) >= 2 and last3[1] > last3[0]:
@@ -691,49 +651,43 @@ def pick_coin():
                 if len(last3) >= 3 and last3[2] > last3[1]:
                     ups += 1
                 if ups < 1:
-                    reasons.append("not_enough_recent_ups")
-                if ema_uplift is None:
-                    reasons.append("ema_na")
-                else:
-                    if ema_uplift < EMA_UPLIFT_MIN * 1.2:
-                        reasons.append(f"ema_uplift_low ({ema_uplift:.6f} < {EMA_UPLIFT_MIN*1.2:.6f})")
-                    if not (short_ema > long_ema * 1.0005):
-                        reasons.append("ema_not_above")
-                if rsi_val is not None and (rsi_val > 65 or rsi_val < 25):
-                    reasons.append(f"rsi_bad ({rsi_val:.1f})")
-                if REQUIRE_OB_IN_PICK and not ob_ok:
-                    reasons.append("orderbook_not_bullish")
-
-                # compute score only if basic checks passed (so we can log score too)
-                score = 0.0
-                if not reasons:
-                    score += max(0.0, recent_pct) * 12.0
-                    score += math.log1p(qvol) * 0.5
-                    score += (vol_ratio - 1.0) * 8.0
-                    score += (ema_uplift or 0.0) * 100.0
-                    if rsi_val is not None:
-                        score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
-                    score += max(0.0, change_pct) * 0.6
-                    if score < SCORE_MIN:
-                        reasons.append(f"score<{SCORE_MIN:.1f} ({score:.2f})")
-                else:
-                    # for debug, still compute rough score to show why it failed margins
-                    try:
-                        tmp_score = 0.0
-                        tmp_score += max(0.0, recent_pct) * 12.0
-                        tmp_score += math.log1p(qvol) * 0.5
-                        tmp_score += (vol_ratio - 1.0) * 8.0
-                        tmp_score += (ema_uplift or 0.0) * 100.0
-                        if rsi_val is not None:
-                            tmp_score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
-                        tmp_score += max(0.0, change_pct) * 0.6
-                        score = tmp_score
-                    except Exception:
-                        score = 0.0
-                # skip if any reason present
-                if reasons:
                     continue
-                # passed all checks -> append candidate
+
+                short_period = 3
+                long_period = 10
+                short_ema = ema_local(closes[-short_period:], short_period) if len(closes) >= short_period else None
+                long_ema = ema_local(closes[-long_period:], long_period) if len(closes) >= long_period else ema_local(closes, max(len(closes), 1))
+                if short_ema is None or long_ema is None:
+                    continue
+                ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
+                if ema_uplift < EMA_UPLIFT_MIN * 1.2:
+                    continue
+                if not (short_ema > long_ema * 1.0005):
+                    continue
+
+                rsi_val = compute_rsi_local(closes, period=14)
+                if rsi_val is not None and (rsi_val > 65 or rsi_val < 25):
+                    continue
+
+                # optional lightweight pre-buy confirmation inside picker
+                try:
+                    if not pre_buy_confirmation(sym, closes, require_breakout=True, require_orderbook=REQUIRE_OB_IN_PICK):
+                        continue
+                except Exception:
+                    continue
+
+                score = 0.0
+                score += max(0.0, recent_pct) * 12.0
+                score += math.log1p(qvol) * 0.5
+                score += (vol_ratio - 1.0) * 8.0
+                score += ema_uplift * 100.0
+                if rsi_val is not None:
+                    score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
+                score += max(0.0, change_pct) * 0.6
+
+                if score < SCORE_MIN:
+                    continue
+
                 candidates.append({
                     'symbol': sym,
                     'price': last_price,
@@ -759,6 +713,7 @@ def pick_coin():
 
         took = time.time() - t0
         notify(f"ℹ️ pick_coin finished in {took:.2f}s, evaluated={len(sampled)}, candidates={len(candidates)}, best_score={best.get('score', 0):.2f}")
+
         return (best['symbol'], best['price'], best['qvol'], best['change'], best.get('closes'))
 
     except Exception as e:
@@ -949,7 +904,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
     except Exception:
         pass
     return executed_qty, avg_price
-    
+
 # -------------------------
 # Micro TP helper (unchanged mostly)
 # -------------------------
@@ -1116,7 +1071,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-            
+
 # -------------------------
 # SAFE SELL FALLBACK (market)
 # -------------------------
@@ -1352,7 +1307,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
     notify("❌ All attempts to protect position failed (no TP/SL placed). TEMP skipping symbol.")
     TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
     return None
-    
+
 # -------------------------
 # CANCEL HELPERS (updated)
 # -------------------------
@@ -1403,7 +1358,7 @@ def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
         notify(f"⚠️ Failed to cancel orders: {e}")
         result['errors'] += 1
     return result
-    
+
 # -------------------------
 # MONITOR & ROLL (mostly same but sell_qty recompute after cancel)
 # -------------------------
@@ -1570,7 +1525,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-            
+
 # =========================
 # DAILY METRICS (unchanged)
 # =========================
@@ -1840,7 +1795,7 @@ def trade_cycle():
             time.sleep(CYCLE_DELAY)
 
         time.sleep(CYCLE_DELAY)
-        
+
 # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
