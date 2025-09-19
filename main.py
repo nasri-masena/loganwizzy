@@ -26,7 +26,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 1000_000          # daily quote volume baseline
+MIN_VOLUME = 500_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.6
@@ -510,7 +510,13 @@ def pick_coin():
     Picker that performs a lightweight pre-buy confirmation (breakout +/- optional orderbook)
     before accepting a candidate. Returns (symbol, price, qvol, change, closes) or None.
     """
-    global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYSANDIDATES = globals().get('TOP_CANDIDATES', 60)
+    global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
+
+    try:
+        t0 = time.time()
+        now = t0
+
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
@@ -692,9 +698,6 @@ def pick_coin():
                         continue
                 except Exception:
                     continue
-
-                # final orderbook sanity if REQUIRE_OB_IN_PICK is False but we still want some OB check:
-                # (kept minimal to avoid extra weight) - currently skipped
 
                 score = 0.0
                 score += max(0.0, recent_pct) * 12.0
