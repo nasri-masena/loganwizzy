@@ -722,8 +722,7 @@ def pick_coin():
         best = candidates[0]
 
         took = time.time() - t0
-        notify(f"ℹ️ pick_coin finished in {took:.2f}s, evaluated={len(sampled)}, candidates={len(candidates)}, best_score={best.get('score', 0):.2f}")
-
+        
         return (best['symbol'], best['price'], best['qvol'], best['change'], best.get('closes'))
 
     except Exception as e:
