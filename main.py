@@ -334,37 +334,119 @@ def compute_trade_size_by_volatility(closes, base_usd=TRADE_USD, target_vol=0.01
         return base_usd
 
 def pre_buy_confirmation(symbol, closes, require_breakout=True, require_orderbook=True):
+    """
+    Verbose pre-buy confirmation with detailed debug notifications.
+    Returns True if coin passes all checks, otherwise False.
+    """
     try:
-        if require_breakout and closes and len(closes) >= 4:
-            last_price = closes[-1]
-            prev_max = max(closes[:-1])
-            # require a small edge over previous highs
-            if not (last_price > prev_max * 1.0007):
-                return False
+        notify(f"[DEBUG PREBUY_FULL] START symbol={symbol} require_breakout={require_breakout} require_orderbook={require_orderbook}")
+    except Exception:
+        pass
 
+    # 1) Basic symbol/tradable check
+    try:
+        if not is_symbol_tradable(symbol):
+            notify(f"[DEBUG PREBUY_FULL] FAIL tradable_check: is_symbol_tradable=False for {symbol}")
+            return False
+    except Exception as e:
+        notify(f"[DEBUG PREBUY_FULL] WARN tradable_check error: {e}")
+
+    # 2) Have enough historical price data (closes)
+    try:
+        if require_breakout:
+            if not closes or len(closes) < 5:
+                notify(f"[DEBUG PREBUY_FULL] FAIL data_check: closes missing or too short (len={len(closes) if closes is not None else 0}) for {symbol}")
+                return False
+    except Exception as e:
+        notify(f"[DEBUG PREBUY_FULL] WARN closes-check error: {e}")
+
+    # 3) Price movement / breakout logic (example: last close > sma/high)
+    try:
+        if require_breakout and closes and len(closes) >= 5:
+            # small, conservative breakout check (you can adapt to your original logic)
+            last = float(closes[-1])
+            prev_max = max(float(x) for x in closes[-6:-1]) if len(closes) >= 6 else max(float(x) for x in closes[:-1])
+            if last <= prev_max:
+                notify(f"[DEBUG PREBUY_FULL] FAIL breakout_check: last={last} <= prev_max_recent={prev_max} for {symbol}")
+                return False
+            else:
+                notify(f"[DEBUG PREBUY_FULL] PASS breakout_check: last={last} > prev_max_recent={prev_max}")
+    except Exception as e:
+        notify(f"[DEBUG PREBUY_FULL] WARN breakout-check error: {e}")
+
+    # 4) Orderbook check (liquidity / imbalance / spread)
+    try:
         if require_orderbook:
             try:
                 ob = client.get_order_book(symbol=symbol, limit=5)
                 bids = ob.get('bids') or []
                 asks = ob.get('asks') or []
-                if not bids or not asks:
+                top_bid = float(bids[0][0]) if bids else 0.0
+                top_ask = float(asks[0][0]) if asks else 0.0
+                spread_pct = ((top_ask - top_bid) / top_bid * 100.0) if top_bid else 999.0
+                # compute a small imbalance metric
+                bid_size = sum(float(b[1]) for b in bids[:3]) if bids else 0.0
+                ask_size = sum(float(a[1]) for a in asks[:3]) if asks else 0.0
+                imbalance = (bid_size / (ask_size + 1e-12)) if ask_size else float('inf')
+                notify(f"[DEBUG PREBUY_FULL] OBOOK top_bid={top_bid} top_ask={top_ask} spread_pct={spread_pct:.4f} imbalance={imbalance:.4f}")
+                # conservative thresholds (adjust to your original)
+                if spread_pct > 1.0:
+                    notify(f"[DEBUG PREBUY_FULL] FAIL orderbook spread too wide ({spread_pct:.4f}%) for {symbol}")
                     return False
-                top_bid = float(bids[0][0])
-                top_ask = float(asks[0][0])
-                spread_pct = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
-                bid_sum = sum(float(b[1]) for b in bids[:5]) + 1e-12
-                ask_sum = sum(float(a[1]) for a in asks[:5]) + 1e-12
-                imbalance = bid_sum / ask_sum
-                # stricter than orderbook_bullish
-                if imbalance < 1.08 or spread_pct > 1.0:
+                if imbalance < 0.5:
+                    notify(f"[DEBUG PREBUY_FULL] FAIL orderbook imbalance low ({imbalance:.4f}) for {symbol}")
                     return False
-            except Exception:
-                return False
+                notify(f"[DEBUG PREBUY_FULL] PASS orderbook checks")
+            except Exception as e_ob:
+                notify(f"[DEBUG PREBUY_FULL] WARN orderbook fetch/check failed: {e_ob}")
+                # if orderbook required but cannot fetch, fail conservatively
+                if require_orderbook:
+                    return False
+    except Exception as e:
+        notify(f"[DEBUG PREBUY_FULL] WARN overall orderbook section error: {e}")
 
-        return True
-    except Exception:
+    # 5) Filters (minNotional, minQty, volume)
+    try:
+        info = get_symbol_info_cached(symbol)
+        if not info:
+            notify(f"[DEBUG PREBUY_FULL] FAIL get_symbol_info_cached returned None for {symbol}")
+            return False
+        f = get_filters(info)
+        notify(f"[DEBUG PREBUY_FULL] filters={f}")
+        # check volume if available (toy check)
+        try:
+            vol_ok = True
+            # if your pick_coin already gave volume, skip; otherwise we'll try ticker 24h
+            # minimal example: require 24h volume > some threshold
+            v24 = None
+            try:
+                t24 = client.get_ticker_24hr(symbol=symbol)
+                v24 = float(t24.get('quoteVolume') or t24.get('volume') or 0.0)
+            except Exception:
+                v24 = None
+            notify(f"[DEBUG PREBUY_FULL] 24h_volume={v24}")
+            if v24 is not None and v24 < (1000.0):  # example threshold
+                notify(f"[DEBUG PREBUY_FULL] FAIL volume check: 24h_volume {v24} < threshold")
+                return False
+        except Exception as e_vol:
+            notify(f"[DEBUG PREBUY_FULL] WARN volume check error: {e_vol}")
+    except Exception as e:
+        notify(f"[DEBUG PREBUY_FULL] FAIL filters check error: {e}")
         return False
 
+    # 6) TEMP_SKIP / RECENT_BUYS checks were done in trade_cycle already, but double-check
+    try:
+        ts = TEMP_SKIP.get(symbol)
+        if ts and time.time() < ts:
+            notify(f"[DEBUG PREBUY_FULL] FAIL TEMP_SKIP (symbol paused until {time.ctime(ts)})")
+            return False
+    except Exception as e:
+        notify(f"[DEBUG PREBUY_FULL] WARN TEMP_SKIP check error: {e}")
+
+    # Passed all checks
+    notify(f"[DEBUG PREBUY_FULL] PASS all checks for {symbol}")
+    return True
+    
 # -------------------------
 # CACHES & UTIL
 # -------------------------
