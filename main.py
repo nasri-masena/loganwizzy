@@ -816,45 +816,57 @@ def pick_coin():
 # -------------------------
 def _parse_market_buy_exec(order_resp):
     """
-    Parse market buy response to return (executed_qty, avg_price).
-    Handles multiple client response shapes.
+    Robust parsing of market buy response. Returns (executed_qty (base), avg_price) or (None, None).
     """
     try:
         if not order_resp:
             return None, None
-        if isinstance(order_resp, dict):
-            try:
-                exec_qty = order_resp.get('executedQty') or order_resp.get('transactQty') or None
-                if exec_qty:
-                    cumm = order_resp.get('cummulativeQuoteQty') or order_resp.get('cumQuote') or None
-                    if cumm:
-                        try:
-                            return float(exec_qty), float(cumm) / float(exec_qty)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            fills = order_resp.get('fills') or []
-            if fills:
-                total_qty = 0.0
-                total_quote = 0.0
-                for f in fills:
-                    q = float(f.get('qty') or f.get('executedQty') or 0)
-                    p = float(f.get('price') or 0)
-                    total_qty += q
-                    total_quote += q * p
-                if total_qty > 0:
-                    return total_qty, (total_quote / total_qty)
-            if 'fills' in order_resp and not fills:
+
+        # Try common direct fields first
+        try:
+            exec_qty = order_resp.get('executedQty') or order_resp.get('transactQty') or None
+            if exec_qty is not None:
+                exec_qty = float(exec_qty)
+            cumm = order_resp.get('cummulativeQuoteQty') or order_resp.get('cumQuote') or None
+            if cumm is not None and exec_qty:
                 try:
-                    import json as _json
-                    fills_js = _json.loads(order_resp.get('fills') or '[]')
-                    total_qty = sum(float(x.get('qty', 0)) for x in fills_js)
-                    total_quote = sum(float(x.get('qty', 0)) * float(x.get('price', 0)) for x in fills_js)
-                    if total_qty:
-                        return total_qty, (total_quote / total_qty)
+                    cumm_f = float(cumm)
+                    return float(exec_qty), (cumm_f / float(exec_qty))
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+        # Try fills list (preferred)
+        fills = order_resp.get('fills') or []
+        if fills:
+            total_qty = 0.0
+            total_quote = 0.0
+            for f in fills:
+                try:
+                    q = float(f.get('qty') or f.get('executedQty') or 0)
+                    p = float(f.get('price') or 0)
+                except Exception:
+                    q = 0.0
+                    p = 0.0
+                total_qty += q
+                total_quote += q * p
+            if total_qty > 0:
+                return total_qty, (total_quote / total_qty)
+
+        # If fills is present as a JSON string, try to parse it
+        if 'fills' in order_resp and not fills:
+            try:
+                import json as _json
+                fills_js = _json.loads(order_resp.get('fills') or '[]')
+                total_qty = sum(float(x.get('qty', 0)) for x in fills_js)
+                total_quote = sum(float(x.get('qty', 0)) * float(x.get('price', 0)) for x in fills_js)
+                if total_qty > 0:
+                    return total_qty, (total_quote / total_qty)
+            except Exception:
+                pass
+
+        # Fallback: cummulative parsing
         try:
             exec_qty = float(order_resp.get('executedQty') or order_resp.get('transactQty') or 0)
             quote = float(order_resp.get('cummulativeQuoteQty') or order_resp.get('cumQuote') or 0)
@@ -862,6 +874,7 @@ def _parse_market_buy_exec(order_resp):
                 return exec_qty, (quote / exec_qty)
         except Exception:
             pass
+
     except Exception:
         pass
     return None, None
@@ -887,7 +900,6 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False, f
         return None, None
     f = get_filters(info)
 
-    # Optional orderbook check
     if require_orderbook:
         try:
             if not orderbook_bullish(symbol, depth=5, min_imbalance=1.1, max_spread_pct=0.6):
@@ -896,7 +908,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False, f
         except Exception as e:
             notify(f"⚠️ Orderbook check error for {symbol}: {e}")
 
-    # Get or verify price
+    # fetch current price
     price = get_price_cached(symbol)
     if price is None:
         try:
@@ -921,56 +933,65 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False, f
         notify(f"❌ Invalid price type for {symbol}: {price}")
         return None, None
 
-    # Debug preflight
-    try:
-        free_quote = get_free_usdt()
-    except Exception:
-        free_quote = get_free_asset(QUOTE) if 'get_free_asset' in globals() else 0.0
-    notify(f"[BUY_PREFLIGHT] symbol={symbol} price={price:.8f} want_usd={usd_amount:.8f} free_{QUOTE}={free_quote:.8f}")
-
+    # preflight: check free quote balance (USDT)
+    free_quote = get_free_asset(QUOTE)
     needed_est = float(usd_amount) * (1.0 + fee_buffer)
+    notify(f"[BUY_PREFLIGHT] {symbol} price={price:.8f} want_usd={usd_amount:.8f} free_{QUOTE}={free_quote:.8f} need≈{needed_est:.8f}")
+
     if free_quote + 1e-9 < needed_est:
         notify(f"❌ Aborting market buy for {symbol}: insufficient {QUOTE}. free={free_quote:.8f} need≈{needed_est:.8f}")
         return None, None
 
-    # Estimate base qty
+    # compute qty estimate (base asset) for minNotional enforcement if needed
     qty_est = float(usd_amount) / price
     if f.get('minQty'):
         qty_est = max(qty_est, f.get('minQty', 0.0))
 
-    # Try quoteOrderQty first (preferred)
+    min_notional = f.get('minNotional')
     order_resp = None
     used_quote_order = False
-    time.sleep(random.uniform(0.02, 0.12))
+
+    # --- try quoteOrderQty first, but ALWAYS fallback to base-qty on ANY error ---
     try:
         payload = {'symbol': symbol, 'side': 'BUY', 'type': 'MARKET', 'quoteOrderQty': str(round(float(usd_amount), 8))}
         notify(f"[BUY_ATTEMPT] trying quoteOrderQty payload={payload}")
         try:
             order_resp = client.create_order(**payload)
-        except Exception:
-            # some client libs expose order_market_buy with quoteOrderQty param
-            order_resp = client.order_market_buy(symbol=symbol, quoteOrderQty=str(round(float(usd_amount), 8)))
-        used_quote_order = True
+        except Exception as e1:
+            try:
+                order_resp = client.order_market_buy(symbol=symbol, quoteOrderQty=str(round(float(usd_amount), 8)))
+            except Exception as e2:
+                notify(f"⚠️ quoteOrderQty market buy failed for {symbol}: create_order err={e1} fallback err={e2}")
+                order_resp = None
+
+        if order_resp:
+            used_quote_order = True
     except Exception as e:
-        err = str(e)
-        notify(f"⚠️ quoteOrderQty market buy failed for {symbol}: {err}")
-        if '-2010' in err and 'insufficient' in err.lower():
-            TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
-            notify(f"⏸ Market buy insufficient balance for {symbol}. TEMP skipping.")
-            return None, None
-        if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
-            RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
-                                    RATE_LIMIT_BACKOFF_MAX)
-            TEMP_SKIP[symbol] = time.time() + max(60, RATE_LIMIT_BACKOFF or RATE_LIMIT_BASE_SLEEP)
-            notify(f"❗ Rate-limit while placing market buy (quoteOrderQty): backing off {RATE_LIMIT_BACKOFF}s; TEMP skipping {symbol}.")
-            return None, None
+        notify(f"⚠️ Unexpected error in quoteOrderQty attempt for {symbol}: {e}")
         order_resp = None
 
-    # If quoteOrderQty failed, fallback to base qty flow
+    # If quoteOrderQty didn't work, FALLBACK to base qty path (don't abort)
     if order_resp is None:
+        notify(f"[BUY_FALLBACK] quoteOrderQty failed or unsupported for {symbol}; trying base-qty flow.")
+        notify(f"[BUY_INFO] symbol filters: {f}")
         step = f.get('stepSize', 0.0)
-        qty_base = round_step(qty_est, step)
-        min_notional = f.get('minNotional')
+        qty_base = float(qty_est)
+
+        # floor (round_step) but if floor -> 0, try ceil if funds allow
+        if step and step > 0:
+            qty_floor = round_step(qty_base, step)
+            if qty_floor <= 0:
+                qty_ceil = ceil_step(qty_base, step)
+                if qty_ceil * price <= free_quote * (1.0 + 1e-6):
+                    qty_base = qty_ceil
+                    notify(f"[BUY_FIX] floor->0, using ceil qty={qty_base}")
+                else:
+                    notify(f"[BUY_FAIL] floor->0 and insufficient funds to ceil for {symbol}")
+                    return None, None
+            else:
+                qty_base = qty_floor
+
+        # enforce minNotional with ceil if needed
         if min_notional:
             notional = qty_base * price
             if notional + 1e-12 < min_notional:
@@ -991,41 +1012,45 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False, f
             notify(f"[BUY_ATTEMPT] trying base-qty market buy: symbol={symbol}, quantity={qty_str}")
             try:
                 order_resp = client.create_order(symbol=symbol, side='BUY', type='MARKET', quantity=qty_str)
-            except Exception:
-                order_resp = client.order_market_buy(symbol=symbol, quantity=qty_str)
+            except Exception as e:
+                try:
+                    order_resp = client.order_market_buy(symbol=symbol, quantity=qty_str)
+                except Exception as e2:
+                    notify(f"❌ Market buy failed for {symbol}: create_order err={e} fallback err={e2}")
+                    # check for common errors and TEMP skip
+                    if '-2010' in str(e).lower() or '-2010' in str(e2).lower():
+                        TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
+                        notify(f"⏸ Insufficient balance for market buy (base qty). TEMP skipping {symbol}.")
+                    if '-1003' in str(e).lower() or 'too much request weight' in str(e).lower():
+                        RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
+                                                RATE_LIMIT_BACKOFF_MAX)
+                        TEMP_SKIP[symbol] = time.time() + max(60, RATE_LIMIT_BACKOFF or RATE_LIMIT_BASE_SLEEP)
+                        notify(f"❗ Rate-limit while placing market buy (base qty): backing off {RATE_LIMIT_BACKOFF}s and TEMP skipping {symbol}.")
+                    return None, None
         except Exception as e:
-            err = str(e)
-            notify(f"❌ Market buy failed for {symbol}: {err}")
-            if '-2010' in err and 'insufficient' in err.lower():
-                TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
-                notify(f"⏸ Insufficient balance for market buy (base qty). TEMP skipping {symbol}.")
-            if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
-                RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
-                                        RATE_LIMIT_BACKOFF_MAX)
-                TEMP_SKIP[symbol] = time.time() + max(60, RATE_LIMIT_BACKOFF or RATE_LIMIT_BASE_SLEEP)
-                notify(f"❗ Rate-limit while placing market buy (base qty): backing off {RATE_LIMIT_BACKOFF}s and TEMP skipping {symbol}.")
+            notify(f"❌ Unexpected market-buy error for {symbol}: {e}")
             return None, None
 
-    # Parse execution
+    # Parse executed qty and average price
     executed_qty, avg_price = None, None
     try:
         executed_qty, avg_price = _parse_market_buy_exec(order_resp)
     except Exception:
-        try:
-            fills = order_resp.get('fills') or []
-            executed_qty = sum(float(f.get('qty') or f.get('executedQty') or 0) for f in fills)
-            total_quote = sum(float(f.get('qty') or 0) * float(f.get('price') or 0) for f in fills)
-            avg_price = (total_quote / executed_qty) if executed_qty else price
-        except Exception:
-            executed_qty = None
-            avg_price = None
+        executed_qty, avg_price = None, None
 
-    # allow balances to update
-    time.sleep(0.6)
+    # Poll balances a bit to let them settle, then reconcile
     asset = symbol[:-len(QUOTE)]
+    max_wait = 3.0
+    waited = 0.0
+    poll_interval = 0.4
     free_after = get_free_asset(asset)
-    free_after_clip = round_step(free_after, f.get('stepSize', 0.0))
+    while waited < max_wait and (free_after is None or free_after <= 0):
+        time.sleep(poll_interval)
+        waited += poll_interval
+        free_after = get_free_asset(asset)
+    free_after_clip = round_step(free_after or 0.0, f.get('stepSize', 0.0))
 
+    # If parsed executed_qty is missing or differs substantially from balance change, reconcile
     if free_after_clip >= f.get('minQty', 0.0) and (not executed_qty or executed_qty <= 0 or abs(free_after_clip - (executed_qty or 0)) / ((executed_qty or 1) + 1e-9) > 0.02):
         notify(f"ℹ️ Adjusting executed qty from parsed {executed_qty} to actual free balance {free_after_clip}")
         executed_qty = free_after_clip
@@ -1037,6 +1062,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False, f
         notify(f"❌ Executed quantity too small after reconciliation for {symbol}: {executed_qty}")
         return None, None
 
+    # very small leftover check
     if free_after_clip < max(1e-8, executed_qty * 0.5):
         notify(f"⚠️ After buy free balance {free_after_clip} is much smaller than expected executed {executed_qty}. Skipping symbol for a while.")
         TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
@@ -1559,25 +1585,14 @@ def trade_cycle():
     global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS, RATE_LIMIT_BACKOFF
 
     if start_balance_usdt is None:
-        try:
-            start_balance_usdt = get_free_usdt()
-        except Exception:
-            start_balance_usdt = 0.0
+        start_balance_usdt = get_free_usdt()
         notify(f"🔰 Start balance snapshot: ${start_balance_usdt:.6f}")
 
     while True:
         try:
-            # --- housekeeping ---
             cleanup_recent_buys()
 
-            # Debug: top-level state each loop iteration
-            try:
-                open_orders_global = get_open_orders_cached()
-                notify(f"[DEBUG LOOP] ACTIVE_SYMBOL={ACTIVE_SYMBOL} LAST_BUY_TS={LAST_BUY_TS:.1f} RATE_LIMIT_BACKOFF={RATE_LIMIT_BACKOFF} open_orders_global_count={len(open_orders_global) if open_orders_global is not None else 'N/A'}")
-            except Exception as e:
-                notify(f"[DEBUG LOOP] failed to fetch open_orders_global: {e}")
-                open_orders_global = get_open_orders_cached()
-
+            open_orders_global = get_open_orders_cached()
             if open_orders_global:
                 notify("⏳ Still waiting for previous trade(s) to finish (open orders present)...")
                 time.sleep(300)
@@ -1590,14 +1605,10 @@ def trade_cycle():
 
             now = time.time()
             if now - LAST_BUY_TS < BUY_LOCK_SECONDS:
-                # debug small note
-                notify(f"[DEBUG LOCK] Skipping due to BUY_LOCK_SECONDS: now-LAST_BUY_TS={(now - LAST_BUY_TS):.1f}s < {BUY_LOCK_SECONDS}")
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # --- candidate selection ---
             candidate = pick_coin()
-            notify(f"[DEBUG PICK] raw candidate={candidate}")
             if not candidate:
                 notify("⚠️ No eligible coin found. Sleeping...")
                 if RATE_LIMIT_BACKOFF:
@@ -1607,7 +1618,7 @@ def trade_cycle():
                     time.sleep(30)
                 continue
 
-            # normalize candidate tuple
+            # pick_coin may return 4-tuple or 5-tuple (with closes)
             symbol = price = volume = change = None
             closes = None
             try:
@@ -1617,6 +1628,7 @@ def trade_cycle():
                     elif len(candidate) == 4:
                         symbol, price, volume, change = candidate
                     else:
+                        # fallback: try unpack first 4
                         symbol, price, volume, change = tuple(candidate)[:4]
                 else:
                     notify(f"⚠️ Unexpected candidate format: {candidate}")
@@ -1634,23 +1646,12 @@ def trade_cycle():
             try:
                 if closes:
                     usd_to_buy = compute_trade_size_by_volatility(closes, base_usd=TRADE_USD)
-            except Exception as e:
-                notify(f"[DEBUG TRADE_SIZE] compute_trade_size_by_volatility failed: {e}")
-                usd_to_buy = TRADE_USD
-
-            # Debug: candidate details & pre-checks
-            try:
-                notify(f"[DEBUG CANDIDATE] symbol={symbol} price={price} volume={volume} change={change} closes_len={len(closes) if closes is not None else 0} usd_to_buy={usd_to_buy:.6f}")
             except Exception:
-                notify(f"[DEBUG CANDIDATE] symbol={symbol} usd_to_buy={usd_to_buy:.6f}")
+                usd_to_buy = TRADE_USD
 
             # quick pre-buy confirmation to avoid stale picks
             try:
-                # debug call to pre_buy_confirmation
-                notify(f"[DEBUG PREBUY_CALL] calling pre_buy_confirmation for {symbol} (require_breakout=True, require_orderbook=True)")
-                pre_ok = pre_buy_confirmation(symbol, closes, require_breakout=True, require_orderbook=True)
-                notify(f"[DEBUG PREBUY_RESULT] {symbol} -> {pre_ok}")
-                if not pre_ok:
+                if not pre_buy_confirmation(symbol, closes, require_breakout=True, require_orderbook=True):
                     notify(f"⏭️ Pre-buy confirmation failed for {symbol} (stale/orderbook). Skipping.")
                     time.sleep(CYCLE_DELAY)
                     continue
@@ -1659,48 +1660,25 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # RECENT_BUYS cooldown checks
             last = RECENT_BUYS.get(symbol)
             if last:
                 if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
                     notify(f"⏭️ Skipping {symbol} due to recent buy cooldown.")
                     time.sleep(CYCLE_DELAY)
                     continue
-                if last.get('price') and price and price > last['price'] * (1 + REBUY_MAX_RISE_PCT / 100.0):
+                if last.get('price') and price > last['price'] * (1 + REBUY_MAX_RISE_PCT / 100.0):
                     notify(f"⏭️ Skipping {symbol} because price rose >{REBUY_MAX_RISE_PCT}% since last buy.")
                     time.sleep(CYCLE_DELAY)
                     continue
 
-            # Balance / sizing preflight
-            try:
-                free_usdt = get_free_usdt()
-            except Exception:
-                free_usdt = 0.0
-            notify(f"[DEBUG BALANCE] free_usdt={free_usdt:.6f} usd_to_buy(before min)={usd_to_buy:.6f}")
+            free_usdt = get_free_usdt()
             usd_to_buy = min(usd_to_buy, free_usdt)
-            notify(f"[DEBUG BALANCE] usd_to_buy(after min)={usd_to_buy:.6f}")
-
             if usd_to_buy < 1.0:
                 notify(f"⚠️ Not enough USDT to buy (free={free_usdt:.4f}). Sleeping...")
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # Debug: fetch symbol info & filters before placing buy
             try:
-                info_dbg = get_symbol_info_cached(symbol)
-                notify(f"[DEBUG SYMINFO] info_present={bool(info_dbg)}")
-                if info_dbg:
-                    f_dbg = get_filters(info_dbg)
-                    notify(f"[DEBUG SYMINFO] filters={f_dbg}")
-            except Exception as e:
-                notify(f"[DEBUG SYMINFO] failed to get symbol info: {e}")
-
-            # DEBUG: show TEMP_SKIP for symbol and global RATE_LIMIT_BACKOFF
-            notify(f"[DEBUG SKIP] TEMP_SKIP_for_symbol={TEMP_SKIP.get(symbol)} RATE_LIMIT_BACKOFF={RATE_LIMIT_BACKOFF}")
-
-            # final buy attempt (wrapped with debug)
-            try:
-                notify(f"[DEBUG BUY] Attempting market buy: symbol={symbol} usd_to_buy={usd_to_buy:.6f} require_orderbook=True")
                 buy_res = place_safe_market_buy(symbol, usd_to_buy, require_orderbook=True)
             except Exception as e:
                 err = str(e)
@@ -1727,8 +1705,7 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # record recent buy (debug)
-            notify(f"[DEBUG POSTBUY] Bought {symbol}: qty={qty} entry_price={entry_price:.8f}")
+            # record recent buy
             RECENT_BUYS[symbol] = {'ts': time.time(), 'price': entry_price, 'profit': None, 'cooldown': REBUY_COOLDOWN}
 
             info = get_symbol_info_cached(symbol)
@@ -1739,7 +1716,6 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # Micro TP attempt
             micro_order, micro_sold_qty, micro_tp_price = None, 0.0, None
             try:
                 micro_order, micro_sold_qty, micro_tp_price = place_micro_tp(symbol, qty, entry_price, f)
@@ -1758,11 +1734,10 @@ def trade_cycle():
                 _notify_daily_stats(date_key)
                 continue
 
-            # Mark active and monitor
             ACTIVE_SYMBOL = symbol
             LAST_BUY_TS = time.time()
 
-            # invalidate OPEN_ORDERS_CACHE safely
+            # invalidate OPEN_ORDERS_CACHE safely if possible
             try:
                 with OPEN_ORDERS_LOCK:
                     OPEN_ORDERS_CACHE['data'] = None
@@ -1811,6 +1786,7 @@ def trade_cycle():
             date_key, m = _update_metrics_for_profit(total_profit_usd)
             _notify_daily_stats(date_key)
 
+            # send profit only when closed and profit positive
             if closed and total_profit_usd and total_profit_usd > 0:
                 send_profit_to_funding(total_profit_usd)
 
@@ -1831,7 +1807,8 @@ def trade_cycle():
             time.sleep(CYCLE_DELAY)
 
         time.sleep(CYCLE_DELAY)
-        
+
+
 # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
