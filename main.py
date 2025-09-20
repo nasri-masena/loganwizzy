@@ -42,7 +42,7 @@ EMA_UPLIFT_MIN_PCT = 0.001        # fractional uplift threshold (0.001 = 0.1%)
 SCORE_MIN_THRESHOLD = 10.0        # floor score required to accept a candidate
 
 # runtime / pacing
-TRADE_USD = 10.0
+TRADE_USD = 7.0
 SLEEP_BETWEEN_CHECKS = 30
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
