@@ -55,7 +55,7 @@ BASE_TP_PCT = 2.5
 BASE_SL_PCT = 2.0
 
 # --- Pre-buy / orderbook confirmation config ---
-REQUIRE_ORDERBOOK_BEFORE_BUY = False     # if True, picker requires OB bullish before accepting candidate
+REQUIRE_ORDERBOOK_BEFORE_BUY = True     # if True, picker requires OB bullish before accepting candidate
 PREBUY_BREAKOUT_MARGIN = 0.0007          # fractional margin above recent highs (0.0007 = 0.07%)
 PREBUY_OB_DEPTH = 5                      # number of orderbook levels to sample for pre-buy check
 PREBUY_MIN_IMBALANCE = 1.08              # minimal bids/asks imbalance (bid_sum / ask_sum) required
