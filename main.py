@@ -363,7 +363,7 @@ def pick_coin():
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)             # reduced from 8
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.03) # reduced from 0.10
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.25)
+        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.4)
 
         # use config constants defined at top
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT)
