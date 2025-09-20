@@ -361,9 +361,9 @@ def pick_coin():
         # load tunables (use top-level values if present, otherwise safe defaults)
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)   # reduced from 60 for speed
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)             # reduced from 8
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.03) # reduced from 0.10
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.05) # reduced from 0.10
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.4)
+        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.8)
 
         # use config constants defined at top
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT)
