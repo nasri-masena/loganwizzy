@@ -239,11 +239,15 @@ def notify_orderbook_snapshot(symbol, depth=5):
         ob = client.get_order_book(symbol=symbol, limit=depth)
         bids = ob.get('bids', [])[:5]
         asks = ob.get('asks', [])[:5]
-        s = f"OB SNAP {symbol} | bids(top5): " + ", ".join([f\"{p}@{q}\" for p,q in bids]) \
-            + " || asks(top5): " + ", ".join([f\"{p}@{q}\" for p,q in asks])
+        bids_str = ", ".join([f"{p}@{q}" for p, q in bids])
+        asks_str = ", ".join([f"{p}@{q}" for p, q in asks])
+        s = f"OB SNAP {symbol} | bids(top5): {bids_str} || asks(top5): {asks_str}"
         notify(s)
     except Exception as e:
-        notify(f"[DEBUG] get_order_book error for {symbol}: {e}")
+        try:
+            notify(f"[DEBUG] get_order_book error for {symbol}: {e}")
+        except Exception:
+            pass
         
 # -------------------------
 # BALANCES / FILTERS
