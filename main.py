@@ -44,6 +44,7 @@ SCORE_MIN_THRESHOLD = 10.0        # floor score required to accept a candidate
 
 # runtime / pacing
 TRADE_USD = 10.0
+DEFAULT_USD_PER_TRADE = 8.0
 SLEEP_BETWEEN_CHECKS = 30
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
@@ -289,7 +290,7 @@ def get_trade_candidates():
         return []
 
     score_data = {
-        'usd': globals().get('DEFAULT_USD_PER_TRADE', TRADE_USD if 'TRADE_USD' in globals() else 5.0),
+        'usd': globals().get('DEFAULT_USD_PER_TRADE', TRADE_USD if 'TRADE_USD' in globals() else 8.0),
         'price': price,
         'qvol': qvol,
         'change': change,
