@@ -25,7 +25,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.9
 PRICE_MAX = 4.0
-MIN_VOLUME = 800_000          # daily quote volume baseline
+MIN_VOLUME = 500_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.8
