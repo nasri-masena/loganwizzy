@@ -57,9 +57,9 @@ BASE_SL_PCT = 2.0
 # --- Pre-buy / orderbook confirmation config ---
 REQUIRE_ORDERBOOK_BEFORE_BUY = False     # if True, picker requires OB bullish before accepting candidate
 PREBUY_BREAKOUT_MARGIN = 0.0007          # fractional margin above recent highs (0.0007 = 0.07%)
-PREBUY_OB_DEPTH = 10                      # number of orderbook levels to sample for pre-buy check
-PREBUY_MIN_IMBALANCE = 1.01             # minimal bids/asks imbalance (bid_sum / ask_sum) required
-PREBUY_MAX_SPREAD = 2.0                  # max allowed spread (%) at pre-buy confirmation
+PREBUY_OB_DEPTH = 20                     # number of orderbook levels to sample for pre-buy check
+PREBUY_MIN_IMBALANCE = 1.001            # minimal bids/asks imbalance (bid_sum / ask_sum) required
+PREBUY_MAX_SPREAD = 3.0                  # max allowed spread (%) at pre-buy confirmation
 
 # micro-take profit
 MICRO_TP_PCT = 1.0
@@ -1736,7 +1736,7 @@ BUY_LOCK_SECONDS = 30
 
 # Safety/testing flags (change only for debugging locally)
 DRY_RUN = True              # True = do not place real orders, only simulate
-BYPASS_PREBUY = False       # True = ignore pre_buy_confirmation result (for testing)
+BYPASS_PREBUY = True       # True = ignore pre_buy_confirmation result (for testing)
 FORCE_NO_ORDERBOOK = False  # True = bypass orderbook checks inside place_safe_market_buy wrapper if needed
 
 def trade_cycle():
@@ -1943,7 +1943,7 @@ def trade_cycle():
             pre_ok = False
             pre_exc = None
             try:
-                pre_ok = pre_buy_confirmation(symbol, closes, require_breakout=True, require_orderbook=True)
+                pre_ok = pre_buy_confirmation(symbol, closes, require_breakout=False, require_orderbook=True)
             except Exception as e:
                 pre_exc = str(e)
                 pre_ok = False
