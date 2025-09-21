@@ -1736,7 +1736,7 @@ BUY_LOCK_SECONDS = 30
 
 # Safety/testing flags (change only for debugging locally)
 DRY_RUN = True              # True = do not place real orders, only simulate
-BYPASS_PREBUY = True       # True = ignore pre_buy_confirmation result (for testing)
+BYPASS_PREBUY = False       # True = ignore pre_buy_confirmation result (for testing)
 FORCE_NO_ORDERBOOK = False  # True = bypass orderbook checks inside place_safe_market_buy wrapper if needed
 
 def trade_cycle():
