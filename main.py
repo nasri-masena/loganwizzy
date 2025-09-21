@@ -1729,7 +1729,7 @@ def _notify_daily_stats(date_key):
 # -------------------------
 # MAIN TRADE CYCLE (unchanged structure)
 # -------------------------
-# --- Replace your trade_cycle() with this updated-debug-friendly version ---
+# ---- Replace your trade_cycle() with this updated version ----
 ACTIVE_SYMBOL = None
 LAST_BUY_TS = 0.0
 BUY_LOCK_SECONDS = 30
@@ -1737,8 +1737,8 @@ BUY_LOCK_SECONDS = 30
 def trade_cycle():
     global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS, RATE_LIMIT_BACKOFF
 
-    # safe defaults (use existing globals if present)
-    CYCLE_DELAY = globals().get('CYCLE_DELAY', 8)
+    # safe defaults (use your globals if present)
+    CYCLE_DELAY = globals().get('CYCLE_DELAY', 30)
     REBUY_COOLDOWN = globals().get('REBUY_COOLDOWN', 3600)
     TRADE_USD = globals().get('TRADE_USD', globals().get('DEFAULT_USD_PER_TRADE', 5.0))
     PREBUY_OB_DEPTH = globals().get('PREBUY_OB_DEPTH', 5)
@@ -1747,16 +1747,16 @@ def trade_cycle():
     RATE_LIMIT_BASE_SLEEP = globals().get('RATE_LIMIT_BASE_SLEEP', 30)
     RATE_LIMIT_BACKOFF_MAX = globals().get('RATE_LIMIT_BACKOFF_MAX', 600)
 
-    # testing flags (keep DRY_RUN=True until ready)
+    # behavior flags
     DRY_RUN = globals().get('DRY_RUN', False)
     BYPASS_PREBUY = globals().get('BYPASS_PREBUY', False)
 
-    # ensure helpers exist
+    # ensure structures exist
     globals().setdefault('RECENT_BUYS', {})
     globals().setdefault('TEMP_SKIP', {})
-    globals().setdefault('BLOCKLIST', [])
+    globals().setdefault('BLOCKLIST', {})
 
-    # initial snapshot
+    # snapshot start balance once
     if start_balance_usdt is None:
         try:
             start_balance_usdt = get_free_usdt()
@@ -1769,17 +1769,17 @@ def trade_cycle():
 
     while True:
         try:
+            # housekeeping
             cleanup_recent_buys()
             cleanup_temp_skip()
 
-            # skip if there are open orders globally
+            # open orders / active symbol guard
             open_orders_global = get_open_orders_cached()
             if open_orders_global:
-                notify("⏳ Waiting for open orders to finish... sleeping 300s")
+                notify("⏳ Still waiting for previous trade(s) to finish (open orders present)...")
                 time.sleep(300)
                 continue
 
-            # skip if already monitoring an active symbol
             if ACTIVE_SYMBOL is not None:
                 notify(f"⏳ Active trade in progress for {ACTIVE_SYMBOL}, skipping new buys.")
                 time.sleep(CYCLE_DELAY)
@@ -1794,18 +1794,19 @@ def trade_cycle():
             try:
                 candidate = pick_coin()
             except Exception as e:
-                notify(f"⚠️ pick_coin() failed: {e}")
+                notify(f"⚠️ pick_coin() error: {e}")
                 candidate = None
 
             if not candidate:
                 notify("⚠️ No eligible coin found. Sleeping...")
                 if RATE_LIMIT_BACKOFF:
+                    notify(f"⏸ Backing off due to prior rate-limit for {RATE_LIMIT_BACKOFF}s.")
                     time.sleep(RATE_LIMIT_BACKOFF)
                 else:
                     time.sleep(CYCLE_DELAY)
                 continue
 
-            # unpack candidate (support 4- or 5-tuple)
+            # unpack candidate
             symbol = price = volume = change = None
             closes = None
             try:
@@ -1825,66 +1826,63 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # skip blocked or temporarily skipped symbols
+            # skip blocklist / temp skip
             if symbol in globals().get('BLOCKLIST', []):
-                notify(f"⏭️ {symbol} in BLOCKLIST. Skipping.")
+                notify(f"⏭️ {symbol} in BLOCKLIST, skipping.")
                 time.sleep(CYCLE_DELAY)
                 continue
             if globals().get('TEMP_SKIP', {}).get(symbol, 0) > time.time():
-                notify(f"⏭️ {symbol} temporarily skipped (TEMP_SKIP).")
+                notify(f"⏭️ {symbol} temporarily skipped by TEMP_SKIP.")
                 time.sleep(CYCLE_DELAY)
                 continue
 
             notify(f"🎯 Selected {symbol} for potential buy (24h change={change}%, vol≈{volume})")
 
-            # --- EARLY DEBUG: price, balance, filters, qty estimate ---
+            # --- quick pre-buy basic info ---
             try:
                 estimated_price = price or get_price_cached(symbol) or 0.0
-            except Exception as e:
+            except Exception:
                 estimated_price = 0.0
-                notify(f"[DEBUG] get_price_cached error for {symbol}: {e}")
 
             try:
                 free_usdt = get_free_usdt()
-            except Exception as e:
+            except Exception:
                 free_usdt = 0.0
-                notify(f"[DEBUG] get_free_usdt error: {e}")
 
-            # fetch filters safely
+            # get symbol filters
             f = {}
             try:
                 info = get_symbol_info_cached(symbol)
                 f = get_filters(info) if info else {}
-            except Exception as e:
-                notify(f"[DEBUG] get_filters error for {symbol}: {e}")
+            except Exception:
                 f = {}
 
-            # compute usd_to_buy
+            # compute base usd_to_buy (volatility-aware if closes present)
             usd_to_buy = TRADE_USD
             try:
                 if closes:
                     usd_to_buy = compute_trade_size_by_volatility(closes, base_usd=usd_to_buy)
             except Exception:
-                usd_to_buy = usd_to_buy
+                pass
+
+            # cap by available free_usdt
             usd_to_buy = min(usd_to_buy, free_usdt)
 
-            # qty estimate + rounding
+            # estimate qty & notional
             qty_est = qty_rounded = notional = None
+            step = float(f.get('stepSize')) if f.get('stepSize') else 0.0
             try:
                 if estimated_price and usd_to_buy:
                     qty_est = usd_to_buy / estimated_price
-                    if f and f.get('stepSize'):
-                        try:
-                            qty_rounded = round_step(qty_est, float(f.get('stepSize')))
-                        except Exception:
-                            qty_rounded = float("{:.8f}".format(qty_est))
+                    if step:
+                        qty_rounded = round_step(qty_est, step)
                     else:
                         qty_rounded = float("{:.8f}".format(qty_est))
                     notional = qty_rounded * estimated_price
-            except Exception as e:
-                notify(f"[DEBUG] qty estimation error for {symbol}: {e}")
+            except Exception:
+                pass
 
-            # parse minNotional/minQty
+            # parse filters
             min_notional = None
             min_qty = None
             try:
@@ -1896,7 +1894,93 @@ def trade_cycle():
 
             notify(f"[DEBUG] pre-buy quick: price={estimated_price}, free_usdt={free_usdt:.6f}, usd_to_buy={usd_to_buy:.6f}, qty_est={qty_est}, qty_rounded={qty_rounded}, notional={notional}, min_notional={min_notional}, min_qty={min_qty}, filters_present={bool(f)}")
 
-            # show orderbook snapshot if helper exists (non-blocking)
+            # -----------------------------
+            # Auto-bump logic to satisfy filters (minNotional / minQty)
+            # -----------------------------
+            bumped = False
+            # 1) If notional < min_notional, try to bump qty/usd to meet min_notional
+            if min_notional and (notional is None or notional + 1e-12 < min_notional):
+                # compute minimal qty satisfying min_notional after rounding
+                try:
+                    needed_qty = ceil_step(min_notional / (estimated_price or 1.0), step)
+                except Exception:
+                    needed_qty = None
+
+                if needed_qty:
+                    needed_usd = needed_qty * (estimated_price or 0.0)
+                    # check if we have funds to bump
+                    if needed_usd <= free_usdt + 1e-9:
+                        qty_rounded = needed_qty
+                        usd_to_buy = min(needed_usd, free_usdt)
+                        notional = qty_rounded * (estimated_price or 0.0)
+                        bumped = True
+                        notify(f"ℹ️ Auto-bumped buy for {symbol} to meet minNotional: qty->{qty_rounded}, notional->{notional:.6f}, usd_to_buy->{usd_to_buy:.6f}")
+                    else:
+                        notify(f"⚠️ Cannot meet minNotional for {symbol}: need ${needed_usd:.6f}, free_usdt=${free_usdt:.6f} -> skipping")
+                        time.sleep(CYCLE_DELAY)
+                        continue
+                else:
+                    # fallback: if free_usdt already >= min_notional try bumping usd_to_buy to min_notional
+                    if free_usdt >= min_notional - 1e-9:
+                        usd_to_buy = min_notional
+                        try:
+                            qty_est = usd_to_buy / (estimated_price or 1.0)
+                            qty_rounded = ceil_step(qty_est, step) if step else float("{:.8f}".format(qty_est))
+                            notional = qty_rounded * (estimated_price or 0.0)
+                            bumped = True
+                            notify(f"ℹ️ Fallback bumped {symbol} to usd_to_buy={usd_to_buy:.6f}, qty={qty_rounded}, notional={notional:.6f}")
+                        except Exception:
+                            notify(f"⚠️ Fallback bump failed for {symbol}; skipping")
+                            time.sleep(CYCLE_DELAY)
+                            continue
+                    else:
+                        notify(f"⚠️ Cannot compute bump to satisfy minNotional for {symbol}; skipping")
+                        time.sleep(CYCLE_DELAY)
+                        continue
+
+            # 2) If qty < min_qty, try to bump to min_qty (rounded up to step)
+            if min_qty and (qty_rounded is None or qty_rounded + 1e-12 < min_qty):
+                try:
+                    needed_qty2 = ceil_step(min_qty, step) if step else min_qty
+                except Exception:
+                    needed_qty2 = None
+                if needed_qty2:
+                    needed_usd2 = needed_qty2 * (estimated_price or 0.0)
+                    if needed_usd2 <= free_usdt + 1e-9:
+                        qty_rounded = needed_qty2
+                        usd_to_buy = min(needed_usd2, free_usdt)
+                        notional = qty_rounded * (estimated_price or 0.0)
+                        bumped = True
+                        notify(f"ℹ️ Auto-bumped qty for {symbol} to meet minQty: qty->{qty_rounded}, notional->{notional:.6f}")
+                    else:
+                        notify(f"⚠️ Insufficient funds to bump qty to minQty for {symbol}: need ${needed_usd2:.6f}, free_usdt=${free_usdt:.6f} -> skipping")
+                        time.sleep(CYCLE_DELAY)
+                        continue
+
+            # recompute notional if needed
+            try:
+                if qty_rounded and estimated_price:
+                    notional = qty_rounded * estimated_price
+            except Exception:
+                pass
+
+            notify(f"[DEBUG] post-bump: usd_to_buy={usd_to_buy:.6f}, qty_rounded={qty_rounded}, notional={notional}, bumped={bumped}")
+
+            # still ensure final checks
+            if usd_to_buy < 1.0:
+                notify(f"⚠️ Final check: usd_to_buy too small ({usd_to_buy}). Skipping.")
+                time.sleep(CYCLE_DELAY)
+                continue
+            if min_notional and (notional is None or notional + 1e-12 < min_notional):
+                notify(f"⚠️ Final check: notional < minNotional ({notional} < {min_notional}). Skipping.")
+                time.sleep(CYCLE_DELAY)
+                continue
+            if min_qty and (qty_rounded is None or qty_rounded + 1e-12 < min_qty):
+                notify(f"⚠️ Final check: qty < minQty ({qty_rounded} < {min_qty}). Skipping.")
+                time.sleep(CYCLE_DELAY)
+                continue
+
+            # show orderbook snapshot (debug) but do not abort based on it
             try:
                 if 'notify_orderbook_snapshot' in globals():
                     try:
@@ -1906,30 +1990,28 @@ def trade_cycle():
             except Exception:
                 pass
 
-            # ----------------------
-            # Debug block user asked for:
-            # Immediately after orderbook snapshot/check and before pre_buy_confirmation
-            # ----------------------
+            # optionally check orderbook_bullish for info but do not strictly require (you can change)
             try:
-                ob_ok = orderbook_bullish(symbol,
-                                          depth=PREBUY_OB_DEPTH,
-                                          min_imbalance=PREBUY_MIN_IMBALANCE,
-                                          max_spread_pct=PREBUY_MAX_SPREAD)
+                ob_ok = orderbook_bullish(symbol, depth=PREBUY_OB_DEPTH, min_imbalance=PREBUY_MIN_IMBALANCE, max_spread_pct=PREBUY_MAX_SPREAD)
             except Exception as e:
                 ob_ok = f"ERR:{e}"
             notify(f"[DEBUG] orderbook_bullish for {symbol} => {ob_ok}")
 
-            # Run pre_buy_confirmation but make sure its result (or exception) is always printed
-            try:
-                pre_ok = pre_buy_confirmation(symbol, closes, require_breakout=True, require_orderbook=True)
-                notify(f"[DEBUG] pre_buy_confirmation for {symbol} => {pre_ok}")
-            except Exception as e:
-                pre_ok = False
-                notify(f"[DEBUG] pre_buy_confirmation exception for {symbol}: {e}")
+            # run pre_buy_confirmation (if you want to keep it); if BYPASS_PREBUY True, skip
+            pre_ok = True
+            pre_exc = None
+            if not BYPASS_PREBUY:
+                try:
+                    pre_ok = pre_buy_confirmation(symbol, closes, require_breakout=True, require_orderbook=True)
+                    notify(f"[DEBUG] pre_buy_confirmation for {symbol} => {pre_ok}")
+                except Exception as e:
+                    pre_ok = False
+                    pre_exc = str(e)
+                    notify(f"[DEBUG] pre_buy_confirmation exception for {symbol}: {e}")
+            else:
+                notify(f"[DEBUG] BYPASS_PREBUY enabled — skipping pre_buy_confirmation for {symbol}")
 
-            # If pre-buy failed and BYPASS not set, skip
             if not pre_ok and not BYPASS_PREBUY:
-                # assemble likely reasons for quick debugging
                 reasons = []
                 if free_usdt < 1.0:
                     reasons.append(f"low_balance({free_usdt:.4f})")
@@ -1939,42 +2021,24 @@ def trade_cycle():
                     reasons.append(f"qty_too_small({qty_rounded}<{min_qty})")
                 if isinstance(ob_ok, bool) and not ob_ok:
                     reasons.append("orderbook_bad")
-                # include pre_buy exception if present (not part of pre_ok bool)
-                # (we printed exception above already)
+                if pre_exc:
+                    reasons.append(f"pre_exc:{pre_exc}")
                 if not reasons:
                     reasons = ["unknown_prebuy_reject"]
                 notify(f"⏭️ Pre-buy rejected for {symbol}, reasons: {', '.join(reasons)}. Skipping.")
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # cooldown and re-buy checks
+            # cooldown / rebuy guard
             last = globals().get('RECENT_BUYS', {}).get(symbol)
             if last:
                 if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
                     notify(f"⏭️ Skipping {symbol} due to recent buy cooldown.")
                     time.sleep(CYCLE_DELAY)
                     continue
-                if last.get('price') and price and price > last['price'] * (1 + globals().get('REBUY_MAX_RISE_PCT', 2.0)/100.0):
-                    notify(f"⏭️ Skipping {symbol} because price rose > REBUY_MAX_RISE_PCT since last buy.")
-                    time.sleep(CYCLE_DELAY)
-                    continue
-
-            # final quick checks
-            if usd_to_buy < 1.0:
-                notify(f"⚠️ Not enough USDT to buy (free={free_usdt:.4f}). Sleeping...")
-                time.sleep(CYCLE_DELAY)
-                continue
-            if min_notional and (notional is None or notional < min_notional):
-                notify(f"⚠️ Final check: notional < minNotional ({notional} < {min_notional}). Skipping.")
-                time.sleep(CYCLE_DELAY)
-                continue
-            if min_qty and (qty_rounded is None or qty_rounded < min_qty):
-                notify(f"⚠️ Final check: qty < minQty ({qty_rounded} < {min_qty}). Skipping.")
-                time.sleep(CYCLE_DELAY)
-                continue
 
             # READY - show final debug and either simulate or place buy
-            notify(f"[DEBUG] READY to buy {symbol}: usd_to_buy={usd_to_buy:.6f}, qty_est={qty_est}, qty_rounded={qty_rounded}, DRY_RUN={DRY_RUN}")
+            notify(f"[DEBUG] READY to buy {symbol}: usd_to_buy={usd_to_buy:.6f}, qty_rounded={qty_rounded}, notional={notional:.6f}, DRY_RUN={DRY_RUN}")
 
             if DRY_RUN:
                 simulated_qty = qty_rounded or qty_est or 0.0
@@ -1984,12 +2048,11 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # actual market buy
+            # place market buy (place_safe_market_buy will still re-check some stuff but we pass require_orderbook=True for safety)
             try:
                 buy_res = place_safe_market_buy(symbol, usd_to_buy, require_orderbook=True)
             except Exception as e:
                 notify(f"❌ Exception during market buy attempt for {symbol}: {e}")
-                # handle rate-limit/backoff in place_safe_market_buy or here as needed
                 time.sleep(CYCLE_DELAY)
                 continue
 
@@ -2006,15 +2069,46 @@ def trade_cycle():
 
             notify(f"🟢 Bought {symbol}: qty={qty} avg_price={entry_price}")
 
-            # record & continue with monitoring
+            # record buy & continue with existing monitoring
             globals().setdefault('RECENT_BUYS', {})[symbol] = {'ts': time.time(), 'price': entry_price, 'profit': None, 'cooldown': REBUY_COOLDOWN}
             try:
                 info = get_symbol_info_cached(symbol)
                 f = get_filters(info) if info else {}
             except Exception:
                 f = {}
-            # (rest of monitoring/TP/SL as in your script)
-            time.sleep(CYCLE_DELAY)
+
+            # minimal handoff to monitoring - keep your logic if available
+            try:
+                micro_order, micro_sold_qty, micro_tp_price = place_micro_tp(symbol, qty, entry_price, f)
+            except Exception:
+                micro_order, micro_sold_qty, micro_tp_price = None, 0.0, None
+
+            # update ACTIVE_SYMBOL and continue monitoring as usual in your script
+            ACTIVE_SYMBOL = symbol
+            LAST_BUY_TS = time.time()
+
+            # NOTE: if you have monitor_and_roll, call it here; otherwise just loop.
+            try:
+                closed, exit_price, profit_usd = monitor_and_roll(symbol, max(0.0, qty - (micro_sold_qty or 0.0)), entry_price, f)
+            finally:
+                ACTIVE_SYMBOL = None
+
+            # update metrics
+            total_profit_usd = profit_usd or 0.0
+            ent = globals().get('RECENT_BUYS', {}).get(symbol, {})
+            ent['ts'] = time.time()
+            ent['price'] = entry_price
+            ent['profit'] = total_profit_usd
+            if ent.get('profit') is None:
+                ent['cooldown'] = globals().get('REBUY_COOLDOWN', REBUY_COOLDOWN)
+            elif ent.get('profit') < 0:
+                ent['cooldown'] = globals().get('LOSS_COOLDOWN', REBUY_COOLDOWN)
+            else:
+                ent['cooldown'] = globals().get('REBUY_COOLDOWN', REBUY_COOLDOWN)
+            globals().setdefault('RECENT_BUYS', {})[symbol] = ent
+
+            # final housekeeping
+            globals()['RATE_LIMIT_BACKOFF'] = 0
 
         except Exception as e:
             err = str(e)
@@ -2029,8 +2123,8 @@ def trade_cycle():
             time.sleep(CYCLE_DELAY)
 
         time.sleep(CYCLE_DELAY)
-        
-# ---------------- end trade_cycle ----------------
+# ---- end trade_cycle() ----
+
 # # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
