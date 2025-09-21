@@ -32,14 +32,14 @@ RECENT_PCT_MIN = 0.8
 RECENT_PCT_MAX = 3.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
-MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
-MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
+MAX_24H_RISE_PCT = 10.0          # disallow > +5% 24h rise
+MAX_24H_CHANGE_ABS = 20.0        # require abs(24h change) <= 5.0
 
 MOVEMENT_MIN_PCT = 1.0
 
 # picker tuning
-EMA_UPLIFT_MIN_PCT = 0.001        # fractional uplift threshold (0.001 = 0.1%)
-SCORE_MIN_THRESHOLD = 10.0        # floor score required to accept a candidate
+EMA_UPLIFT_MIN_PCT = 0.0008        # fractional uplift threshold (0.001 = 0.1%)
+SCORE_MIN_THRESHOLD = 8.0        # floor score required to accept a candidate
 
 # runtime / pacing
 TRADE_USD = 7.0
@@ -96,7 +96,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 300
+CACHE_TTL = 80
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -435,7 +435,7 @@ def pick_coin():
         # load tunables (use top-level values if present, otherwise safe defaults)
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)   # reduced from 60 for speed
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)             # reduced from 8
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.10) # reduced from 0.10
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02) # reduced from 0.10
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.4)
 
