@@ -39,7 +39,7 @@ MOVEMENT_MIN_PCT = 1.0
 
 # picker tuning
 EMA_UPLIFT_MIN_PCT = 0.0008        # fractional uplift threshold (0.001 = 0.1%)
-SCORE_MIN_THRESHOLD = 8.0        # floor score required to accept a candidate
+SCORE_MIN_THRESHOLD = 10.0        # floor score required to accept a candidate
 
 # runtime / pacing
 TRADE_USD = 7.0
