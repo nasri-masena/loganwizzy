@@ -267,6 +267,36 @@ def get_filters(symbol_info):
         'tickSize': float(pricef['tickSize']) if pricef else 0.0,
         'minNotional': float(min_notional) if min_notional else None
     }
+# --- Compatibility wrapper so trade_cycle can keep using get_trade_candidates() ---
+def get_trade_candidates():
+    """
+    Compatibility wrapper: reuses pick_coin() (which exists in this file)
+    and returns a list of (symbol, score_data) so existing trade_cycle can work unchanged.
+    """
+    try:
+        candidate = pick_coin()
+    except Exception:
+        candidate = None
+
+    if not candidate:
+        return []
+
+    # pick_coin returns (symbol, price, qvol, change, closes)
+    try:
+        symbol, price, qvol, change, closes = candidate
+    except Exception:
+        # fallback in case signature differs
+        return []
+
+    score_data = {
+        'usd': globals().get('DEFAULT_USD_PER_TRADE', TRADE_USD if 'TRADE_USD' in globals() else 5.0),
+        'price': price,
+        'qvol': qvol,
+        'change': change,
+        'closes': closes,
+    }
+    return [(symbol, score_data)]
+    
 # -------------------------
 # TRANSFERS
 # -------------------------
