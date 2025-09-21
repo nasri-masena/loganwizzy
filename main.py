@@ -1647,6 +1647,8 @@ def _notify_daily_stats(date_key):
 ACTIVE_SYMBOL = None
 LAST_BUY_TS = 0.0
 BUY_LOCK_SECONDS = 30
+# List ya symbols usizotaka bot kugusa
+BLOCKLIST = []
 
 def trade_cycle():
     global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS, RATE_LIMIT_BACKOFF
