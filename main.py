@@ -57,9 +57,9 @@ BASE_SL_PCT = 2.0
 # --- Pre-buy / orderbook confirmation config ---
 REQUIRE_ORDERBOOK_BEFORE_BUY = False     # if True, picker requires OB bullish before accepting candidate
 PREBUY_BREAKOUT_MARGIN = 0.0007          # fractional margin above recent highs (0.0007 = 0.07%)
-PREBUY_OB_DEPTH = 5                      # number of orderbook levels to sample for pre-buy check
-PREBUY_MIN_IMBALANCE = 1.08              # minimal bids/asks imbalance (bid_sum / ask_sum) required
-PREBUY_MAX_SPREAD = 1.0                  # max allowed spread (%) at pre-buy confirmation
+PREBUY_OB_DEPTH = 10                      # number of orderbook levels to sample for pre-buy check
+PREBUY_MIN_IMBALANCE = 1.01             # minimal bids/asks imbalance (bid_sum / ask_sum) required
+PREBUY_MAX_SPREAD = 2.0                  # max allowed spread (%) at pre-buy confirmation
 
 # micro-take profit
 MICRO_TP_PCT = 1.0
@@ -234,6 +234,17 @@ def safe_api_call(func):
             raise
     return wrapper
 
+def notify_orderbook_snapshot(symbol, depth=5):
+    try:
+        ob = client.get_order_book(symbol=symbol, limit=depth)
+        bids = ob.get('bids', [])[:5]
+        asks = ob.get('asks', [])[:5]
+        s = f"OB SNAP {symbol} | bids(top5): " + ", ".join([f\"{p}@{q}\" for p,q in bids]) \
+            + " || asks(top5): " + ", ".join([f\"{p}@{q}\" for p,q in asks])
+        notify(s)
+    except Exception as e:
+        notify(f"[DEBUG] get_order_book error for {symbol}: {e}")
+        
 # -------------------------
 # BALANCES / FILTERS
 # -------------------------
@@ -1650,20 +1661,47 @@ LAST_BUY_TS = 0.0
 BUY_LOCK_SECONDS = 30
 
 # Safety/testing flags (change only for debugging locally)
-DRY_RUN = False              # True = do not place real orders, only simulate
+DRY_RUN = True              # True = do not place real orders, only simulate
 BYPASS_PREBUY = False       # True = ignore pre_buy_confirmation result (for testing)
 FORCE_NO_ORDERBOOK = False  # True = bypass orderbook checks inside place_safe_market_buy wrapper if needed
 
 def trade_cycle():
-    global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS, RATE_LIMIT_BACKOFF, DRY_RUN, BYPASS_PREBUY
+    # keep as globals used elsewhere in your script
+    global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS, RATE_LIMIT_BACKOFF
 
+    # safe defaults if some globals missing
+    PREBUY_OB_DEPTH = globals().get('PREBUY_OB_DEPTH', 5)
+    PREBUY_MIN_IMBALANCE = globals().get('PREBUY_MIN_IMBALANCE', 1.02)
+    PREBUY_MAX_SPREAD = globals().get('PREBUY_MAX_SPREAD', 0.6)
+    CYCLE_DELAY = globals().get('CYCLE_DELAY', 30)
+    REBUY_COOLDOWN = globals().get('REBUY_COOLDOWN', 3600)
+    TRADE_USD = globals().get('TRADE_USD', globals().get('DEFAULT_USD_PER_TRADE', 5.0))
+    RATE_LIMIT_BASE_SLEEP = globals().get('RATE_LIMIT_BASE_SLEEP', 30)
+    RATE_LIMIT_BACKOFF_MAX = globals().get('RATE_LIMIT_BACKOFF_MAX', 600)
+
+    # ensure RECENT_BUYS exists to avoid NameError
+    if 'RECENT_BUYS' not in globals():
+        globals()['RECENT_BUYS'] = {}
+
+    # respect any DRY_RUN / BYPASS flags the rest of your script may set
+    DRY_RUN = globals().get('DRY_RUN', False)
+    BYPASS_PREBUY = globals().get('BYPASS_PREBUY', False)
+    FORCE_NO_ORDERBOOK = globals().get('FORCE_NO_ORDERBOOK', False)
+
+    # snapshot start balance once
     if start_balance_usdt is None:
         try:
             start_balance_usdt = get_free_usdt()
         except Exception as e:
             start_balance_usdt = 0.0
-            notify(f"⚠️ Could not snapshot start balance: {e}")
-        notify(f"🔰 Start balance snapshot: ${start_balance_usdt:.6f}")
+            try:
+                notify(f"⚠️ Could not snapshot start balance: {e}")
+            except Exception:
+                pass
+        try:
+            notify(f"🔰 Start balance snapshot: ${start_balance_usdt:.6f}")
+        except Exception:
+            pass
 
     while True:
         try:
@@ -1685,7 +1723,7 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # get candidate
+            # pick candidate (keep using your pick_coin helper)
             try:
                 candidate = pick_coin()
             except Exception as e:
@@ -1694,14 +1732,14 @@ def trade_cycle():
 
             if not candidate:
                 notify("⚠️ No eligible coin found. Sleeping...")
-                if RATE_LIMIT_BACKOFF:
-                    notify(f"⏸ Backing off due to prior rate-limit for {RATE_LIMIT_BACKOFF}s.")
-                    time.sleep(RATE_LIMIT_BACKOFF)
+                if globals().get('RATE_LIMIT_BACKOFF'):
+                    notify(f"⏸ Backing off due to prior rate-limit for {globals().get('RATE_LIMIT_BACKOFF')}s.")
+                    time.sleep(globals().get('RATE_LIMIT_BACKOFF'))
                 else:
-                    time.sleep(30)
+                    time.sleep(CYCLE_DELAY)
                 continue
 
-            # unpack candidate
+            # unpack candidate (support 4- or 5-tuple)
             symbol = price = volume = change = None
             closes = None
             try:
@@ -1711,7 +1749,6 @@ def trade_cycle():
                     elif len(candidate) == 4:
                         symbol, price, volume, change = candidate
                     else:
-                        # try best-effort
                         symbol, price, volume, change = tuple(candidate)[:4]
                 else:
                     notify(f"⚠️ Unexpected candidate format: {candidate}")
@@ -1724,7 +1761,7 @@ def trade_cycle():
 
             notify(f"🎯 Selected {symbol} for potential buy (24h change={change}%, vol≈{volume})")
 
-            # --- EARLY DEBUG: fetch price, balance, filters, estimate qty/notional, orderbook ---
+            # --- EARLY DEBUG BLOCK: price, balance, filters, qty estimation ---
             try:
                 estimated_price = price or get_price_cached(symbol) or 0.0
             except Exception as e:
@@ -1746,19 +1783,17 @@ def trade_cycle():
                 notify(f"[DEBUG] get_symbol_info/get_filters error for {symbol}: {e}")
                 f = {}
 
-            # usd_to_buy decision
-            usd_to_buy = TRADE_USD if 'TRADE_USD' in globals() else globals().get('DEFAULT_USD_PER_TRADE', 5.0)
+            # compute usd_to_buy (volatility aware if closes provided)
+            usd_to_buy = TRADE_USD
             try:
                 if closes:
                     usd_to_buy = compute_trade_size_by_volatility(closes, base_usd=usd_to_buy)
             except Exception:
-                pass
+                usd_to_buy = usd_to_buy
             usd_to_buy = min(usd_to_buy, free_usdt)
 
-            # qty estimation + rounding
-            qty_est = None
-            qty_rounded = None
-            notional = None
+            # qty estimate and rounding
+            qty_est = qty_rounded = notional = None
             try:
                 if estimated_price and usd_to_buy:
                     qty_est = usd_to_buy / estimated_price
@@ -1773,7 +1808,7 @@ def trade_cycle():
             except Exception as e:
                 notify(f"[DEBUG] qty estimation error: {e}")
 
-            # parse minNotional/minQty
+            # parse minNotional and minQty if present
             min_notional = None
             min_qty = None
             try:
@@ -1783,15 +1818,27 @@ def trade_cycle():
             except Exception:
                 pass
 
-            # orderbook quick check
+            # --- HERE: snapshot orderbook (use helper if present) ---
             try:
-                ob_ok = orderbook_bullish(symbol, depth=5, min_imbalance=1.02, max_spread_pct=0.6)
+                if 'notify_orderbook_snapshot' in globals():
+                    try:
+                        notify_orderbook_snapshot(symbol, depth=PREBUY_OB_DEPTH)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # call orderbook_bullish with tuned globals (fallback to defaults above)
+            try:
+                ob_ok = orderbook_bullish(symbol,
+                                          depth=PREBUY_OB_DEPTH,
+                                          min_imbalance=PREBUY_MIN_IMBALANCE,
+                                          max_spread_pct=PREBUY_MAX_SPREAD)
             except Exception as e:
                 ob_ok = f"ERR:{e}"
+            notify(f"[DEBUG] orderbook_bullish for {symbol} => {ob_ok}")
 
-            notify(f"[DEBUG] CANDIDATE {symbol} debug -> price={estimated_price}, free_usdt={free_usdt}, usd_to_buy={usd_to_buy}, qty_est={qty_est}, qty_rounded={qty_rounded}, notional={notional}, min_notional={min_notional}, min_qty={min_qty}, orderbook_ok={ob_ok}, filters_present={bool(f)}")
-
-            # run pre_buy_confirmation but capture reason if possible
+            # run pre_buy (but allow bypass via global flag)
             pre_ok = False
             pre_exc = None
             try:
@@ -1802,7 +1849,6 @@ def trade_cycle():
 
             notify(f"[DEBUG] pre_buy_confirmation for {symbol} => {pre_ok} (exc={pre_exc})")
 
-            # If pre_buy failed, give explicit likely reasons (combine checks)
             if not pre_ok and not BYPASS_PREBUY:
                 reasons = []
                 if free_usdt < 1.0:
@@ -1821,19 +1867,19 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # Cooldown checks (original)
-            last = RECENT_BUYS.get(symbol)
+            # cooldown checks (use existing RECENT_BUYS map)
+            last = globals().get('RECENT_BUYS', {}).get(symbol)
             if last:
                 if now < last['ts'] + last.get('cooldown', REBUY_COOLDOWN):
-                    notify(f"⏭️ Skipping {symbol} due recent buy cooldown.")
+                    notify(f"⏭️ Skipping {symbol} due to recent buy cooldown.")
                     time.sleep(CYCLE_DELAY)
                     continue
-                if last.get('price') and price and price > last['price'] * (1 + REBUY_MAX_RISE_PCT / 100.0):
-                    notify(f"⏭️ Skipping {symbol} bc price rose >{REBUY_MAX_RISE_PCT}% since last buy.")
+                if last.get('price') and price and price > last['price'] * (1 + globals().get('REBUY_MAX_RISE_PCT', 2.0) / 100.0):
+                    notify(f"⏭️ Skipping {symbol} bc price rose >REBUY_MAX_RISE_PCT since last buy.")
                     time.sleep(CYCLE_DELAY)
                     continue
 
-            # Final safety checks before placing
+            # final checks for minNotional/minQty and balance
             if usd_to_buy < 1.0:
                 notify(f"⚠️ Final check: usd_to_buy too small ({usd_to_buy}). Skipping.")
                 time.sleep(CYCLE_DELAY)
@@ -1847,22 +1893,20 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # READY: attempt buy (or simulate if DRY_RUN)
-            notify(f"[DEBUG] READY to buy {symbol}: usd_to_buy={usd_to_buy}, qty_est={qty_est}, qty_rounded={qty_rounded}, DRY_RUN={DRY_RUN}, BYPASS_PREBUY={BYPASS_PREBUY}")
+            # READY: show ready debug then either simulate or place buy
+            notify(f"[DEBUG] READY to buy {symbol}: usd_to_buy={usd_to_buy}, qty_est={qty_est}, qty_rounded={qty_rounded}, DRY_RUN={DRY_RUN}")
 
             if DRY_RUN:
-                # simulate
                 simulated_qty = qty_rounded or qty_est or 0.0
                 simulated_price = estimated_price or 0.0
                 notify(f"[DRY_RUN] would buy {symbol}: qty≈{simulated_qty}, price≈{simulated_price}, usd≈{usd_to_buy}")
-                # record simulated buy in RECENT_BUYS (so flow continues like a buy)
-                RECENT_BUYS[symbol] = {'ts': time.time(), 'price': simulated_price, 'profit': None, 'cooldown': REBUY_COOLDOWN}
+                # record simulated buy to RECENT_BUYS to avoid immediate re-buy
+                globals().setdefault('RECENT_BUYS', {})[symbol] = {'ts': time.time(), 'price': simulated_price, 'profit': None, 'cooldown': REBUY_COOLDOWN}
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # If we reach here, actually place buy
+            # place real buy (with optional FORCE_NO_ORDERBOOK)
             try:
-                # optionally bypass orderbook inside the buy wrapper if environment requires
                 if FORCE_NO_ORDERBOOK:
                     buy_res = place_safe_market_buy(symbol, usd_to_buy, require_orderbook=False)
                 else:
@@ -1871,10 +1915,8 @@ def trade_cycle():
                 err = str(e)
                 notify(f"❌ Exception during market buy attempt for {symbol}: {err}")
                 if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
-                    RATE_LIMIT_BACKOFF = min(
-                        RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
-                        RATE_LIMIT_BACKOFF_MAX
-                    )
+                    RATE_LIMIT_BACKOFF = min(globals().get('RATE_LIMIT_BACKOFF', RATE_LIMIT_BASE_SLEEP) * 2 if globals().get('RATE_LIMIT_BACKOFF') else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+                    globals()['RATE_LIMIT_BACKOFF'] = RATE_LIMIT_BACKOFF
                     notify(f"❌ Rate limit detected during buy attempt: backing off for {RATE_LIMIT_BACKOFF}s.")
                     time.sleep(RATE_LIMIT_BACKOFF)
                 else:
@@ -1894,12 +1936,10 @@ def trade_cycle():
 
             notify(f"🟢 Bought {symbol}: qty={qty} avg_price={entry_price}")
 
-            # record and continue with monitoring (original flow)
-            RECENT_BUYS[symbol] = {'ts': time.time(), 'price': entry_price, 'profit': None, 'cooldown': REBUY_COOLDOWN}
+            # record buy and continue with original monitoring flow
+            globals().setdefault('RECENT_BUYS', {})[symbol] = {'ts': time.time(), 'price': entry_price, 'profit': None, 'cooldown': REBUY_COOLDOWN}
 
-            # [rest of original monitoring/TP/SL flow kept unchanged...]
-            # For brevity, call your original monitor_and_roll or place_micro_tp flows here.
-            # (Assuming the following functions exist in your script:)
+            # fetch filters & place micro tp (if implemented in your script)
             try:
                 info = get_symbol_info_cached(symbol)
                 f = get_filters(info) if info else {}
@@ -1907,7 +1947,9 @@ def trade_cycle():
                 notify(f"⚠️ get_filters after buy error: {e}")
                 f = {}
 
-            micro_order, micro_sold_qty, micro_tp_price = None, 0.0, None
+            micro_order = None
+            micro_sold_qty = 0.0
+            micro_tp_price = None
             try:
                 micro_order, micro_sold_qty, micro_tp_price = place_micro_tp(symbol, qty, entry_price, f)
             except Exception as e:
@@ -1926,6 +1968,8 @@ def trade_cycle():
 
             ACTIVE_SYMBOL = symbol
             LAST_BUY_TS = time.time()
+
+            # hands off to monitor/roll logic (existing in your script)
             try:
                 closed, exit_price, profit_usd = monitor_and_roll(symbol, qty_remaining, entry_price, f)
             finally:
@@ -1940,32 +1984,30 @@ def trade_cycle():
                     pass
 
             now2 = time.time()
-            ent = RECENT_BUYS.get(symbol, {})
+            ent = globals().get('RECENT_BUYS', {}).get(symbol, {})
             ent['ts'] = now2
             ent['price'] = entry_price
             ent['profit'] = total_profit_usd
-            if ent['profit'] is None:
-                ent['cooldown'] = REBUY_COOLDOWN
-            elif ent['profit'] < 0:
-                ent['cooldown'] = LOSS_COOLDOWN
+            if ent.get('profit') is None:
+                ent['cooldown'] = globals().get('REBUY_COOLDOWN', REBUY_COOLDOWN)
+            elif ent.get('profit') < 0:
+                ent['cooldown'] = globals().get('LOSS_COOLDOWN', REBUY_COOLDOWN)
             else:
-                ent['cooldown'] = REBUY_COOLDOWN
-            RECENT_BUYS[symbol] = ent
+                ent['cooldown'] = globals().get('REBUY_COOLDOWN', REBUY_COOLDOWN)
+            globals().setdefault('RECENT_BUYS', {})[symbol] = ent
 
             date_key, m = _update_metrics_for_profit(total_profit_usd)
             _notify_daily_stats(date_key)
             if closed and total_profit_usd and total_profit_usd > 0:
                 send_profit_to_funding(total_profit_usd)
 
-            RATE_LIMIT_BACKOFF = 0
+            globals()['RATE_LIMIT_BACKOFF'] = 0
 
         except Exception as e:
             err = str(e)
             if '-1003' in err or 'Too much request weight' in err:
-                RATE_LIMIT_BACKOFF = min(
-                    RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
-                    RATE_LIMIT_BACKOFF_MAX
-                )
+                RATE_LIMIT_BACKOFF = min(globals().get('RATE_LIMIT_BACKOFF', RATE_LIMIT_BASE_SLEEP) * 2 if globals().get('RATE_LIMIT_BACKOFF') else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+                globals()['RATE_LIMIT_BACKOFF'] = RATE_LIMIT_BACKOFF
                 notify(f"❌ Rate limit reached in trade_cycle: backing off for {RATE_LIMIT_BACKOFF}s.")
                 time.sleep(RATE_LIMIT_BACKOFF)
                 continue
@@ -1974,8 +2016,7 @@ def trade_cycle():
             time.sleep(CYCLE_DELAY)
 
         time.sleep(CYCLE_DELAY)
-# --- end trade_cycle ---
-
+        
 # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
