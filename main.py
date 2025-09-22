@@ -1052,7 +1052,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         # Place the limit sell
         try:
             order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str)
-            notify(f"📍 Micro TP placed for {symbol}: sell {qty_str} @ {price_str} (entry={entry_price:.8f})")
+            notify(f"📍 Micro TP placed for {symbol}: sell {qty_str} @ {price_str} (entry={entry_price:.8f})", priority=True)
             try:
                 OPEN_ORDERS_CACHE['data'] = None
             except Exception:
@@ -1131,7 +1131,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
                 if profit_to_send and profit_to_send > 0.0:
                     try:
                         send_profit_to_funding(profit_to_send)
-                        notify(f"💸 Micro TP profit ${profit_to_send:.6f} for {symbol} sent to funding.")
+                        notify(f"💸 Micro TP profit ${profit_to_send:.6f} for {symbol} sent to funding.", priority=True)
                     except Exception as e:
                         notify(f"⚠️ Failed to transfer micro profit for {symbol}: {e}")
                 else:
@@ -1356,7 +1356,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                         ROLL_FAIL_COUNTER[symbol] = 0
                     except Exception:
                         pass
-                    notify(f"🔁 Rolled OCO (abs-step): new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty}")
+                    notify(f"🔁 Rolled OCO (abs-step): new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty}", priority=True)
                 else:
                     # failed roll handling: improved logging
                     cnt = ROLL_FAIL_COUNTER.get(symbol, 0) + 1
@@ -1689,12 +1689,6 @@ LAST_BUY_TS = 0.0
 BUY_LOCK_SECONDS = 30
 
 def trade_cycle():
-    """
-    Single-active-symbol trade loop compatible with your helpers.
-    - Uses pick_coin() or get_trade_candidates()
-    - Uses place_safe_market_buy(..., require_orderbook=True)
-    - Calls place_micro_tp() then monitor_and_roll()
-    """
     global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS, RATE_LIMIT_BACKOFF
 
     # snapshot starting balance once
