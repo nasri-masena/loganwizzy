@@ -26,48 +26,48 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 500_000          # daily quote volume baseline
+MIN_VOLUME = 800_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.6
 RECENT_PCT_MAX = 4.0            # require recent move between 1%..2%
 
 # absolute 24h change guardrails (avoid extreme pump/dump)
-MAX_24H_RISE_PCT = 5.0          # disallow > +5% 24h rise
+MAX_24H_RISE_PCT = 4.0          # disallow > +5% 24h rise
 MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
 
 MOVEMENT_MIN_PCT = 1.0
 
 # picker tuning
-EMA_UPLIFT_MIN_PCT = 0.0001        # fractional uplift threshold (0.001 = 0.1%)
+EMA_UPLIFT_MIN_PCT = 0.0008        # fractional uplift threshold (0.001 = 0.1%)
 SCORE_MIN_THRESHOLD = 13.0        # floor score required to accept a candidate
 
 # runtime / pacing
-TRADE_USD = 10.0
+TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 8
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
 
 # order / protection
-TRIGGER_PROXIMITY = 0.06
-STEP_INCREMENT_PCT = 0.02
-BASE_TP_PCT = 2.5
+TRIGGER_PROXIMITY = 0.015
+STEP_INCREMENT_PCT = 0.01
+BASE_TP_PCT = 3.0
 BASE_SL_PCT = 2.0
 
 # micro-take profit
-MICRO_TP_PCT = 1.0
-MICRO_TP_FRACTION = 0.25
-MICRO_MAX_WAIT = 20.0
+MICRO_TP_PCT = 0.8
+MICRO_TP_FRACTION = 0.20
+MICRO_MAX_WAIT = 6.0
 
 # rolling config
-ROLL_ON_RISE_PCT = 0.5
-ROLL_TRIGGER_PCT = 0.4
-ROLL_TRIGGER_DELTA_ABS = 0.003
-ROLL_TP_STEP_ABS = 0.020
-ROLL_SL_STEP_ABS = 0.003
-ROLL_COOLDOWN_SECONDS = 45
-MAX_ROLLS_PER_POSITION = 5
-ROLL_POST_CANCEL_JITTER = (0.3, 0.6)
+ROLL_ON_RISE_PCT = 0.8        # require clearer rise
+ROLL_TRIGGER_PCT = 1.0        # require 1% pct trigger
+ROLL_TRIGGER_DELTA_ABS = 0.008
+ROLL_TP_STEP_ABS = 0.025
+ROLL_SL_STEP_ABS = 0.004
+ROLL_COOLDOWN_SECONDS = 90
+MAX_ROLLS_PER_POSITION = 2    
+ROLL_POST_CANCEL_JITTER = (0.4, 0.8)
 
 # Rolling failure tracking (prevents roll spam when OCO repeatedly fails)
 ROLL_FAIL_COUNTER = {}             # symbol -> consecutive failed roll attempts
@@ -197,7 +197,7 @@ def notify(msg: str, priority: bool = False):
             Thread(target=_send_telegram, args=(text,), daemon=True).start()
         except Exception:
             pass
-        
+
 def format_price(value, tick_size):
     try:
         tick = Decimal(str(tick_size))
@@ -327,7 +327,7 @@ def get_trade_candidates():
         'closes': closes,
     }
     return [(symbol, score_data)]
-    
+
 # -------------------------
 # TRANSFERS
 # -------------------------
@@ -352,7 +352,7 @@ def send_profit_to_funding(amount, asset='USDT'):
         except Exception as e2:
             notify(f"❌ Failed to transfer profit: {e} | {e2}")
             return None
-            
+
 # -------------------------
 # CACHES & UTIL
 # -------------------------
@@ -471,7 +471,7 @@ def cleanup_recent_buys():
         cd = info.get('cooldown', REBUY_COOLDOWN)
         if now >= info['ts'] + cd:
             del RECENT_BUYS[s]
-            
+
 def compute_recent_volatility(closes, lookback: int = 6):
     try:
         if not closes or len(closes) < 2:
@@ -769,7 +769,7 @@ def pick_coin():
     except Exception as e:
         notify(f"⚠️ pick_coin unexpected error: {e}")
         return None
-        
+
 # -------------------------
 # MARKET BUY helpers
 # -------------------------
@@ -984,7 +984,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
     except Exception:
         pass
     return executed_qty, avg_price
-    
+
 # -------------------------
 # Micro TP helper (unchanged mostly)
 # -------------------------
@@ -1195,7 +1195,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
     except Exception as e:
         notify(f"⚠️ place_micro_tp error: {e}")
         return None, 0.0, None
-        
+
 def monitor_and_roll(symbol, qty, entry_price, f):
     orig_qty = qty
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
@@ -1380,7 +1380,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0
-            
+
 # -------------------------
 # SAFE SELL FALLBACK (market)
 # -------------------------
@@ -1416,7 +1416,7 @@ def place_market_sell_fallback(symbol, qty, f):
 # -------------------------
 # OCO SELL with robust fallbacks & minNotional & qty adjustment
 # -------------------------
-def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
+def place_oco_sell(symbol, qty, buy_price, tp_pct=4.0, sl_pct=0.8,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
     global RATE_LIMIT_BACKOFF
@@ -1699,8 +1699,6 @@ def trade_cycle():
             start_balance_usdt = 0.0
         notify(f"🔰 Start balance snapshot: ${start_balance_usdt:.6f}")
 
-    notify("▶️ trade_cycle started")
-
     while True:
         try:
             # housekeeping
@@ -1929,7 +1927,7 @@ def trade_cycle():
 
         # short sleep between cycles
         time.sleep(CYCLE_DELAY)
-        
+
 # # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
