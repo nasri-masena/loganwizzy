@@ -43,7 +43,7 @@ EMA_UPLIFT_MIN_PCT = 0.0008        # fractional uplift threshold (0.001 = 0.1%)
 SCORE_MIN_THRESHOLD = 13.0        # floor score required to accept a candidate
 
 # runtime / pacing
-TRADE_USD = 8.0
+TRADE_USD = 10.0
 SLEEP_BETWEEN_CHECKS = 8
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
@@ -77,6 +77,14 @@ FAILED_ROLL_SKIP_SECONDS = 60 * 60  # 1 hour skip when repeated roll attempts fa
 # -------------------------
 # INIT / GLOBALS
 # -------------------------
+# notification tweaks (defaults)
+NOTIFY_QUEUE_MAX = 1000        # max queued messages (increase if you log a lot)
+NOTIFY_RETRY = 2               # number of retries for Telegram send
+NOTIFY_TIMEOUT = 4.0           # seconds per HTTP request
+NOTIFY_PRIORITY_SUPPRESS = 0.08  # suppress non-priority duplicates shorter than this (s)
+
+# OCO TP extra buffer (if used elsewhere)
+OCO_TP_EXTRA_PCT = globals().get('OCO_TP_EXTRA_PCT', 0.35)
 
 client = Client(API_KEY, API_SECRET)
 LAST_NOTIFY = 0
@@ -102,26 +110,27 @@ CACHE_TTL = 240
 # -------------------------
 # HELPERS: formatting & rounding
 # -------------------------
-_NOTIFY_Q = queue.Queue(maxsize=NOTIFY_QUEUE_MAX)
+# improved notify system (safe defaults using globals().get)
+_NOTIFY_Q = queue.Queue(maxsize=globals().get('NOTIFY_QUEUE_MAX', 1000))
 _NOTIFY_THREAD_STARTED = False
 _NOTIFY_LOCK = Lock()
 
 def _send_telegram(text: str):
-    """Synchronous send with retries — safe to call in a daemon Thread."""
-    if not BOT_TOKEN or not CHAT_ID:
+    BOT_TOK = globals().get('BOT_TOKEN')
+    CHAT_ID_LOCAL = globals().get('CHAT_ID')
+    if not BOT_TOK or not CHAT_ID_LOCAL:
         return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": text}
-    for attempt in range(1, NOTIFY_RETRY + 1):
+    url = f"https://api.telegram.org/bot{BOT_TOK}/sendMessage"
+    data = {"chat_id": CHAT_ID_LOCAL, "text": text}
+    retries = int(globals().get('NOTIFY_RETRY', 2))
+    timeout = float(globals().get('NOTIFY_TIMEOUT', 4.0))
+    for attempt in range(1, retries + 1):
         try:
-            r = requests.post(url, data=data, timeout=NOTIFY_TIMEOUT)
-            # treat 200 as success; any other status we retry once
+            r = requests.post(url, data=data, timeout=timeout)
             if r.status_code == 200:
                 return True
-            # for 429 (telegram rate limit) or 5xx we also retry
         except Exception:
             pass
-        # small backoff between retries
         time.sleep(0.25 * attempt)
     return False
 
@@ -139,7 +148,6 @@ def _start_notify_thread():
                 if text is None:
                     break
                 try:
-                    # best-effort: synchronous send with retries (in worker thread)
                     _send_telegram(text)
                 except Exception:
                     pass
@@ -152,37 +160,31 @@ def _start_notify_thread():
         t.start()
         _NOTIFY_THREAD_STARTED = True
 
-# track last notify time for non-priority messages only
 _LAST_NOTIFY_NONPRIO = 0.0
 def notify(msg: str, priority: bool = False):
-    global _LAST_NOTIFY_NONPRIO
     now_ts = time.time()
     text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-
-    # always print locally ASAP
     try:
         print(text)
     except Exception:
         pass
 
-    # priority messages: try immediate send (in a background thread) so we don't block
     if priority:
         try:
-            # launch thread to send synchronously with retries (fast path)
             Thread(target=_send_telegram, args=(text,), daemon=True).start()
         except Exception:
             pass
         return
 
-    # non-priority: rate-suppress small bursts
+    suppress = float(globals().get('NOTIFY_PRIORITY_SUPPRESS', 0.08))
+    global _LAST_NOTIFY_NONPRIO
     try:
-        if now_ts - _LAST_NOTIFY_NONPRIO < NOTIFY_PRIORITY_SUPPRESS:
+        if now_ts - _LAST_NOTIFY_NONPRIO < suppress:
             return
         _LAST_NOTIFY_NONPRIO = now_ts
     except Exception:
         _LAST_NOTIFY_NONPRIO = now_ts
 
-    # enqueue; if queue full, fallback to immediate thread send to avoid drop
     try:
         _start_notify_thread()
         _NOTIFY_Q.put_nowait(text)
@@ -192,12 +194,11 @@ def notify(msg: str, priority: bool = False):
         except Exception:
             pass
     except Exception:
-        # fallback to immediate send attempt
         try:
             Thread(target=_send_telegram, args=(text,), daemon=True).start()
         except Exception:
             pass
-
+        
 def format_price(value, tick_size):
     try:
         tick = Decimal(str(tick_size))
