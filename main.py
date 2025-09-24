@@ -55,19 +55,19 @@ BASE_TP_PCT = 3.0
 BASE_SL_PCT = 2.0
 
 # micro-take profit
-MICRO_TP_PCT = 0.8
-MICRO_TP_FRACTION = 0.20
+MICRO_TP_PCT = 0.9
+MICRO_TP_FRACTION = 0.25
 MICRO_MAX_WAIT = 6.0
 
 # rolling config
-ROLL_ON_RISE_PCT = 0.8        # require clearer rise
-ROLL_TRIGGER_PCT = 1.0        # require 1% pct trigger
+ROLL_ON_RISE_PCT = 0.6        # require clearer rise
+ROLL_TRIGGER_PCT = 0.9        # require 1% pct trigger
 ROLL_TRIGGER_DELTA_ABS = 0.008
-ROLL_TP_STEP_ABS = 0.025
-ROLL_SL_STEP_ABS = 0.004
-ROLL_COOLDOWN_SECONDS = 90
-MAX_ROLLS_PER_POSITION = 2    
-ROLL_POST_CANCEL_JITTER = (0.4, 0.8)
+ROLL_TP_STEP_ABS = 0.022
+ROLL_SL_STEP_ABS = 0.0035
+ROLL_COOLDOWN_SECONDS = 60
+MAX_ROLLS_PER_POSITION = 3    
+ROLL_POST_CANCEL_JITTER = (0.3, 0.6)
 
 # Rolling failure tracking (prevents roll spam when OCO repeatedly fails)
 ROLL_FAIL_COUNTER = {}             # symbol -> consecutive failed roll attempts
