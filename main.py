@@ -102,7 +102,7 @@ METRICS = {}  # 'YYYY-MM-DD' (in EAT) -> {'picks':0,'wins':0,'losses':0,'profit'
 METRICS_LOCK = Lock()
 
 # East Africa timezone (fixed offset)
-EAT_TZ = timezone(timedelta(hours=3))
+EAT_TZ = timezone(timedelta(hours=22))
 
 # REBUY / RECENT BUYS CONFIG
 RECENT_BUYS = {}
