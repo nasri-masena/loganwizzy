@@ -75,7 +75,6 @@ NOTIFY_QUEUE_MAX = 1000
 NOTIFY_RETRY = 2
 NOTIFY_TIMEOUT = 4.0
 NOTIFY_PRIORITY_SUPPRESS = 0.08
-
 NOTIFY_ON_BUY = True
 NOTIFY_ON_CLOSE = True
 NOTIFY_ON_ERROR = True
@@ -100,6 +99,12 @@ EAT_TZ = timezone(timedelta(hours=3))
 DAILY_REPORT_HOUR_EAT = int(os.environ.get("DAILY_REPORT_HOUR_EAT", 22))
 
 NOTIFY_THREAD_STARTED = False
+
+start_balance_usdt = None
+ACTIVE_SYMBOL = None
+LAST_BUY_TS = 0.0
+BUY_LOCK_SECONDS = 30
+RATE_LIMIT_BACKOFF = 0
 
 
 _NOTIFY_Q = queue.Queue(maxsize=globals().get('NOTIFY_QUEUE_MAX', 1000))
