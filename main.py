@@ -101,15 +101,10 @@ DAILY_REPORT_HOUR_EAT = int(os.environ.get("DAILY_REPORT_HOUR_EAT", 22))
 
 NOTIFY_THREAD_STARTED = False
 
-# -------------------------
-# HELPERS: formatting & rounding
-# -------------------------
-# improved notify system (safe defaults using globals().get)
+
 _NOTIFY_Q = queue.Queue(maxsize=globals().get('NOTIFY_QUEUE_MAX', 1000))
 _NOTIFY_THREAD_STARTED = False
 _NOTIFY_LOCK = Lock()
-
-# ----- replace existing notify() with this filtered version -----
 _LAST_NOTIFY_NONPRIO = 0.0
 
 def _send_telegram(text: str):
@@ -1567,7 +1562,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                 return {'tp': tp, 'sl': sp, 'method': 'oco_abovebelow', 'raw': oco_alt}
             except BinanceAPIException as e:
                 err = str(e)
-                notify(f"⚠️ OCO SELL attempt {attempt} (alt) failed: {err}")
+                notify(f"OCO SELL attempt {attempt} (alt) failed: {err}")
                 if 'NOTIONAL' in err or 'minNotional' in err:
                     # try adjust qty and retry (handled by outer loop)
                     if min_notional:
@@ -1959,7 +1954,7 @@ def trade_cycle():
                     candidate = None
 
             if not candidate:
-                notify("⚠️ No eligible coin found. Sleeping...")
+                notify("No eligible coin found. Sleeping...")
                 if RATE_LIMIT_BACKOFF:
                     notify(f"⏸ Rate-limit backoff active: sleeping {RATE_LIMIT_BACKOFF}s")
                     time.sleep(RATE_LIMIT_BACKOFF)
