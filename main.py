@@ -286,7 +286,11 @@ def get_free_asset(asset):
         return float(bal['free'])
     except Exception:
         return 0.0
-
+        
+def get_client():
+    global client
+    return client
+    
 def get_filters(symbol_info):
     fs = {f.get('filterType'): f for f in symbol_info.get('filters', [])}
     lot = fs.get('LOT_SIZE')
@@ -476,23 +480,38 @@ def cleanup_recent_buys():
         if now >= info['ts'] + cd:
             del RECENT_BUYS[s]
 
-def compute_recent_volatility(closes):
+def compute_recent_volatility(closes, lookback=5):
     try:
-        if not closes or len(closes) < 3:
+        if not closes or len(closes) < 2:
             return None
-        returns = []
+        # compute simple returns between consecutive closes
+        rets = []
         for i in range(1, len(closes)):
-            prev = closes[i-1]
-            cur = closes[i]
-            if prev == 0:
+            prev = float(closes[i-1])
+            cur = float(closes[i])
+            if prev <= 0:
                 continue
-            returns.append((cur - prev) / prev)
-        if not returns:
+            rets.append((cur - prev) / prev)
+        if not rets:
             return None
-        mean = sum(returns) / len(returns)
-        var = sum((r - mean) ** 2 for r in returns) / len(returns)
-        std = math.sqrt(var)
-        return std
+        # use only last `lookback` returns to be responsive
+        recent = rets[-lookback:] if lookback and len(rets) >= 1 else rets
+        if len(recent) == 0:
+            return None
+        if len(recent) == 1:
+            # single return -> treat absolute as a tiny volatility
+            return abs(recent[0])
+        try:
+            vol = statistics.pstdev(recent)  # population stdev (fast)
+        except Exception:
+            vol = statistics.stdev(recent) if len(recent) > 1 else abs(recent[-1])
+        # guard: ensure non-negative, clamp to reasonable ceiling
+        if vol is None:
+            return None
+        vol = abs(vol)
+        # cap to avoid absurd numbers (e.g., >1 means 100% in a single step)
+        vol = min(vol, 5.0)  # keeps later math safe; interpret as fraction
+        return vol
     except Exception:
         return None
 
