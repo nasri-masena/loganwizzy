@@ -54,7 +54,7 @@ STEP_INCREMENT_PCT = 0.01
 BASE_TP_PCT = 3.0
 BASE_SL_PCT = 2.0
 
-MICRO_TP_PCT = 0.6
+MICRO_TP_PCT = 0.8
 MICRO_TP_FRACTION = 0.20
 MICRO_MAX_WAIT = 15.0
 
@@ -93,6 +93,7 @@ SKIP_SECONDS_ON_MARKET_CLOSED = 60 * 60
 getcontext().prec = 28
 
 MICRO_TP_USE_IOC = True
+
 OCO_MAX_LIFE_SECONDS = int(float(os.environ.get('OCO_MAX_LIFE_SECONDS', 6 * 3600)))  # default 6 hours
 
 # Metrics store used by daily reporter & _notify_daily_stats
@@ -111,8 +112,8 @@ REBUY_MAX_RISE_PCT = 5.0
 # rate-limit/backoff
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
-RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 240
+RATE_LIMIT_BASE_SLEEP = 120
+CACHE_TTL = 250
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -1842,45 +1843,6 @@ def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
         result['errors'] += 1
     return result
 
-def _notify_daily_stats(date_key):
-    with METRICS_LOCK:
-        m = METRICS.get(date_key, {'picks': 0, 'wins': 0, 'losses': 0, 'profit': 0.0})
-    profit_val = m['profit']
-    profit_str = f"+{profit_val:.2f} USDT" if profit_val >= 0 else f"{profit_val:.2f} USDT"
-    notify(
-        f"📊 Stats ya {date_key}:\n\n"
-        f"Coins zilizochaguliwa: {m['picks']}\n\n"
-        f"Zilizofanikiwa (TP/Profit): {m['wins']}\n\n"
-        f"Zilizopoteza: {m['losses']}\n\n"
-        f"Jumla profit: {profit_str}",
-        category='daily'
-    )
-
-def start_daily_reporter():
-    """Send DAILY report every day at 03:00 EAT for the previous day."""
-    def _loop():
-        while True:
-            try:
-                now = datetime.now(tz=EAT_TZ)
-                # target today at 03:00:05 EAT
-                target = now.replace(hour=22, minute=0, second=5, microsecond=0)
-                if target <= now:
-                    target = target + timedelta(days=1)
-                to_sleep = (target - now).total_seconds()
-                time.sleep(max(1.0, to_sleep))
-                # on wake: report for yesterday (EAT date)
-                yesterday = (datetime.now(tz=EAT_TZ) - timedelta(days=1)).strftime('%Y-%m-%d')
-                _notify_daily_stats(yesterday)
-            except Exception as e:
-                notify(f"⚠️ Daily reporter error: {e}", priority=True)
-                time.sleep(60)
-    t = Thread(target=_loop, daemon=True)
-    t.start()
-try:
-    start_daily_reporter()
-except Exception:
-    pass
-
 def _update_metrics_for_profit(profit_usd: float, picked_symbol: str = None, was_win: bool = None):
     """
     Update METRICS for the current EAT date (so stats align with Africa/Dar_es_Salaam).
@@ -1962,53 +1924,56 @@ def enforce_oco_max_life_and_exit_if_needed():
     except Exception as e:
         notify(f"⚠️ enforce_oco_max_life error: {e}")
 
+_DAILY_REPORTER_STARTED = False
+_DAILY_REPORTER_LOCK = Lock()
 
-# Daily reporter thread
-def _daily_reporter_thread():
-    """
-    Sleeps until next 03:00 EAT (which is 00:00 UTC), then calls _notify_daily_stats for the previous day.
-    Runs forever as daemon.
-    """
-    try:
-        while True:
-            now_utc = datetime.utcnow()
-            # next 00:00 UTC
-            next_midnight_utc = datetime(now_utc.year, now_utc.month, now_utc.day)  # today 00:00
-            if now_utc >= next_midnight_utc:
-                # move to next day midnight
-                next_midnight_utc = next_midnight_utc + __import__('datetime').timedelta(days=1)
-            sleep_seconds = (next_midnight_utc - now_utc).total_seconds()
-            # sleep until 00:00 UTC (== 03:00 EAT)
-            time.sleep(max(1.0, sleep_seconds + 1.0))
+def _notify_daily_stats(date_key):
+    with METRICS_LOCK:
+        m = METRICS.get(date_key, {'picks': 0, 'wins': 0, 'losses': 0, 'profit': 0.0})
+    profit_val = m['profit']
+    profit_str = f"+{profit_val:.2f} USDT" if profit_val >= 0 else f"{profit_val:.2f} USDT"
+    notify(
+        f"📊 Stats ya {date_key}:\n\n"
+        f"Coins zilizochaguliwa: {m['picks']}\n\n"
+        f"Zilizofanikiwa (TP/Profit): {m['wins']}\n\n"
+        f"Zilizopoteza: {m['losses']}\n\n"
+        f"Jumla profit: {profit_str}",
+        category='daily'
+    )
 
-            # At this point it's 00:00 UTC => 03:00 EAT (the scheduled time).
-            # Determine the date key for the day we just finished (previous EAT date).
-            run_eat = datetime.utcnow() + __import__('datetime').timedelta(hours=3)
-            report_date = (run_eat.date() - __import__('datetime').timedelta(days=1)).isoformat()
+def _daily_reporter_loop():
+    while True:
+        try:
+            now = datetime.now(tz=EAT_TZ)
+            target = now.replace(hour=22, minute=0, second=5, microsecond=0)
+            if target <= now:
+                target = target + timedelta(days=1)
+            to_sleep = (target - now).total_seconds()
+            time.sleep(max(1.0, to_sleep))
+
+            # report for the previous EAT date (keeps same semantics as before)
+            report_date = (datetime.now(tz=EAT_TZ) - timedelta(days=1)).date().isoformat()
             try:
-                # call the user's reporting function if present, else fallback to simple notify
-                if '_notify_daily_stats' in globals() and callable(globals()['_notify_daily_stats']):
-                    globals()['_notify_daily_stats'](report_date)
-                else:
-                    m = METRICS.get(report_date, {'picks': 0, 'wins': 0, 'losses': 0, 'profit': 0.0})
-                    profit_val = m['profit']
-                    profit_str = f"+{profit_val:.2f} USDT" if profit_val >= 0 else f"{profit_val:.2f} USDT"
-                    notify(f"📊 Daily stats ({report_date}): picks={m['picks']} wins={m['wins']} losses={m['losses']} profit={profit_str}")
+                _notify_daily_stats(report_date)
             except Exception as e:
-                notify(f"⚠️ Daily reporter failed for {report_date}: {e}")
+                notify(f"⚠️ Daily reporter failed to notify for {report_date}: {e}", priority=True)
+        except Exception as e:
+            notify(f"⚠️ Daily reporter loop error: {e}", priority=True)
+            time.sleep(60)
 
-    except Exception as e:
-        notify(f"⚠️ _daily_reporter_thread error: {e}")
-
-
-# start daily reporter once
 def _start_daily_reporter_once():
-    try:
-        t = Thread(target=_daily_reporter_thread, daemon=True)
-        t.start()
-    except Exception:
-        pass
-
+    global _DAILY_REPORTER_STARTED
+    with _DAILY_REPORTER_LOCK:
+        if _DAILY_REPORTER_STARTED:
+            return
+        try:
+            t = Thread(target=_daily_reporter_loop, daemon=True)
+            t.start()
+            _DAILY_REPORTER_STARTED = True
+        except Exception as e:
+            notify(f"⚠️ Failed to start daily reporter: {e}", priority=True)
+ 
+ 
 
 # -------------------------
 # UPDATED TRADE CYCLE
