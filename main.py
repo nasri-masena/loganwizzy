@@ -58,7 +58,7 @@ ROLL_TP_STEP_ABS = 0.020
 ROLL_SL_STEP_ABS = 0.003
 ROLL_COOLDOWN_SECONDS = 60
 MAX_ROLLS_PER_POSITION = 5
-ROLL_POST_CANCEL_JITTER = (0.3, 0.8)
+ROLL_POST_CANCEL_JITTER = (0.3, 0.6)
 
 ROLL_FAIL_COUNTER = {}
 FAILED_ROLL_THRESHOLD = 3
@@ -1345,7 +1345,7 @@ def place_market_sell_fallback(symbol, qty, f):
 # -------------------------
 # OCO SELL with robust fallbacks & minNotional & qty adjustment
 # -------------------------
-def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
+def place_oco_sell(symbol, qty, buy_price, tp_pct=4.0, sl_pct=0.9,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
     global RATE_LIMIT_BACKOFF, TEMP_SKIP
@@ -1397,23 +1397,15 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
             qty = new_qty
 
         min_notional = f.get('minNotional')
-        if min_notional:
-            if qty * tp < min_notional - 1e-12:
-                needed_qty = ceil_step(min_notional / tp, f.get('stepSize', 0.0))
-                if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
-                    notify(f"ℹ️ Increasing qty from {qty} to {needed_qty} to meet minNotional.")
-                    qty = needed_qty
-                else:
-                    attempts = 0
-                    max_attempts = 60
-                    while attempts < max_attempts and qty * tp < min_notional - 1e-12:
-                        if f.get('tickSize') and f.get('tickSize') > 0:
-                            tp = clip_ceil(tp + f.get('tickSize'), f.get('tickSize'))
-                        else:
-                            tp = tp + max(1e-8, tp * 0.001)
-                        attempts += 1
-                    if qty * tp < min_notional - 1e-12:
-                        notify(f"⚠️ Cannot meet minNotional for OCO on {symbol} (qty*tp={qty*tp:.8f} < {min_notional}).")
+
+        # ensure tp > sl + tick (safety)
+        tick = f.get('tickSize', 0.0) or 0.0
+        if tick and tp <= sl + tick:
+            tp = sl + max(tick, 1e-8)
+            tp = clip_ceil(tp, tick)
+
+        # debug notify with crucial info
+        notify(f"ℹ️ place_oco_sell DEBUG {symbol}: qty={qty}, tp={tp}, sp={sp}, sl={sl}, tick={tick}, minNotional={min_notional}, free_qty={free_qty}")
 
         qty_str = format_qty(qty, f.get('stepSize', 0.0))
         tp_str = format_price(tp, f.get('tickSize', 0.0))
@@ -1428,46 +1420,25 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
             except Exception:
                 pass
 
-        # Attempt alt params first
-        for attempt in range(1, retries + 1):
-            try:
-                oco_alt = c.create_oco_order(
-                    symbol=symbol,
-                    side='SELL',
-                    quantity=qty_str,
-                    aboveType="LIMIT_MAKER",
-                    abovePrice=tp_str,
-                    belowType="STOP_LOSS_LIMIT",
-                    belowStopPrice=sp_str,
-                    belowPrice=sl_str,
-                    belowTimeInForce="GTC"
-                )
-                invalidate_open_orders_cache()
-                notify(f"📌 OCO SELL placed (alt params) ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty_str}")
-                return {'tp': tp, 'sl': sp, 'method': 'oco_abovebelow', 'raw': oco_alt}
-            except BinanceAPIException as e:
-                err = str(e)
-                notify(f"⚠️ OCO SELL attempt {attempt} (alt) failed: {err}")
-                if 'NOTIONAL' in err or 'minNotional' in err:
-                    if min_notional:
-                        needed_qty = ceil_step(min_notional / float(tp), f.get('stepSize', 0.0))
-                        if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
-                            qty = needed_qty
-                            qty_str = format_qty(qty, f.get('stepSize', 0.0))
-                            time.sleep(0.25)
-                            continue
-                if '-1003' in err or 'Too much request weight' in err:
-                    TEMP_SKIP[symbol] = time.time() + max(60, RATE_LIMIT_BACKOFF or RATE_LIMIT_BASE_SLEEP)
-                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
-                    return None
-                if attempt < retries:
-                    time.sleep(delay)
-                    continue
-            except Exception as e:
-                notify(f"⚠️ Unexpected error on OCO (alt) attempt: {e}")
-                time.sleep(0.2)
+        # If minNotional prevents OCO, try small adjustments first
+        if min_notional and qty * tp < min_notional - 1e-12:
+            needed_qty = ceil_step(min_notional / float(tp), f.get('stepSize', 0.0))
+            if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
+                notify(f"ℹ️ Increasing qty from {qty} to {needed_qty} to meet minNotional.")
+                qty = needed_qty
+                qty_str = format_qty(qty, f.get('stepSize', 0.0))
+            else:
+                # try raising TP a bit to hit minNotional
+                attempts = 0
+                while attempts < 40 and qty * tp < min_notional - 1e-12:
+                    if tick > 0:
+                        tp = clip_ceil(tp + tick, tick)
+                    else:
+                        tp = tp * 1.001 + 1e-8
+                    attempts += 1
+                tp_str = format_price(tp, f.get('tickSize', 0.0))
 
-        # Attempt standard create_oco_order
+        # Primary attempt: STANDARD create_oco_order (most compatible)
         for attempt in range(1, retries + 1):
             try:
                 oco = c.create_oco_order(
@@ -1480,12 +1451,13 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                     stopLimitTimeInForce='GTC'
                 )
                 invalidate_open_orders_cache()
-                notify(f"📌 OCO SELL placed (standard) ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty_str}")
+                notify(f"📌 OCO SELL placed ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty_str}")
                 return {'tp': tp, 'sl': sp, 'method': 'oco', 'raw': oco}
             except BinanceAPIException as e:
                 err = str(e)
-                notify(f"⚠️ OCO SELL attempt {attempt} (standard) failed: {err}")
+                notify(f"⚠️ OCO SELL attempt {attempt} failed: {err}")
                 if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err:
+                    # try the minNotional adjustments & retry
                     if min_notional:
                         needed_qty = ceil_step(min_notional / float(tp), f.get('stepSize', 0.0))
                         if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
@@ -1495,7 +1467,8 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
                             continue
                 if '-1003' in err or 'Too much request weight' in err:
                     TEMP_SKIP[symbol] = time.time() + max(60, RATE_LIMIT_BACKOFF or RATE_LIMIT_BASE_SLEEP)
-                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+                    prev = RATE_LIMIT_BACKOFF if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP
+                    RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
                     return None
                 if attempt < retries:
                     time.sleep(delay)
@@ -1545,7 +1518,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=1.0,
     except Exception as e:
         notify(f"⚠️ place_oco_sell unexpected error: {e}")
         return None
-
+        
 # -------------------------
 # CANCEL HELPERS (updated)
 # -------------------------
