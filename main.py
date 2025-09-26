@@ -39,7 +39,7 @@ MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
 MOVEMENT_MIN_PCT = 1.0
 
 # picker tuning
-EMA_UPLIFT_MIN_PCT = 0.001        # fractional uplift threshold (0.001 = 0.1%)
+EMA_UPLIFT_MIN_PCT = 0.001       # fractional uplift threshold (0.001 = 0.1%)
 SCORE_MIN_THRESHOLD = 15.0        # floor score required to accept a candidate
 
 # runtime / pacing
@@ -49,30 +49,27 @@ CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
 
 # order / protection
-TRIGGER_PROXIMITY = 0.015
+TRIGGER_PROXIMITY = 0.010
 STEP_INCREMENT_PCT = 0.01
 BASE_TP_PCT = 3.0
 BASE_SL_PCT = 2.0
 
-# micro-take profit
-MICRO_TP_PCT = 1.0
-MICRO_TP_FRACTION = 0.50
-MICRO_MAX_WAIT = 8.0
+MICRO_TP_PCT = 0.6
+MICRO_TP_FRACTION = 0.20
+MICRO_MAX_WAIT = 15.0
 
-# rolling config
-ROLL_ON_RISE_PCT = 0.6        # require clearer rise
-ROLL_TRIGGER_PCT = 0.9        # require 1% pct trigger
+ROLL_ON_RISE_PCT = 1.0
+ROLL_TRIGGER_PCT = 1.0
 ROLL_TRIGGER_DELTA_ABS = 0.006
-ROLL_TP_STEP_ABS = 0.020
+ROLL_TP_STEP_ABS = 0.010
 ROLL_SL_STEP_ABS = 0.003
-ROLL_COOLDOWN_SECONDS = 60
-MAX_ROLLS_PER_POSITION = 5    
+ROLL_COOLDOWN_SECONDS = 45
+MAX_ROLLS_PER_POSITION = 3
 ROLL_POST_CANCEL_JITTER = (0.3, 0.6)
 
-# Rolling failure tracking (prevents roll spam when OCO repeatedly fails)
-ROLL_FAIL_COUNTER = {}             # symbol -> consecutive failed roll attempts
-FAILED_ROLL_THRESHOLD = 3          # after this many failed roll attempts, pause symbol
-FAILED_ROLL_SKIP_SECONDS = 60 * 60  # 1 hour skip when repeated roll attempts fail
+ROLL_FAIL_COUNTER = {}
+FAILED_ROLL_THRESHOLD = 3
+FAILED_ROLL_SKIP_SECONDS = 60 * 60
 
 # -------------------------
 # INIT / GLOBALS
@@ -95,6 +92,7 @@ SKIP_SECONDS_ON_MARKET_CLOSED = 60 * 60
 
 getcontext().prec = 28
 
+MICRO_TP_USE_IOC = True
 OCO_MAX_LIFE_SECONDS = int(float(os.environ.get('OCO_MAX_LIFE_SECONDS', 6 * 3600)))  # default 6 hours
 
 # Metrics store used by daily reporter & _notify_daily_stats
@@ -1094,28 +1092,18 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
 # -------------------------
 def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO_TP_FRACTION):
     try:
-        # sanitize inputs
         qty = float(qty)
         fraction = float(fraction)
         pct = float(pct)
-
-        # compute intended micro sell qty (rounded down to step)
         intended = qty * fraction
-        sell_qty = round_step(intended, f.get('stepSize', 0.0))
-
-        # compute remainder left after micro sell
-        remainder = round_step(qty - sell_qty, f.get('stepSize', 0.0))
-
-        # decision logging
-        notify(f"ℹ️ Micro TP decision for {symbol}: intended={intended:.8f}, sell_qty={sell_qty}, remainder={remainder}, fraction={fraction}")
-
-        # If remainder would be a dust (non-zero but < minQty), prefer either:
-        #  - increase sell_qty so remainder becomes zero (i.e., sell entire position), or
-        #  - skip micro TP if that would violate minNotional.
-        min_qty = f.get('minQty', 0.0)
         step = f.get('stepSize', 0.0)
         tick = f.get('tickSize', 0.0) or 0.0
+        min_qty = f.get('minQty', 0.0)
         min_notional = f.get('minNotional')
+
+        sell_qty = round_step(intended, step)
+        remainder = round_step(qty - sell_qty, step)
+        notify(f"ℹ️ Micro TP decision for {symbol}: intended={intended:.8f}, sell_qty={sell_qty}, remainder={remainder}, fraction={fraction}")
 
         if remainder > 0 and remainder < min_qty:
             candidate_sell_all = round_step(qty, step)
@@ -1127,24 +1115,17 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
                 notify(f"ℹ️ Skipping micro TP (would leave dust remainder={remainder} < minQty).")
                 return None, 0.0, None
 
-        # ensure sell_qty meets minQty
         if sell_qty <= 0 or sell_qty < min_qty:
             notify(f"ℹ️ Micro TP: sell_qty too small ({sell_qty}) for {symbol}, skipping micro TP.")
             return None, 0.0, None
 
-        # compute TP price and round to tick
         tp_price = float(entry_price) * (1.0 + pct / 100.0)
         if tick and tick > 0:
             tp_price = math.ceil(tp_price / tick) * tick
 
-        # re-check minNotional against rounded qty * rounded price
+        # check minNotional
         if min_notional:
-            # use rounded qty string (post-step) and tp_price (rounded) to evaluate notional
-            qty_str_test = format_qty(sell_qty, step)
-            try:
-                qty_test = float(qty_str_test)
-            except Exception:
-                qty_test = sell_qty
+            qty_test = float(format_qty(sell_qty, step))
             notional = qty_test * tp_price
             if notional < (min_notional - 1e-12):
                 notify(f"⚠️ Micro TP would violate MIN_NOTIONAL for {symbol} (need {min_notional}, have {notional:.6f}). Skipping micro TP.")
@@ -1152,154 +1133,226 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
 
         qty_str = format_qty(sell_qty, step)
         price_str = format_price(tp_price, tick)
+        use_ioc = bool(globals().get('MICRO_TP_USE_IOC', False))
 
-        # Place the limit sell
+        # choose order method: IOC limit (aggressive) or GTC limit (passive)
         try:
-            order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str)
-            notify(f"📍 Micro TP placed for {symbol}: sell {qty_str} @ {price_str} (entry={entry_price:.8f})", priority=True)
-            try:
-                OPEN_ORDERS_CACHE['data'] = None
-            except Exception:
-                pass
-        except Exception as e:
-            notify(f"⚠️ Failed to place micro TP for {symbol}: {e}")
-            return None, 0.0, None
+            c = get_client()
+            if not c:
+                notify(f"❌ Micro TP aborted: API client unavailable for {symbol}")
+                return None, 0.0, None
 
-        # if the client didn't return an orderId, just return the raw result and treat as not filled
-        order_id = None
-        if isinstance(order, dict):
-            order_id = order.get('orderId') or order.get('orderId')
-        if not order_id:
-            # might be synchronous fill or ambiguous response — give caller the object but no fills tracked here
-            return order, sell_qty, tp_price
-
-        # Poll for fills up to MICRO_MAX_WAIT; use small adaptive interval to reduce load
-        poll_interval = 0.6
-        waited = 0.0
-        max_wait = float(MICRO_MAX_WAIT or 20.0)
-        filled_qty = 0.0
-        avg_fill_price = None
-
-        while waited < max_wait:
-            try:
-                status = client.get_order(symbol=symbol, orderId=order_id)
-            except Exception:
-                # if get_order fails, break and attempt to cancel later
-                break
-
-            # parse executedQty / fills
-            executed_qty = 0.0
-            try:
-                ex = status.get('executedQty')
-                if ex is not None:
-                    executed_qty = float(ex)
-            except Exception:
-                executed_qty = 0.0
-
-            if executed_qty == 0.0:
-                fills = status.get('fills') or []
-                total_q = 0.0
-                total_quote = 0.0
-                for fll in fills:
-                    try:
-                        fq = float(fll.get('qty', 0.0) or 0.0)
-                        fp = float(fll.get('price', 0.0) or 0.0)
-                    except Exception:
-                        fq = 0.0; fp = 0.0
-                    total_q += fq
-                    total_quote += fq * fp
-                if total_q > 0:
-                    executed_qty = total_q
-                    avg_fill_price = (total_quote / total_q) if total_q > 0 else None
-
-            if executed_qty and executed_qty > 0.0:
-                # if avg_fill_price not set, attempt to compute from cumulative quote qty
-                if avg_fill_price is None:
-                    cumm = status.get('cummulativeQuoteQty') or status.get('cumulativeQuoteQty') or 0.0
-                    try:
-                        cumm = float(cumm)
-                        if executed_qty > 0 and cumm > 0:
-                            avg_fill_price = cumm / executed_qty
-                    except Exception:
-                        avg_fill_price = None
-                if avg_fill_price is None:
-                    avg_fill_price = tp_price
-
-                filled_qty = round_step(executed_qty, step)
-                # send profit to funding for micro portion (best-effort)
-                profit_usd = (avg_fill_price - float(entry_price)) * filled_qty
+            if use_ioc:
                 try:
-                    profit_to_send = float(round(profit_usd, 6))
-                except Exception:
-                    profit_to_send = profit_usd
-                if profit_to_send and profit_to_send > 0.0:
+                    order_resp = c.create_order(
+                        symbol=symbol,
+                        side='SELL',
+                        type='LIMIT',
+                        timeInForce='IOC',
+                        quantity=qty_str,
+                        price=price_str
+                    )
+                except Exception as e:
+                    # try alternative method names for some clients
                     try:
-                        send_profit_to_funding(profit_to_send)
-                        notify(f"💸 Micro TP profit ${profit_to_send:.6f} for {symbol} sent to funding.", priority=True)
-                    except Exception as e:
-                        notify(f"⚠️ Failed to transfer micro profit for {symbol}: {e}")
-                else:
-                    notify(f"ℹ️ Micro TP filled but profit non-positive (${profit_usd:.6f}) — not sending.")
-                return order, filled_qty, avg_fill_price
-
-            # sleep then continue polling (adaptive increase)
-            time.sleep(poll_interval)
-            waited += poll_interval
-            # gentle backoff to reduce load for long waits
-            if waited > 6.0:
-                poll_interval = min(1.2, poll_interval * 1.2)
-
-        # if we reach here, micro TP not filled in time -> cancel order to free qty for rolling
-        try:
-            client.cancel_order(symbol=symbol, orderId=order_id)
-            notify(f"⚠️ Micro TP timed out and was cancelled for {symbol} after {max_wait}s (sell {qty_str} @ {price_str}).")
-            try:
-                OPEN_ORDERS_CACHE['data'] = None
-            except Exception:
-                pass
-        except Exception as e:
-            notify(f"❌ Failed to cancel stale micro TP for {symbol}: {e}")
-
-        # check if partial fill occurred after cancel (last attempt)
-        try:
-            status2 = None
-            try:
-                status2 = client.get_order(symbol=symbol, orderId=order_id)
-            except Exception:
-                status2 = None
-            if status2:
-                ex2 = status2.get('executedQty')
-                if ex2:
-                    ex2f = float(ex2)
-                    filled_qty = round_step(ex2f, step)
-                    # compute avg fill price if available
-                    fills = status2.get('fills') or []
-                    if fills:
-                        total_q = sum(float(x.get('qty', 0.0) or 0.0) for x in fills)
-                        total_quote = sum(float(x.get('qty', 0.0) or 0.0) * float(x.get('price', 0.0) or 0.0) for x in fills)
-                        if total_q > 0:
-                            avg_fill_price = total_quote / total_q
-                    if filled_qty and filled_qty > 0:
-                        notify(f"ℹ️ Micro TP partially filled after cancel: filled={filled_qty} @ {avg_fill_price or tp_price:.8f}")
-                        # attempt to send funding for any profit (best-effort)
+                        order_resp = c.order_limit(symbol=symbol, quantity=qty_str, price=price_str, timeInForce='IOC')
+                    except Exception:
+                        raise
+                # IOC returns immediate fills (if any) and does not leave a GTC order to poll
+                executed_qty, avg_price = None, None
+                # parse fills if present
+                if isinstance(order_resp, dict):
+                    # parse executedQty / fills
+                    ex = order_resp.get('executedQty')
+                    if ex:
                         try:
-                            profit_usd = (avg_fill_price - float(entry_price)) * filled_qty if avg_fill_price else (tp_price - float(entry_price)) * filled_qty
-                            profit_to_send = float(round(profit_usd, 6))
-                            if profit_to_send and profit_to_send > 0.0:
-                                send_profit_to_funding(profit_to_send)
+                            executed_qty = float(ex)
+                        except Exception:
+                            executed_qty = None
+                    fills = order_resp.get('fills') or []
+                    if fills and (not executed_qty or executed_qty == 0):
+                        total_q = 0.0
+                        total_quote = 0.0
+                        for fll in fills:
+                            try:
+                                fq = float(fll.get('qty', 0.0) or 0.0)
+                                fp = float(fll.get('price', 0.0) or 0.0)
+                            except Exception:
+                                fq = 0.0; fp = 0.0
+                            total_q += fq
+                            total_quote += fq * fp
+                        if total_q > 0:
+                            executed_qty = total_q
+                            avg_price = (total_quote / total_q) if total_q > 0 else None
+                    # fallback cummulative
+                    if (not avg_price or avg_price is None) and isinstance(order_resp.get('cummulativeQuoteQty'), (int, float, str)):
+                        try:
+                            exq = float(order_resp.get('executedQty') or 0.0)
+                            cumq = float(order_resp.get('cummulativeQuoteQty') or order_resp.get('cumQuote') or 0.0)
+                            if exq and cumq:
+                                avg_price = cumq / exq
+                                executed_qty = exq
                         except Exception:
                             pass
-                        return order, filled_qty, avg_fill_price
-        except Exception:
-            pass
 
-        # nothing filled
-        return None, 0.0, None
+                if executed_qty and executed_qty > 0:
+                    filled_qty = round_step(executed_qty, step)
+                    if avg_price is None:
+                        avg_price = tp_price
+                    profit_usd = (avg_price - float(entry_price)) * filled_qty
+                    profit_to_send = float(round(profit_usd, 6)) if profit_usd is not None else 0.0
+                    if profit_to_send and profit_to_send > 0.0:
+                        try:
+                            send_profit_to_funding(profit_to_send)
+                            notify(f"💸 Micro TP profit ${profit_to_send:.6f} for {symbol} sent to funding.", priority=True)
+                        except Exception as e:
+                            notify(f"⚠️ Failed to transfer micro profit for {symbol}: {e}")
+                    else:
+                        notify(f"ℹ️ Micro TP filled but profit non-positive (${profit_usd:.6f}) — not sending.")
+                    try:
+                        OPEN_ORDERS_CACHE['data'] = None
+                    except Exception:
+                        pass
+                    return order_resp, filled_qty, avg_price
+                # nothing filled by IOC
+                notify(f"⚠️ Micro TP (IOC) not filled for {symbol} (sell {qty_str} @ {price_str}).")
+                try:
+                    OPEN_ORDERS_CACHE['data'] = None
+                except Exception:
+                    pass
+                return None, 0.0, None
+
+            else:
+                # GTC limit path: place limit and poll (existing behaviour)
+                order = c.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str)
+                notify(f"📍 Micro TP placed for {symbol}: sell {qty_str} @ {price_str} (entry={entry_price:.8f})", priority=True)
+                try:
+                    OPEN_ORDERS_CACHE['data'] = None
+                except Exception:
+                    pass
+
+                order_id = None
+                if isinstance(order, dict):
+                    order_id = order.get('orderId') or order.get('orderId')
+                if not order_id:
+                    return order, sell_qty, tp_price
+
+                poll_interval = 0.6
+                waited = 0.0
+                max_wait = float(globals().get('MICRO_MAX_WAIT', MICRO_MAX_WAIT) or 20.0)
+                filled_qty = 0.0
+                avg_fill_price = None
+
+                while waited < max_wait:
+                    try:
+                        status = c.get_order(symbol=symbol, orderId=order_id)
+                    except Exception:
+                        break
+
+                    executed_qty = 0.0
+                    try:
+                        ex = status.get('executedQty')
+                        if ex is not None:
+                            executed_qty = float(ex)
+                    except Exception:
+                        executed_qty = 0.0
+
+                    if executed_qty == 0.0:
+                        fills = status.get('fills') or []
+                        total_q = 0.0
+                        total_quote = 0.0
+                        for fll in fills:
+                            try:
+                                fq = float(fll.get('qty', 0.0) or 0.0)
+                                fp = float(fll.get('price', 0.0) or 0.0)
+                            except Exception:
+                                fq = 0.0; fp = 0.0
+                            total_q += fq
+                            total_quote += fq * fp
+                        if total_q > 0:
+                            executed_qty = total_q
+                            avg_fill_price = (total_quote / total_q) if total_q > 0 else None
+
+                    if executed_qty and executed_qty > 0.0:
+                        if avg_fill_price is None:
+                            cumm = status.get('cummulativeQuoteQty') or status.get('cumulativeQuoteQty') or 0.0
+                            try:
+                                cumm = float(cumm)
+                                if executed_qty > 0 and cumm > 0:
+                                    avg_fill_price = cumm / executed_qty
+                            except Exception:
+                                avg_fill_price = None
+                        if avg_fill_price is None:
+                            avg_fill_price = tp_price
+
+                        filled_qty = round_step(executed_qty, step)
+                        profit_usd = (avg_fill_price - float(entry_price)) * filled_qty
+                        profit_to_send = float(round(profit_usd, 6)) if profit_usd is not None else 0.0
+                        if profit_to_send and profit_to_send > 0.0:
+                            try:
+                                send_profit_to_funding(profit_to_send)
+                                notify(f"💸 Micro TP profit ${profit_to_send:.6f} for {symbol} sent to funding.", priority=True)
+                            except Exception as e:
+                                notify(f"⚠️ Failed to transfer micro profit for {symbol}: {e}")
+                        else:
+                            notify(f"ℹ️ Micro TP filled but profit non-positive (${profit_usd:.6f}) — not sending.")
+                        return order, filled_qty, avg_fill_price
+
+                    time.sleep(poll_interval)
+                    waited += poll_interval
+                    if waited > 6.0:
+                        poll_interval = min(1.2, poll_interval * 1.2)
+
+                # timed out: cancel and check partial fills
+                try:
+                    c.cancel_order(symbol=symbol, orderId=order_id)
+                    notify(f"⚠️ Micro TP timed out and was cancelled for {symbol} after {max_wait}s (sell {qty_str} @ {price_str}).")
+                    try:
+                        OPEN_ORDERS_CACHE['data'] = None
+                    except Exception:
+                        pass
+                except Exception as e:
+                    notify(f"❌ Failed to cancel stale micro TP for {symbol}: {e}")
+
+                # check partial fill after cancel
+                try:
+                    status2 = c.get_order(symbol=symbol, orderId=order_id)
+                except Exception:
+                    status2 = None
+                if status2:
+                    ex2 = status2.get('executedQty')
+                    if ex2:
+                        try:
+                            ex2f = float(ex2)
+                        except Exception:
+                            ex2f = 0.0
+                        filled_qty = round_step(ex2f, step)
+                        fills = status2.get('fills') or []
+                        if fills:
+                            total_q = sum(float(x.get('qty', 0.0) or 0.0) for x in fills)
+                            total_quote = sum(float(x.get('qty', 0.0) or 0.0) * float(x.get('price', 0.0) or 0.0) for x in fills)
+                            avg_fill_price = (total_quote/total_q) if total_q > 0 else None
+                        if filled_qty and filled_qty > 0:
+                            notify(f"ℹ️ Micro TP partially filled after cancel: filled={filled_qty} @ {avg_fill_price or tp_price:.8f}")
+                            try:
+                                profit_usd = (avg_fill_price - float(entry_price)) * filled_qty if avg_fill_price else (tp_price - float(entry_price)) * filled_qty
+                                profit_to_send = float(round(profit_usd,6))
+                                if profit_to_send and profit_to_send > 0.0:
+                                    send_profit_to_funding(profit_to_send)
+                            except Exception:
+                                pass
+                            return order, filled_qty, avg_fill_price
+
+                return None, 0.0, None
+
+        except Exception as e:
+            notify(f"⚠️ place_micro_tp inner error: {e}")
+            return None, 0.0, None
 
     except Exception as e:
         notify(f"⚠️ place_micro_tp error: {e}")
         return None, 0.0, None
-
+        
 def monitor_and_roll(symbol, qty, entry_price, f):
     orig_qty = qty
     curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
