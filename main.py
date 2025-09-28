@@ -43,7 +43,7 @@ EMA_UPLIFT_MIN_PCT = 0.0008        # fractional uplift threshold (0.001 = 0.1%)
 SCORE_MIN_THRESHOLD = 13.0        # floor score required to accept a candidate
 
 # runtime / pacing
-TRADE_USD = 10.0
+TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 8
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
@@ -74,9 +74,6 @@ ROLL_FAIL_COUNTER = {}             # symbol -> consecutive failed roll attempts
 FAILED_ROLL_THRESHOLD = 3          # after this many failed roll attempts, pause symbol
 FAILED_ROLL_SKIP_SECONDS = 60 * 60  # 1 hour skip when repeated roll attempts fail
 
-# -------------------------
-# INIT / GLOBALS
-# -------------------------
 # notification tweaks (defaults)
 NOTIFY_QUEUE_MAX = 1000        # max queued messages (increase if you log a lot)
 NOTIFY_RETRY = 2               # number of retries for Telegram send
@@ -1763,7 +1760,7 @@ def trade_cycle():
                     candidate = None
 
             if not candidate:
-                notify("⚠️ No eligible coin found. Sleeping...")
+                notify("No eligible coin found. Sleeping...")
                 if RATE_LIMIT_BACKOFF:
                     notify(f"⏸ Rate-limit backoff active: sleeping {RATE_LIMIT_BACKOFF}s")
                     time.sleep(RATE_LIMIT_BACKOFF)
