@@ -102,7 +102,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 240
+CACHE_TTL = 300
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -512,21 +512,15 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # PICKER (tweaked)
 # -------------------------
 def pick_coin():
-    """
-    Pick candidate symbol. Uses MIN_VOL_RATIO as a hard filter on short-term volume uplift.
-    Tries to call compute_recent_volatility() and compute_trade_size_by_volatility() if available,
-    otherwise falls back to simple local implementations so we don't crash.
-    Returns (symbol, price, qvol, change, closes) or None.
-    """
-    global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
+      global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
 
     try:
         t0 = time.time()
         now = t0
 
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
-        DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.04)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 40)
+        DEEP_EVAL = globals().get('DEEP_EVAL', 2)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
 
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
@@ -1528,7 +1522,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=4.0, sl_pct=0.8,
             return {'tp': tp, 'sl': sp, 'method': 'oco', 'raw': oco}
         except BinanceAPIException as e:
             err = str(e)
-            notify(f"⚠️ OCO SELL attempt {attempt} (standard) failed: {err}")
+            notify(f"OCO SELL attempt {attempt} (standard) failed: {err}")
             if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err:
                 # try to increase qty then retry
                 if min_notional:
@@ -1648,7 +1642,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=4.0, sl_pct=0.8,
     notify("❌ All attempts to protect position failed (no TP/SL placed). TEMP skipping symbol.")
     TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
     return None
-
+    
 # -------------------------
 # CANCEL HELPERS (updated)
 # -------------------------
