@@ -512,9 +512,9 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # PICKER (tweaked)
 # -------------------------
 def pick_coin():
-      global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
-      
-      try:
+    global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
+
+    try:
         t0 = time.time()
         now = t0
 
@@ -523,14 +523,32 @@ def pick_coin():
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
 
-        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
-        SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD if 'SCORE_MIN_THRESHOLD' in globals() else 14.0)
+        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', 0.001)
+        SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', 14.0)
 
         REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
         PREBUY_BREAKOUT_MARGIN = globals().get('PREBUY_BREAKOUT_MARGIN', 0.0015)
 
         MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.25)
-        MIN_QUOTE_VOL = globals().get('MIN_QUOTE_VOL', max(globals().get('MIN_VOLUME', MIN_VOLUME), 300_000))
+        min_volume = globals().get('MIN_VOLUME', 0)
+        MIN_QUOTE_VOL = globals().get('MIN_QUOTE_VOL', max(min_volume, 300_000))
+
+        PRICE_MIN = globals().get('PRICE_MIN', 0.0)
+        PRICE_MAX = globals().get('PRICE_MAX', float('inf'))
+        MAX_24H_CHANGE_ABS = globals().get('MAX_24H_CHANGE_ABS', float('inf'))
+        MAX_24H_RISE_PCT = globals().get('MAX_24H_RISE_PCT', float('inf'))
+        REBUY_COOLDOWN = globals().get('REBUY_COOLDOWN', 0)
+        REBUY_MAX_RISE_PCT = globals().get('REBUY_MAX_RISE_PCT', 100.0)
+
+        RATE_LIMIT_BASE_SLEEP = globals().get('RATE_LIMIT_BASE_SLEEP', 1.0)
+        RATE_LIMIT_BACKOFF_MAX = globals().get('RATE_LIMIT_BACKOFF_MAX', 60.0)
+
+        TRADE_USD = globals().get('TRADE_USD', globals().get('TRADE_USD', 8.0))
+        TARGET_VOL_FRACTION = globals().get('TARGET_VOL_FRACTION', 0.01)
+        MIN_TRADE_USD = globals().get('MIN_TRADE_USD', 5.0)
+        MAX_TRADE_USD = globals().get('MAX_TRADE_USD', 1000.0)
+
+        QUOTE = globals().get('QUOTE', 'USDT')
 
         tickers = get_tickers_cached() or []
         prefiltered = []
@@ -540,11 +558,11 @@ def pick_coin():
             if not sym or not sym.endswith(QUOTE):
                 continue
 
-            skip_until = TEMP_SKIP.get(sym)
+            skip_until = TEMP_SKIP.get(sym) if isinstance(TEMP_SKIP, dict) else None
             if skip_until and now < skip_until:
                 continue
 
-            last_buy = RECENT_BUYS.get(sym)
+            last_buy = RECENT_BUYS.get(sym) if isinstance(RECENT_BUYS, dict) else None
             try:
                 price = float(t.get('lastPrice') or 0.0)
                 qvol = float(t.get('quoteVolume') or 0.0)
@@ -552,23 +570,23 @@ def pick_coin():
             except Exception:
                 continue
 
-            if not (globals().get('PRICE_MIN', PRICE_MIN) <= price <= globals().get('PRICE_MAX', PRICE_MAX)):
+            if not (PRICE_MIN <= price <= PRICE_MAX):
                 continue
 
             if qvol < MIN_QUOTE_VOL:
                 continue
 
-            if abs(change_pct) > globals().get('MAX_24H_CHANGE_ABS', MAX_24H_CHANGE_ABS):
+            if abs(change_pct) > MAX_24H_CHANGE_ABS:
                 continue
-            if change_pct > globals().get('MAX_24H_RISE_PCT', MAX_24H_RISE_PCT):
+            if change_pct > MAX_24H_RISE_PCT:
                 continue
 
             if last_buy:
                 cd = last_buy.get('cooldown', REBUY_COOLDOWN)
-                if now < last_buy['ts'] + cd:
+                if now < last_buy.get('ts', 0) + cd:
                     continue
                 last_price = last_buy.get('price')
-                if last_price and price > last_price * (1 + globals().get('REBUY_MAX_RISE_PCT', REBUY_MAX_RISE_PCT) / 100.0):
+                if last_price and price > last_price * (1 + REBUY_MAX_RISE_PCT / 100.0):
                     continue
 
             prefiltered.append((sym, price, qvol, change_pct))
@@ -601,7 +619,7 @@ def pick_coin():
             gains = []
             losses = []
             for i in range(1, len(closes)):
-                diff = closes[i] - closes[i-1]
+                diff = closes[i] - closes[i - 1]
                 gains.append(max(0.0, diff))
                 losses.append(max(0.0, -diff))
             avg_gain = sum(gains[:period]) / period
@@ -612,21 +630,20 @@ def pick_coin():
             rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
             return 100 - (100 / (1 + rs))
 
-        # local fallback volatility calculator (fractional volatility)
         def _local_recent_volatility(closes):
             if not closes or len(closes) < 2:
                 return 0.0
             rets = []
             for i in range(1, len(closes)):
-                if closes[i-1] == 0:
+                if closes[i - 1] == 0:
                     rets.append(0.0)
                 else:
-                    rets.append((closes[i] - closes[i-1]) / closes[i-1])
+                    rets.append((closes[i] - closes[i - 1]) / closes[i - 1])
             if not rets:
                 return 0.0
             mean = sum(rets) / len(rets)
             var = sum((r - mean) ** 2 for r in rets) / len(rets)
-            return math.sqrt(var)  # fractional (e.g., 0.01 = 1%)
+            return math.sqrt(var)
 
         for sym, last_price, qvol, change_pct in sampled:
             try:
@@ -668,7 +685,6 @@ def pick_coin():
                 prev_avg = (sum(vols[:-1]) / max(1, len(vols[:-1]))) if len(vols) > 1 else recent_vol
                 vol_ratio = recent_vol / (prev_avg + 1e-12)
 
-                # HARD filter: require volume uplift
                 if vol_ratio < MIN_VOL_RATIO:
                     continue
 
@@ -676,7 +692,6 @@ def pick_coin():
                 if len(closes) >= 4 and closes[-4] > 0:
                     recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
 
-                # volatility (try global function then fallback)
                 try:
                     vol_f = compute_recent_volatility(closes) if 'compute_recent_volatility' in globals() else None
                     if vol_f is None:
@@ -684,12 +699,10 @@ def pick_coin():
                 except Exception:
                     vol_f = _local_recent_volatility(closes)
 
-                # breakout requirement
                 if len(closes) >= 4:
                     if not (closes[-1] > max(closes[:-1]) * (1.0 + PREBUY_BREAKOUT_MARGIN)):
                         continue
 
-                # momentum last3
                 last3 = closes[-3:]
                 ups = 0
                 if len(last3) >= 2 and last3[1] > last3[0]:
@@ -715,7 +728,6 @@ def pick_coin():
                 if rsi_val is not None and (rsi_val > 65 or rsi_val < 25):
                     continue
 
-                # optional orderbook check
                 if REQUIRE_OB_IN_PICK:
                     try:
                         if not orderbook_bullish(sym, depth=5, min_imbalance=1.08, max_spread_pct=0.6):
@@ -723,7 +735,6 @@ def pick_coin():
                     except Exception:
                         continue
 
-                # scoring
                 score = 0.0
                 score += max(0.0, recent_pct) * 12.0
                 try:
@@ -740,13 +751,15 @@ def pick_coin():
                 if score < SCORE_MIN:
                     continue
 
-                # suggested trade sizing using compute_trade_size_by_volatility (if available)
                 try:
                     if 'compute_trade_size_by_volatility' in globals():
-                        suggested_usd = compute_trade_size_by_volatility(closes, base_usd=globals().get('TRADE_USD', TRADE_USD),
-                                                                        target_vol=globals().get('TARGET_VOL_FRACTION', TARGET_VOL_FRACTION),
-                                                                        min_usd=globals().get('MIN_TRADE_USD', MIN_TRADE_USD),
-                                                                        max_usd=globals().get('MAX_TRADE_USD', MAX_TRADE_USD))
+                        suggested_usd = compute_trade_size_by_volatility(
+                            closes,
+                            base_usd=globals().get('TRADE_USD', TRADE_USD),
+                            target_vol=globals().get('TARGET_VOL_FRACTION', TARGET_VOL_FRACTION),
+                            min_usd=globals().get('MIN_TRADE_USD', MIN_TRADE_USD),
+                            max_usd=globals().get('MAX_TRADE_USD', MAX_TRADE_USD)
+                        )
                     else:
                         suggested_usd = globals().get('TRADE_USD', TRADE_USD)
                 except Exception:
