@@ -513,8 +513,8 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 # -------------------------
 def pick_coin():
       global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
-
-    try:
+      
+      try:
         t0 = time.time()
         now = t0
 
