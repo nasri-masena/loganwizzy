@@ -142,7 +142,7 @@ def notify(msg: str, priority: bool = False, category: str = None):
                     allow = True
                 elif msg.startswith("🔁 Moved"):
                     allow = True
-                elif msg.startswith("📌 STOP_MARKE"):
+                elif msg.startswith("📌 STOP_MARKET"):
                     allow = True
                 elif msg.startswith("💸 Profit"):
                     allow = True
@@ -309,6 +309,52 @@ def get_trade_candidates():
     }
     return [(symbol, score_data)]
 
+def get_current_position_qty(symbol) -> float:
+    try:
+        asset = symbol[:-len(QUOTE)]
+        bal = client.get_asset_balance(asset=asset)
+        if not bal:
+            return 0.0
+        free = float(bal.get('free') or 0.0)
+        locked = float(bal.get('locked') or 0.0)
+        return free + locked
+    except Exception:
+        try:
+            # fallback: try get_free_asset only
+            return float(get_free_asset(asset))
+        except Exception:
+            return 0.0
+
+def get_last_fill_price(symbol: str):
+    try:
+        trades = client.get_my_trades(symbol=symbol, limit=10)
+        if not trades:
+            return None
+        # trades usually ordered by time ascending; safe pick last element
+        last = trades[-1]
+        price = float(last.get('price') or 0.0)
+        return price
+    except Exception:
+        return None
+        
+def round_price_step(price: float, symbol: str):
+    try:
+        info = get_symbol_info_cached(symbol)
+        f = get_filters(info) if info else {}
+        tick = f.get('tickSize') or 0.0
+        if not tick or tick == 0:
+            return float(price)
+        # determine precision from tick (Decimal trick)
+        t = Decimal(str(tick))
+        precision = max(0, -t.as_tuple().exponent)
+        dec = Decimal(str(price)).quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN)
+        return float(dec)
+    except Exception:
+        try:
+            return float(round(price, 8))
+        except Exception:
+            return price
+            
 # -------------------------
 # TRANSFERS
 # -------------------------
@@ -453,6 +499,67 @@ def cleanup_recent_buys():
         if now >= info['ts'] + cd:
             del RECENT_BUYS[s]
 
+def calculate_realized_profit(symbol: str, sold_amount: float = None) -> float:
+    try:
+        trades = client.get_my_trades(symbol=symbol)
+    except Exception:
+        return 0.0
+
+    # convert trades to list of (side, qty, price, quote)
+    sells = []
+    buys = []
+    for t in trades:
+        try:
+            qty = float(t.get('qty') or t.get('executedQty') or 0.0)
+            price = float(t.get('price') or 0.0)
+            quote = qty * price
+            is_buyer = t.get('isBuyer') in (True, 'true', 'True', 1)
+            if is_buyer:
+                buys.append((qty, price, quote))
+            else:
+                sells.append((qty, price, quote))
+        except Exception:
+            continue
+
+    # if no sells, profit 0
+    if not sells:
+        return 0.0
+
+    # if user provided sold_amount, limit to that amount (sum earliest sells)
+    total_sold = sum(q for q,_,_ in sells)
+    if sold_amount and sold_amount > 0 and sold_amount < total_sold:
+        remaining = sold_amount
+        proceeds = 0.0
+        proportion = 0.0
+        for q, p, quote in sells:
+            take = min(q, remaining)
+            proceeds += take * p
+            remaining -= take
+            if remaining <= 1e-12:
+                break
+    else:
+        proceeds = sum(q*p for q,p,_ in sells)
+
+    # approximate cost basis: proportionally consume buys to match sold qty
+    # We'll approximate average buy price by total buy quote / total buy qty.
+    total_buy_qty = sum(q for q,_,_ in buys)
+    total_buy_quote = sum(quote for _,_,quote in buys)
+    if total_buy_qty > 0:
+        avg_buy_price = (total_buy_quote / total_buy_qty)
+    else:
+        avg_buy_price = None
+
+    # if avg_buy_price known, estimate profit = proceeds - sold_qty * avg_buy_price
+    sold_qty_used = sold_amount if (sold_amount and sold_amount > 0) else sum(q for q,_,_ in sells)
+    if avg_buy_price:
+        profit = proceeds - (sold_qty_used * avg_buy_price)
+        return float(profit)
+    else:
+        # fallback: use difference between sells and buys totals
+        total_sell_quote = sum(q*p for q,p,_ in sells)
+        profit_est = total_sell_quote - total_buy_quote
+        return float(profit_est)
+        
 def compute_recent_volatility(closes):
     try:
         if not closes or len(closes) < 3:
@@ -1059,34 +1166,53 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
 # -------------------------
 # SAFE SELL FALLBACK (market)
 # -------------------------
-def place_market_sell_fallback(symbol, qty, f):
-    """Try market sell to ensure closing when all protective order attempts failed."""
+def place_market_sell_fallback(symbol, qty=None, filters=None):
     try:
-        if not f:
+        # determine filters if not provided
+        if filters is None:
             info = get_symbol_info_cached(symbol)
-            f = get_filters(info) if info else {}
-    except Exception:
-        f = f or {}
-    try:
-        qty_str = format_qty(qty, f.get('stepSize', 0.0))
-    except Exception:
-        qty_str = str(qty)
-    notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
-    try:
+            filters = get_filters(info) if info else {}
+
+        step = filters.get('stepSize') or None
+        min_qty = filters.get('minQty') or 0.0
+
+        # prefer actual position qty (locked+free) for sell
         try:
-            resp = client.order_market_sell(symbol=symbol, quantity=qty_str)
+            pos_qty = float(get_current_position_qty(symbol))
         except Exception:
-            resp = client.create_order(symbol=symbol, side='SELL', type='MARKET', quantity=qty_str)
-        notify(f"✅ Market sell fallback executed for {symbol}")
+            pos_qty = None
+
+        if qty is None:
+            qty_to_sell = pos_qty if pos_qty is not None else float(get_free_asset(symbol[:-len(QUOTE)]))
+        else:
+            qty_to_sell = float(qty)
+
+        # round down to step
+        if step:
+            qty_to_sell = math.floor(qty_to_sell / step) * step
+
+        if qty_to_sell <= 0 or qty_to_sell < min_qty:
+            notify(f"❌ Market sell fallback: qty too small for {symbol} after rounding ({qty_to_sell} < minQty {min_qty})")
+            return None
+
+        qty_str = format_qty(qty_to_sell, step)
+        # place market sell
+        order = client.create_order(symbol=symbol, side='SELL', type='MARKET', quantity=qty_str)
         try:
             OPEN_ORDERS_CACHE['data'] = None
         except Exception:
             pass
-        return resp
+        notify(f"⚠️ Emergency MARKET sell executed for {symbol}: qty={qty_str}")
+        return order
     except Exception as e:
         notify(f"❌ Market sell fallback failed for {symbol}: {e}")
+        # after failing, refresh balances and set TEMP_SKIP to avoid retry storm
+        try:
+            TEMP_SKIP[symbol] = time.time() + FAILED_ROLL_SKIP_SECONDS
+        except Exception:
+            pass
         return None
-
+        
 # ---------------------------
 # place_stop_market_order
 # ---------------------------
@@ -1281,20 +1407,18 @@ def place_stop_market_order(symbol, qty, stop_price, retries=3, delay=1):
 # monitor_and_roll (slightly adjusted to use place_stop_market_order)
 # ---------------------------
 def monitor_and_roll(symbol, bought_qty, avg_buy_price, ctx=None):
-    """
-    Monitors a bought position and moves stop higher as price rises.
-    Uses place_stop_market_order() for placing stops and cancel_order() to remove old stops.
-    """
-    global TEMP_SKIP, RATE_LIMIT_BACKOFF
+    global TEMP_SKIP, RATE_LIMIT_BACKOFF, ROLL_FAIL_COUNTER, FAILED_ROLL_SKIP_SECONDS
 
-    # defaults
     cfg = {
-        'TRAIL_START_PCT': 0.8,
-        'TRAIL_DOWN_PCT': 1.5,
+        'TRAIL_START_PCT': globals().get('TRAIL_START_PCT', 0.8),
+        'TRAIL_DOWN_PCT': globals().get('TRAIL_DOWN_PCT', 1.5),
         'POLL_INTERVAL': 2.0,
         'MAX_POSITION_TIME_SECONDS': 4 * 3600,
-        'INITIAL_SL_PCT': 0.8,
+        'INITIAL_SL_PCT': globals().get('BASE_SL_PCT', 2.0),
         'MIN_CANCEL_WAIT': 0.25,
+        'MIN_TIME_BETWEEN_ROLLS': 3.0,
+        'MIN_PRICE_DELTA_PCT': 0.05,  # require at least 0.05% improvement to move stop
+        'MAX_ROLLS': globals().get('MAX_ROLLS_PER_POSITION', 9999999),
     }
     if ctx:
         cfg.update(ctx)
@@ -1305,34 +1429,36 @@ def monitor_and_roll(symbol, bought_qty, avg_buy_price, ctx=None):
     MAX_POSITION_TIME_SECONDS = float(cfg['MAX_POSITION_TIME_SECONDS'])
     INITIAL_SL_PCT = float(cfg['INITIAL_SL_PCT'])
     MIN_CANCEL_WAIT = float(cfg['MIN_CANCEL_WAIT'])
+    MIN_TIME_BETWEEN_ROLLS = float(cfg['MIN_TIME_BETWEEN_ROLLS'])
+    MIN_PRICE_DELTA_PCT = float(cfg['MIN_PRICE_DELTA_PCT'])
+    MAX_ROLLS = int(cfg['MAX_ROLLS'])
 
     start_ts = time.time()
     highest_price = float(avg_buy_price)
     qty_left = float(bought_qty)
-
     current_stop_order = None
     current_stop_price = None
+    rolls_done = 0
+    last_roll_ts = 0.0
+    total_profit_usd = 0.0
+    exit_price = None
 
     info = get_symbol_info_cached(symbol)
     f = get_filters(info) if info else {}
-    price_tick = f.get('tickSize') or None
-    qty_step = f.get('stepSize') or None
-
     def _round_price(p):
         try:
             return round_price_step(p, symbol)
         except Exception:
             return p
-
     def _round_qty(q):
         try:
             return round_step(q, symbol)
         except Exception:
             return q
 
-    # place initial conservative stop near buy (optional)
+    # place an initial conservative stop near buy (best-effort)
     try:
-        initial_stop_price = avg_buy_price * (1.0 - INITIAL_SL_PCT / 100.0)
+        initial_stop_price = avg_buy_price * (1.0 - INITIAL_SL_PCT/100.0)
         initial_stop_price = _round_price(initial_stop_price)
         if qty_left > 0 and initial_stop_price > 0:
             try:
@@ -1346,16 +1472,27 @@ def monitor_and_roll(symbol, bought_qty, avg_buy_price, ctx=None):
     except Exception as e:
         notify(f"Failed to compute/place initial stop for {symbol}: {e}")
 
-    # monitoring loop
+    # main loop
     while True:
+        # respect global rate-limit backoff: slow down activity if set
+        if RATE_LIMIT_BACKOFF and RATE_LIMIT_BACKOFF > 0:
+            notify(f"⏸️ Respecting rate-limit backoff ({RATE_LIMIT_BACKOFF}s) before trailing for {symbol}")
+            time.sleep(max(RATE_LIMIT_BACKOFF, POLL_INTERVAL))
+
         now = time.time()
+        # safety: maximum hold time
         if now - start_ts > MAX_POSITION_TIME_SECONDS:
             notify(f"Max position time reached for {symbol}. Forcing market exit of remaining {qty_left}")
             try:
                 place_market_sell_fallback(symbol, qty_left, f)
             except Exception as e:
                 notify(f"Emergency market sell failed for {symbol}: {e}")
-            break
+            # compute profit best-effort
+            try:
+                total_profit_usd = calculate_realized_profit(symbol) or total_profit_usd
+            except Exception:
+                pass
+            return True, exit_price, total_profit_usd
 
         # get latest price
         try:
@@ -1368,60 +1505,106 @@ def monitor_and_roll(symbol, bought_qty, avg_buy_price, ctx=None):
         if price > highest_price:
             highest_price = price
 
-        # start trailing if not started and price moved up enough
+        # if not yet started trailing, see if we should start
         if current_stop_price is None:
             up_pct = (highest_price / avg_buy_price - 1.0) * 100.0
             if up_pct >= TRAIL_START_PCT:
-                desired_stop = highest_price * (1.0 - TRAIL_DOWN_PCT / 100.0)
+                desired_stop = highest_price * (1.0 - TRAIL_DOWN_PCT/100.0)
                 desired_stop = _round_price(desired_stop)
                 if desired_stop >= price:
-                    desired_stop = _round_price(price * (1.0 - TRAIL_DOWN_PCT / 100.0))
+                    desired_stop = _round_price(price * (1.0 - TRAIL_DOWN_PCT/100.0))
+                # check actual qty before placing
                 try:
+                    actual_qty = float(get_current_position_qty(symbol))
+                except Exception:
+                    actual_qty = qty_left
+                min_qty = (f.get('minQty') or 0.0)
+                if actual_qty <= 0 or actual_qty < min_qty:
+                    notify(f"⚠️ Not starting trailing for {symbol}: actual qty too small ({actual_qty})")
+                    TEMP_SKIP[symbol] = time.time() + FAILED_ROLL_SKIP_SECONDS
+                    # reconcile attempted emergency sell of anything leftover then exit
                     try:
-                        qty_left = float(get_current_position_qty(symbol))
+                        place_market_sell_fallback(symbol, actual_qty, f)
                     except Exception:
                         pass
-                    if qty_left <= 0:
-                        notify(f"No remaining qty for {symbol} at trail start (qty_left={qty_left}). Exiting monitor.")
-                        break
-                    current_stop_order = place_stop_market_order(symbol, qty_left, desired_stop)
+                    # compute profit
+                    try:
+                        total_profit_usd = calculate_realized_profit(symbol) or total_profit_usd
+                    except Exception:
+                        pass
+                    return True, exit_price, total_profit_usd
+
+                try:
+                    current_stop_order = place_stop_market_order(symbol, actual_qty, desired_stop)
                     current_stop_price = desired_stop
+                    qty_left = actual_qty
                     notify(f"Started trailing for {symbol}: placed stop {current_stop_price} (peak {highest_price:.8f})")
+                    last_roll_ts = time.time()
                 except Exception as e:
                     notify(f"Failed to place initial trailing stop for {symbol}: {e}")
                     current_stop_order = None
                     current_stop_price = None
         else:
-            # already trailing: compute desired higher stop
-            desired_stop = highest_price * (1.0 - TRAIL_DOWN_PCT / 100.0)
+            # compute new desired stop based on peak
+            desired_stop = highest_price * (1.0 - TRAIL_DOWN_PCT/100.0)
             desired_stop = _round_price(desired_stop)
 
+            # only move stop up
             if desired_stop > (current_stop_price or 0):
-                # refresh qty_left
+                # ensure we aren't rolling too fast (time guard)
+                if time.time() - last_roll_ts < MIN_TIME_BETWEEN_ROLLS:
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                # require a minimum percent improvement to avoid tiny bumps
                 try:
-                    qty_left = float(get_current_position_qty(symbol))
+                    if current_stop_price and current_stop_price > 0:
+                        pct_improvement = (desired_stop - current_stop_price) / current_stop_price * 100.0
+                    else:
+                        pct_improvement = 100.0
                 except Exception:
-                    pass
+                    pct_improvement = 100.0
 
-                if qty_left <= 0:
-                    notify(f"Position for {symbol} closed while preparing to move stop.")
-                    break
+                if pct_improvement < MIN_PRICE_DELTA_PCT:
+                    # not significant improvement
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
-                # cancel old stop if exists
+                # check actual qty before cancel/placing new stop
+                try:
+                    actual_qty = float(get_current_position_qty(symbol))
+                except Exception:
+                    actual_qty = qty_left
+                min_qty = (f.get('minQty') or 0.0)
+                if actual_qty <= 0 or actual_qty < min_qty:
+                    notify(f"⚠️ In monitor_and_roll: actual position qty too small ({actual_qty}) for {symbol}; aborting rolling.")
+                    TEMP_SKIP[symbol] = time.time() + FAILED_ROLL_SKIP_SECONDS
+                    try:
+                        place_market_sell_fallback(symbol, actual_qty, f)
+                    except Exception:
+                        pass
+                    try:
+                        total_profit_usd = calculate_realized_profit(symbol) or total_profit_usd
+                    except Exception:
+                        pass
+                    return True, exit_price, total_profit_usd
+
+                # cancel existing stop (if any) and reconcile
                 if current_stop_order:
                     try:
                         cancel_order(current_stop_order)
-                        time.sleep(MIN_CANCEL_WAIT)
+                        time.sleep(MIN_CANCEL_WAIT + random.uniform(*ROLL_POST_CANCEL_JITTER))
                     except Exception as e:
                         notify(f"Warning: cancel order failed for {symbol}: {e}")
 
-                    # reconcile after cancel: check whether partial fill happened
+                    # After cancel, check if order filled during cancel
                     try:
                         new_qty = float(get_current_position_qty(symbol))
                     except Exception:
-                        new_qty = qty_left
-                    if new_qty < qty_left - 1e-12:
-                        sold_amount = qty_left - new_qty
+                        new_qty = actual_qty
+
+                    if new_qty < actual_qty - 1e-12:
+                        sold_amount = actual_qty - new_qty
                         try:
                             profit = calculate_realized_profit(symbol, sold_amount)
                         except Exception:
@@ -1430,6 +1613,7 @@ def monitor_and_roll(symbol, bought_qty, avg_buy_price, ctx=None):
                         try:
                             if profit is not None:
                                 send_profit_to_funding(symbol, profit)
+                                total_profit_usd += profit
                         except Exception:
                             pass
                         qty_left = new_qty
@@ -1437,25 +1621,43 @@ def monitor_and_roll(symbol, bought_qty, avg_buy_price, ctx=None):
                             notify(f"All qty sold for {symbol} while moving stop. Exiting monitor.")
                             current_stop_order = None
                             current_stop_price = None
-                            break
+                            try:
+                                total_profit_usd = calculate_realized_profit(symbol) or total_profit_usd
+                            except Exception:
+                                pass
+                            return True, exit_price, total_profit_usd
+                        # update actual_qty for placing new stop
+                        actual_qty = qty_left
 
-                # place new stop at desired_stop for remaining qty
+                # now place the new stop for remaining qty
                 try:
-                    qty_to_place = _round_qty(qty_left)
+                    qty_to_place = _round_qty(actual_qty)
                     if qty_to_place <= 0:
                         notify(f"Rounded qty to zero for {symbol} when attempting to place new stop; exiting.")
-                        break
+                        try:
+                            total_profit_usd = calculate_realized_profit(symbol) or total_profit_usd
+                        except Exception:
+                            pass
+                        return True, exit_price, total_profit_usd
+
                     new_order = place_stop_market_order(symbol, qty_to_place, desired_stop)
                     current_stop_order = new_order
                     current_stop_price = desired_stop
-                    notify(f"🔁 Moved stop for {symbol} up to {current_stop_price} for qty {qty_to_place}")
+                    qty_left = qty_to_place
+                    rolls_done += 1
+                    last_roll_ts = time.time()
+                    notify(f"🔁 Moved stop for {symbol} up to {current_stop_price} for qty {qty_to_place} (roll #{rolls_done})")
                 except Exception as e:
-                    notify(f"❌ Failed to place moved stop for {symbol}: {e}")
-                    current_stop_order = None
+                    # increment fail counter for this symbol
+                    ROLL_FAIL_COUNTER[symbol] = ROLL_FAIL_COUNTER.get(symbol, 0) + 1
+                    notify(f"❌ Failed to place moved stop for {symbol}: {e} (fail #{ROLL_FAIL_COUNTER[symbol]})")
+                    if ROLL_FAIL_COUNTER.get(symbol, 0) >= FAILED_ROLL_THRESHOLD:
+                        TEMP_SKIP[symbol] = time.time() + FAILED_ROLL_SKIP_SECONDS
+                        notify(f"⚠️ Reached failed roll threshold for {symbol}. TEMP skipping for {FAILED_ROLL_SKIP_SECONDS}s.")
                     time.sleep(POLL_INTERVAL)
                     continue
 
-        # reconciliation: detect if some qty sold by stop
+        # reconciliation: detect if stop executed (market sell) by inspecting actual position qty
         try:
             latest_qty = float(get_current_position_qty(symbol))
         except Exception:
@@ -1471,20 +1673,39 @@ def monitor_and_roll(symbol, bought_qty, avg_buy_price, ctx=None):
             try:
                 if profit is not None:
                     send_profit_to_funding(symbol, profit)
+                    total_profit_usd += profit
             except Exception:
                 pass
 
             qty_left = latest_qty
             if qty_left <= 0:
+                # position fully closed
+                try:
+                    # determine exit price if possible
+                    if 'get_last_fill_price' in globals():
+                        exit_price = get_last_fill_price(symbol)
+                    else:
+                        # best-effort: compute exit price approx from profit and original qty
+                        if bought_qty and bought_qty > 0:
+                            exit_price = avg_buy_price + (total_profit_usd / bought_qty)
+                except Exception:
+                    exit_price = None
                 notify(f"Position fully closed for {symbol} by stop sell.")
-                current_stop_order = None
-                current_stop_price = None
-                break
+                try:
+                    total_profit_usd = calculate_realized_profit(symbol) or total_profit_usd
+                except Exception:
+                    pass
+                return True, exit_price, total_profit_usd
 
         time.sleep(POLL_INTERVAL)
 
-    notify(f"monitor_and_roll ended for {symbol}.")
-    return
+    # unreachable, but be explicit
+    try:
+        total_profit_usd = calculate_realized_profit(symbol) or total_profit_usd
+    except Exception:
+        pass
+    return False, exit_price, total_profit_usd
+    
 # -------------------------
 # CANCEL HELPERS (updated)
 # -------------------------
