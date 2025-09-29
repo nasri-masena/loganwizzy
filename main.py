@@ -231,22 +231,21 @@ def safe_api_call(func):
     def wrapper(*args, **kwargs):
         global RATE_LIMIT_BACKOFF
         try:
+            if not rest_allowed():
+                raise Exception("REST calls currently banned by GLOBAL_REST_BAN_UNTIL")
             return func(*args, **kwargs)
         except BinanceAPIException as e:
             err = str(e)
             notify(f"⚠️ BinanceAPIException in {func.__name__}: {err}")
-            # common rate-limit detection
-            if '-1003' in err or 'Too much request weight' in err or 'Way too much request weight' in err or 'Request has been rejected' in err:
-                prev = RATE_LIMIT_BACKOFF if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP
-                RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
-                notify(f"❗ Rate-limit detected, backing off {RATE_LIMIT_BACKOFF}s.")
-            # re-raise for calling code to handle if necessary
+            if 'Way too much request weight' in err or '-1003' in err or 'Too much request weight' in err:
+                set_rest_ban_from_error(err)
+            # existing rate-limit logic...
             raise
         except Exception as e:
             notify(f"⚠️ Unexpected API error in {func.__name__}: {e}")
             raise
     return wrapper
-
+    
 # -------------------------
 # BALANCES / FILTERS
 # -------------------------
@@ -431,32 +430,107 @@ def get_open_orders_cached(symbol=None):
         with OPEN_ORDERS_LOCK:
             return OPEN_ORDERS_CACHE.get('data') or []
 
-# per-symbol price cache
+# GLOBAL rest-ban guard + helper
+GLOBAL_REST_BAN_UNTIL = 0.0
+TICKER_CACHE_LOCK = threading.Lock()
+
+def set_rest_ban_from_error(err_text: str):
+    """
+    Try to parse a Binance "banned until <timestamp>" message and set GLOBAL_REST_BAN_UNTIL.
+    Returns True if parsed a timestamp, False if fallback used.
+    """
+    global GLOBAL_REST_BAN_UNTIL
+    try:
+        import re, time
+        # try find a long integer timestamp (ms or s) after word 'until'
+        m = re.search(r'until\s+(\d{10,13})', err_text)
+        if m:
+            ts = int(m.group(1))
+            if ts > 1e12:  # ms
+                ts = ts / 1000.0
+            GLOBAL_REST_BAN_UNTIL = float(ts)
+            notify(f"⚠️ GLOBAL_REST_BAN_UNTIL set to {GLOBAL_REST_BAN_UNTIL} ({datetime.utcfromtimestamp(GLOBAL_REST_BAN_UNTIL).isoformat()} UTC)")
+            return True
+    except Exception:
+        pass
+    # fallback: set a conservative short ban (5 minutes)
+    try:
+        GLOBAL_REST_BAN_UNTIL = time.time() + 300
+    except Exception:
+        GLOBAL_REST_BAN_UNTIL = time.time() + 300
+    notify(f"⚠️ GLOBAL_REST_BAN_UNTIL fallback set to {GLOBAL_REST_BAN_UNTIL} (5m)")
+    return False
+
+def rest_allowed() -> bool:
+    """
+    Return True if it's OK to make REST calls (current time >= GLOBAL_REST_BAN_UNTIL).
+    """
+    try:
+        return time.time() >= (GLOBAL_REST_BAN_UNTIL or 0.0)
+    except Exception:
+        return True
+
 PER_SYMBOL_PRICE_CACHE = {}  # symbol -> (price, ts)
-PRICE_CACHE_TTL = 2.0  # seconds
+PRICE_CACHE_TTL = 2.0 
 
 def get_tickers_cached():
-    global TICKER_CACHE, LAST_FETCH, RATE_LIMIT_BACKOFF
-    now = time.time()
-    if RATE_LIMIT_BACKOFF and now - LAST_FETCH < RATE_LIMIT_BACKOFF:
-        return TICKER_CACHE or []
-    if TICKER_CACHE is None or now - LAST_FETCH > CACHE_TTL:
-        try:
-            TICKER_CACHE = client.get_ticker()
-            LAST_FETCH = now
-            RATE_LIMIT_BACKOFF = 0
-        except Exception as e:
-            err = str(e)
-            if '-1003' in err or 'Too much request weight' in err:
-                RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
-                                         RATE_LIMIT_BACKOFF_MAX)
-                notify(f"⚠️ Rate limit detected in get_tickers_cached, backing off for {RATE_LIMIT_BACKOFF}s.")
-                time.sleep(RATE_LIMIT_BACKOFF)
-            else:
-                notify(f"⚠️ Failed to refresh tickers: {e}")
-            return TICKER_CACHE or []
-    return TICKER_CACHE
+    global TICKER_CACHE, LAST_FETCH, RATE_LIMIT_BACKOFF, GLOBAL_REST_BAN_UNTIL
 
+    now = time.time()
+
+    # if currently banned by global flag, return cached immediately and avoid REST calls
+    if GLOBAL_REST_BAN_UNTIL and now < GLOBAL_REST_BAN_UNTIL:
+        notify(f"⏸️ REST calls banned until {datetime.utcfromtimestamp(GLOBAL_REST_BAN_UNTIL).isoformat()} UTC; returning cached tickers.")
+        with TICKER_CACHE_LOCK:
+            return TICKER_CACHE or []
+
+    # if we're in a RATE_LIMIT_BACKOFF window, avoid calling until it expires (use cached)
+    if RATE_LIMIT_BACKOFF and (now - LAST_FETCH) < RATE_LIMIT_BACKOFF:
+        with TICKER_CACHE_LOCK:
+            return TICKER_CACHE or []
+
+    # if cache still valid, return it
+    with TICKER_CACHE_LOCK:
+        if TICKER_CACHE is not None and (now - LAST_FETCH) < CACHE_TTL:
+            return TICKER_CACHE or []
+
+    # attempt fetching fresh tickers (guarded)
+    try:
+        tickers = client.get_ticker()
+        now = time.time()
+        with TICKER_CACHE_LOCK:
+            TICKER_CACHE = tickers or []
+            LAST_FETCH = now
+            # reset rate-limit backoff on success
+            RATE_LIMIT_BACKOFF = 0
+        return TICKER_CACHE or []
+    except BinanceAPIException as e:
+        err = str(e)
+        # detect explicit "way too much request weight" / ban message
+        if 'Way too much request weight' in err or '-1003' in err or 'Too much request weight' in err:
+            parsed = set_rest_ban_from_error(err)
+            # escalate RATE_LIMIT_BACKOFF defensively
+            prev = RATE_LIMIT_BACKOFF if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP
+            RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+            notify(f"⚠️ Rate limit / ban detected in get_tickers_cached: {err}. Backing off {RATE_LIMIT_BACKOFF}s.")
+            with TICKER_CACHE_LOCK:
+                return TICKER_CACHE or []
+        else:
+            # other Binance error: increase backoff a bit to be safe
+            prev = RATE_LIMIT_BACKOFF if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP
+            RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+            notify(f"⚠️ BinanceAPIException while fetching tickers: {err} — backing off {RATE_LIMIT_BACKOFF}s.")
+            with TICKER_CACHE_LOCK:
+                return TICKER_CACHE or []
+    except Exception as e:
+        err = str(e)
+        # generic network / requests error; set a modest backoff and return cached
+        prev = RATE_LIMIT_BACKOFF if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP
+        RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+        notify(f"⚠️ Failed to refresh tickers: {err} — backing off {RATE_LIMIT_BACKOFF}s.")
+        with TICKER_CACHE_LOCK:
+            return TICKER_CACHE or []
+            
 def get_price_cached(symbol):
     """
     First try per-symbol short TTL cache, then fall back to TICKER_CACHE; last fallback uses client.get_symbol_ticker.
