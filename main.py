@@ -779,72 +779,117 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 
 # -------------------------
 # PICKER (tweaked)
-# -------------------------
+# -----------------------
 def pick_coin():
-    try:
-        now = time.time()
-        # Tunable local defaults (can be overridden via globals)
-        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 60))
-        DEEP_EVAL = int(globals().get('DEEP_EVAL', 2))           # smaller = less REST weight
-        REQUEST_SLEEP = float(globals().get('REQUEST_SLEEP', 0.12))
-        KLINES_LIMIT = int(globals().get('KLINES_LIMIT', 6))
-        MIN_VOL_RATIO = float(globals().get('MIN_VOL_RATIO', 1.25))
-        PREBUY_BREAKOUT_MARGIN = float(globals().get('PREBUY_BREAKOUT_MARGIN', 0.0015))
-        EMA_UPLIFT_MIN = float(globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.0001))
-        SCORE_MIN = float(globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD if 'SCORE_MIN_THRESHOLD' in globals() else 15.0))
-        REQUIRE_OB_IN_PICK = bool(globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', False))
-        TARGET_VOL = float(globals().get('TRADE_VOL_TARGET', 0.01))
-        MAX_USD_CAP = float(globals().get('TRADE_USD_MAX_CAP', globals().get('TRADE_USD', TRADE_USD) * 2.0))
+    global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
 
-        tickers = get_tickers_cached() or []
-        if not tickers:
+    # Local fallbacks in case helper funcs are missing globally (keeps compatibility)
+    def _compute_recent_volatility_local(closes):
+        try:
+            if not closes or len(closes) < 3:
+                return None
+            returns = []
+            for i in range(1, len(closes)):
+                prev = closes[i-1]
+                if prev and prev != 0:
+                    returns.append((closes[i] - prev) / prev)
+            if not returns:
+                return None
+            return float(statistics.pstdev(returns))
+        except Exception:
             return None
 
-        # quick prefilter using tickers to limit pool
+    def _compute_trade_size_by_volatility_local(closes, base_usd=None, target_vol=0.01, min_usd=1.0, max_usd=None):
+        try:
+            if base_usd is None:
+                base_usd = float(globals().get('TRADE_USD', 7.0))
+            vol = None
+            # prefer global implementation if available
+            if 'compute_recent_volatility' in globals() and callable(globals()['compute_recent_volatility']):
+                try:
+                    vol = globals()['compute_recent_volatility'](closes)
+                except Exception:
+                    vol = _compute_recent_volatility_local(closes)
+            else:
+                vol = _compute_recent_volatility_local(closes)
+            if vol is None or vol <= 0:
+                return float(base_usd)
+            scale = float(target_vol) / float(vol)
+            scale = max(0.25, min(1.5, scale))
+            size = float(base_usd) * scale
+            if max_usd:
+                size = min(size, float(max_usd))
+            size = max(size, float(min_usd))
+            return float(round(size, 2))
+        except Exception:
+            return float(base_usd)
+
+    try:
+        t0 = time.time()
+        now = t0
+
+        # localizable tuning (can be overridden via globals())
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        DEEP_EVAL = globals().get('DEEP_EVAL', 3)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
+        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
+        MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.25)
+
+        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', globals().get('EMA_UPLIFT_MIN_PCT', 0.0001))
+        SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', globals().get('SCORE_MIN_THRESHOLD', 13.0))
+
+        REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', False)
+
+        # small breakout margin constant (if not present globally)
+        PREBUY_BREAKOUT_MARGIN = globals().get('PREBUY_BREAKOUT_MARGIN', 0.0015)
+
+        tickers = get_tickers_cached() or []
         prefiltered = []
+
+        # quick prefilter using tickers (cheap)
         for t in tickers:
             sym = t.get('symbol')
             if not sym or not sym.endswith(QUOTE):
                 continue
 
-            # TEMP_SKIP handling
+            # respect TEMP_SKIP
             skip_until = TEMP_SKIP.get(sym)
             if skip_until and now < skip_until:
                 continue
 
             # basic fields
             try:
-                price = float(t.get('lastPrice') or t.get('price') or 0.0)
+                price = float(t.get('lastPrice') or 0.0)
                 qvol = float(t.get('quoteVolume') or 0.0)
                 change_pct = float(t.get('priceChangePercent') or 0.0)
             except Exception:
                 continue
 
             # price bounds
-            price_min = float(globals().get('PRICE_MIN', PRICE_MIN))
-            price_max = float(globals().get('PRICE_MAX', PRICE_MAX))
+            price_min = globals().get('PRICE_MIN', PRICE_MIN)
+            price_max = globals().get('PRICE_MAX', PRICE_MAX)
             if not (price_min <= price <= price_max):
                 continue
 
-            # volume baseline filter
-            min_vol = max(int(globals().get('MIN_VOLUME', MIN_VOLUME)), 300_000)
+            # volume baseline
+            min_vol = max(globals().get('MIN_VOLUME', MIN_VOLUME), 300_000)
             if qvol < min_vol:
                 continue
 
             # 24h guardrails
-            if abs(change_pct) > float(globals().get('MAX_24H_CHANGE_ABS', MAX_24H_CHANGE_ABS)):
+            if abs(change_pct) > globals().get('MAX_24H_CHANGE_ABS', MAX_24H_CHANGE_ABS):
                 continue
-            if change_pct > float(globals().get('MAX_24H_RISE_PCT', MAX_24H_RISE_PCT)):
+            if change_pct > globals().get('MAX_24H_RISE_PCT', MAX_24H_RISE_PCT):
                 continue
 
-            # recent rebuy protection
+            # recent buy cooldown / rebuy protection
             last_buy = RECENT_BUYS.get(sym)
             if last_buy:
                 cd = last_buy.get('cooldown', REBUY_COOLDOWN)
                 if now < last_buy['ts'] + cd:
                     continue
                 last_price = last_buy.get('price')
-                if last_price and price > last_price * (1 + float(globals().get('REBUY_MAX_RISE_PCT', REBUY_MAX_RISE_PCT))/100.0):
+                if last_price and price > last_price * (1 + globals().get('REBUY_MAX_RISE_PCT', REBUY_MAX_RISE_PCT) / 100.0):
                     continue
 
             prefiltered.append((sym, price, qvol, change_pct))
@@ -852,11 +897,11 @@ def pick_coin():
         if not prefiltered:
             return None
 
-        # keep top by quote vol
+        # sort by quote volume and pick top pool
         prefiltered.sort(key=lambda x: x[2], reverse=True)
         top_pool = prefiltered[:TOP_CANDIDATES]
 
-        # sample a small set for deep evaluation
+        # sample DEEP_EVAL from pool for deeper analysis
         if len(top_pool) > DEEP_EVAL:
             sampled = random.sample(top_pool, DEEP_EVAL)
         else:
@@ -864,8 +909,8 @@ def pick_coin():
 
         candidates = []
 
-        # helpers
-        def ema(values, period):
+        # small local helpers
+        def ema_local(values, period):
             if not values or period <= 0:
                 return None
             alpha = 2.0 / (period + 1.0)
@@ -874,7 +919,7 @@ def pick_coin():
                 e = alpha * float(v) + (1 - alpha) * e
             return e
 
-        def rsi_local(closes, period=14):
+        def compute_rsi_local(closes, period=14):
             if not closes or len(closes) < period + 1:
                 return None
             gains = []
@@ -896,12 +941,21 @@ def pick_coin():
             try:
                 time.sleep(REQUEST_SLEEP)
 
-                # fetch klines via throttled wrapper
-                klines = get_klines_cached(sym, interval='5m', limit=KLINES_LIMIT)
-                if klines is None or len(klines) < 3:
+                # fetch klines
+                try:
+                    klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
+                except Exception as e:
+                    err = str(e)
+                    if '-1003' in err or 'Too much request weight' in err or 'Way too much request weight' in err:
+                        prev = RATE_LIMIT_BACKOFF if isinstance(RATE_LIMIT_BACKOFF, (int, float)) and RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP
+                        RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+                        notify(f"⚠️ Rate limit while fetching klines for {sym}: {err}. Backing off {RATE_LIMIT_BACKOFF}s.")
+                        return None
                     continue
 
-                # parse closes & vols
+                if not klines or len(klines) < 4:
+                    continue
+
                 closes = []
                 vols = []
                 for k in klines:
@@ -913,6 +967,7 @@ def pick_coin():
                         if len(k) > 7 and k[7] is not None:
                             vols.append(float(k[7]))
                         else:
+                            # fallback: approximate quote vol = volume * close
                             vols.append(float(k[5]) * float(k[4]))
                     except Exception:
                         vols.append(0.0)
@@ -920,22 +975,31 @@ def pick_coin():
                 if not closes or len(closes) < 3:
                     continue
 
-                # recent volume spike
-                recent_vol = vols[-1] if vols else 0.0
+                # compute recent volume ratio
+                recent_vol = vols[-1]
                 prev_avg = (sum(vols[:-1]) / max(1, len(vols[:-1]))) if len(vols) > 1 else recent_vol
-                vol_ratio = (recent_vol / (prev_avg + 1e-12)) if prev_avg > 0 else 1.0
+                vol_ratio = recent_vol / (prev_avg + 1e-12)
 
-                # recent percent move over last 3 intervals
+                # recent percentage move over last 3 intervals (5m each)
                 recent_pct = 0.0
                 if len(closes) >= 4 and closes[-4] > 0:
                     recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
 
-                # require breakout above recent high
+                # volatility: prefer global helper if present
+                if 'compute_recent_volatility' in globals() and callable(globals()['compute_recent_volatility']):
+                    try:
+                        vol_f = globals()['compute_recent_volatility'](closes) or 0.0
+                    except Exception:
+                        vol_f = _compute_recent_volatility_local(closes) or 0.0
+                else:
+                    vol_f = _compute_recent_volatility_local(closes) or 0.0
+
+                # breakout requirement (price above recent maxima)
                 if len(closes) >= 4:
                     if not (closes[-1] > max(closes[:-1]) * (1.0 + PREBUY_BREAKOUT_MARGIN)):
                         continue
 
-                # require at least one up candle in last 3
+                # require at least one of last 3 candles are up (momentum)
                 last3 = closes[-3:]
                 ups = 0
                 if len(last3) >= 2 and last3[1] > last3[0]:
@@ -948,53 +1012,45 @@ def pick_coin():
                 # EMA uplift (short vs long)
                 short_period = 3
                 long_period = 10
-                short_ema = ema(closes[-short_period:], short_period) if len(closes) >= short_period else None
-                long_ema = ema(closes[-long_period:], long_period) if len(closes) >= long_period else ema(closes, max(len(closes),1))
+                short_ema = ema_local(closes[-short_period:], short_period) if len(closes) >= short_period else None
+                long_ema = ema_local(closes[-long_period:], long_period) if len(closes) >= long_period else ema_local(closes, max(len(closes), 1))
                 if short_ema is None or long_ema is None:
                     continue
                 ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-                if ema_uplift < EMA_UPLIFT_MIN * 1.1:
+                if ema_uplift < EMA_UPLIFT_MIN * 1.2:
                     continue
                 if not (short_ema > long_ema * 1.0005):
                     continue
 
-                # RSI sanity
-                rsi_val = rsi_local(closes, period=14)
-                if rsi_val is not None and (rsi_val > 68 or rsi_val < 20):
+                # RSI sanity check
+                rsi_val = compute_rsi_local(closes, period=14)
+                if rsi_val is not None and (rsi_val > 65 or rsi_val < 25):
                     continue
 
-                # optional orderbook check
+                # optional orderbook check if requested globally
                 if REQUIRE_OB_IN_PICK:
                     try:
                         if not orderbook_bullish(sym, depth=5, min_imbalance=1.08, max_spread_pct=0.6):
                             continue
                     except Exception:
+                        # on error, be conservative and skip
                         continue
 
-                # scoring: combine signals conservatively
+                # scoring
                 score = 0.0
-                score += max(0.0, recent_pct) * 10.0               # strong weight for recent move
+                score += max(0.0, recent_pct) * 12.0
                 try:
-                    score += math.log1p(qvol) * 0.4
+                    score += math.log1p(qvol) * 0.5
                 except Exception:
-                    pass
-                score += max(0.0, (vol_ratio - 1.0)) * 10.0        # volume spike importance
-                score += ema_uplift * 120.0                       # EMA uplift strong
+                    score += 0.0
+                score += max(0.0, (vol_ratio - 1.0)) * 8.0
+                score += ema_uplift * 100.0
                 if rsi_val is not None:
-                    score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 0.6
-                score += max(0.0, change_pct) * 0.5
-                # penalize excessive volatility
-                try:
-                    vol_f = compute_recent_volatility(closes) or 0.0
-                except Exception:
-                    vol_f = 0.0
-                score -= min(vol_f, 5.0) * 0.6
+                    score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
+                score += max(0.0, change_pct) * 0.6
+                # small dampening by volatility (prefer controlled moves)
+                score -= min(vol_f, 5.0) * 0.5
 
-                # require min volume surge OR decent EMA uplift
-                if (vol_ratio < MIN_VOL_RATIO) and (ema_uplift < EMA_UPLIFT_MIN * 1.5):
-                    continue
-
-                # final threshold
                 if score < SCORE_MIN:
                     continue
 
@@ -1016,30 +1072,43 @@ def pick_coin():
                 notify(f"⚠️ pick_coin deep-eval error for {sym}: {e}")
                 continue
 
+        # no candidates after deep-eval
         if not candidates:
             return None
 
-        # pick best by score and prefer higher vol_ratio to avoid illiquid winners
-        candidates.sort(key=lambda x: (x['score'], x['vol_ratio']), reverse=True)
+        # pick best by score
+        candidates.sort(key=lambda x: x['score'], reverse=True)
         best = candidates[0]
 
-        # compute suggested trade size using volatility-aware sizing (global helper if present)
+        # compute suggested trade size using volatility-aware sizing (prefer global func if present)
         try:
             closes_for_vol = best.get('closes') or []
+            TARGET_VOL = globals().get('TRADE_VOL_TARGET', 0.01)
+            max_usd_cap = globals().get('TRADE_USD_MAX_CAP', globals().get('TRADE_USD', TRADE_USD) * 2.0)
             if 'compute_trade_size_by_volatility' in globals() and callable(globals()['compute_trade_size_by_volatility']):
-                suggested_usd = globals()['compute_trade_size_by_volatility'](closes_for_vol, base_usd=globals().get('TRADE_USD', TRADE_USD), target_vol=TARGET_VOL, min_usd=1.0, max_usd=MAX_USD_CAP)
+                try:
+                    suggested_usd = globals()['compute_trade_size_by_volatility'](closes_for_vol, base_usd=globals().get('TRADE_USD', TRADE_USD), target_vol=TARGET_VOL, min_usd=1.0, max_usd=max_usd_cap)
+                except Exception:
+                    suggested_usd = _compute_trade_size_by_volatility_local(closes_for_vol, base_usd=globals().get('TRADE_USD', TRADE_USD), target_vol=TARGET_VOL, min_usd=1.0, max_usd=max_usd_cap)
             else:
-                suggested_usd = compute_trade_size_by_volatility(closes_for_vol, base_usd=globals().get('TRADE_USD', TRADE_USD), target_vol=TARGET_VOL, min_usd=1.0, max_usd=MAX_USD_CAP)
+                suggested_usd = _compute_trade_size_by_volatility_local(closes_for_vol, base_usd=globals().get('TRADE_USD', TRADE_USD), target_vol=TARGET_VOL, min_usd=1.0, max_usd=max_usd_cap)
+
+            # publish to globals for trade_cycle to pick up without signature changes
             globals()['DEFAULT_USD_PER_TRADE'] = float(suggested_usd)
-            notify(f"ℹ️ Suggested trade size (vol-adjusted): ${suggested_usd:.2f} for {best['symbol']} (score={best['score']:.1f})")
+            # informational notify (non-spammy): use simple prefix; if you want Telegram, prepend emoji
+            notify(f"ℹ️ Suggested trade size (vol adjusted): ${suggested_usd:.2f} (target_vol={TARGET_VOL})")
         except Exception:
             pass
 
+        # return same tuple shape as your prior pick_coin so other code remains compatible
         return (best['symbol'], best['price'], best['qvol'], best['change'], best.get('closes'))
 
     except Exception as e:
         notify(f"⚠️ pick_coin unexpected error: {e}")
-        return None# -------------------------
+        return None
+
+
+# -------------------------
 # MARKET BUY helpers
 # -------------------------
 def _parse_market_buy_exec(order_resp):
