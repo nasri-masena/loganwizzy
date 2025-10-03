@@ -1011,36 +1011,38 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         if not c:
             return None, 0.0, None
 
-        sell_qty = float(qty) * float(fraction)
-        sell_qty = round_step(sell_qty, f.get('stepSize', 0.0))
-        remainder = round_step(float(qty) - sell_qty, f.get('stepSize', 0.0))
-
-        # NEW: Ensure remainder is rollable
         min_notional = f.get('minNotional')
-        if min_notional and remainder * entry_price < min_notional - 1e-12:
-            # If remainder after micro TP is too small, sell all in micro TP instead
-            candidate_sell_all = round_step(float(qty), f.get('stepSize', 0.0))
-            if candidate_sell_all * entry_price >= min_notional:
-                sell_qty = candidate_sell_all
-                remainder = 0.0
-            else:
-                notify(f"⚠️ Micro TP remainder too small for future rolls; selling full position.")
-                return None, 0.0, None
+        step_size = f.get('stepSize', 0.0)
+        tick_size = f.get('tickSize', 0.0)
+        
+        # Calculate micro sell qty
+        sell_qty = round_step(qty * fraction, step_size)
+        remainder = round_step(qty - sell_qty, step_size)
 
-        if sell_qty <= 0 or sell_qty < f.get('minQty', 0.0):
+        # Check if remainder will be rollable
+        if min_notional and remainder * entry_price < min_notional - 1e-12:
+            # If not, sell whole position in micro TP
+            sell_qty = round_step(qty, step_size)
+            remainder = 0.0
+            notify(f"⚠️ Micro TP remainder would be unrollable for {symbol}; selling full position instead.")
+
+        # Check if sell_qty itself can be sold
+        if sell_qty < f.get('minQty', 0.0) or (min_notional and sell_qty * entry_price < min_notional - 1e-12):
+            notify(f"❌ Micro TP sell_qty too small for {symbol}; skipping micro TP.")
             return None, 0.0, None
 
         tp_price = float(entry_price) * (1.0 + float(pct) / 100.0)
-        tick = f.get('tickSize', 0.0) or 0.0
-        if tick and tick > 0:
-            tp_price = math.ceil(tp_price / tick) * tick
+        if tick_size and tick_size > 0:
+            tp_price = math.ceil(tp_price / tick_size) * tick_size
 
         if min_notional and sell_qty * tp_price < min_notional - 1e-12:
+            notify(f"❌ Micro TP at target price would be below minNotional for {symbol}; skipping micro TP.")
             return None, 0.0, None
 
-        qty_str = format_qty(sell_qty, f.get('stepSize', 0.0))
-        price_str = format_price(tp_price, f.get('tickSize', 0.0))
+        qty_str = format_qty(sell_qty, step_size)
+        price_str = format_price(tp_price, tick_size)
 
+        # Place limit sell
         try:
             order = c.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str)
         except Exception as e:
@@ -1821,6 +1823,16 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
+            info = get_symbol_info_cached(symbol)
+            f = get_filters(info) if info else {}
+            min_notional = f.get('minNotional', 0.0)
+            # Ensure buy is large enough to allow micro TP and rolls
+            min_safe_trade = min_notional * 2.5  # allow for both micro TP and roll
+            if usd_to_buy < min_safe_trade:
+                notify(f"⏭️ Skipping buy for {symbol}: not enough USDT to safely trade (need at least ${min_safe_trade:.2f})")
+                time.sleep(CYCLE_DELAY)
+                continue
+
             if not is_symbol_tradable(symbol):
                 TEMP_SKIP[symbol] = time.time() + SKIP_SECONDS_ON_MARKET_CLOSED
                 time.sleep(CYCLE_DELAY)
@@ -1880,7 +1892,9 @@ def trade_cycle():
                 notify(f"⚠️ Micro TP placement error for {symbol}: {e}")
 
             qty_remaining = round_step(max(0.0, qty - micro_sold_qty), f.get('stepSize', 0.0))
-            if qty_remaining <= 0 or qty_remaining < f.get('minQty', 0.0):
+            # NEW: If remainder is unrollable, do not proceed
+            if qty_remaining <= 0 or qty_remaining < f.get('minQty', 0.0) or (f.get('minNotional') and qty_remaining * entry_price < f.get('minNotional') - 1e-12):
+                # All sold in micro TP or remainder is unsellable/unrollable, close position
                 total_profit_usd = 0.0
                 try:
                     if micro_sold_qty and micro_tp_price:
