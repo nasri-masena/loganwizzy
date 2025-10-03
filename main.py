@@ -103,7 +103,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 250
+CACHE_TTL = 300
 
 # notify subsystem (replace existing notify/_send/_start thread block)
 _NOTIFY_Q = queue.Queue(maxsize=globals().get('NOTIFY_QUEUE_MAX', 1000))
@@ -408,7 +408,7 @@ LAST_FETCH = 0
 SYMBOL_INFO_CACHE = {}
 SYMBOL_INFO_TTL = 120
 OPEN_ORDERS_CACHE = {'ts': 0, 'data': None}
-OPEN_ORDERS_TTL = 80
+OPEN_ORDERS_TTL = 300
 
 def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
     now = time.time()
@@ -446,9 +446,9 @@ def get_open_orders_cached(symbol=None):
         return data or []
     except Exception as e:
         notify(f"⚠️ Failed to fetch open orders: {e}")
-        # on failure return last cached (if any) to avoid breaking callers
         with OPEN_ORDERS_LOCK:
             return OPEN_ORDERS_CACHE.get('data') or []
+
 
 # per-symbol price cache
 PER_SYMBOL_PRICE_CACHE = {}  # symbol -> (price, ts)
@@ -1013,14 +1013,18 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
 
         sell_qty = float(qty) * float(fraction)
         sell_qty = round_step(sell_qty, f.get('stepSize', 0.0))
-
         remainder = round_step(float(qty) - sell_qty, f.get('stepSize', 0.0))
-        if remainder > 0 and remainder < f.get('minQty', 0.0):
+
+        # NEW: Ensure remainder is rollable
+        min_notional = f.get('minNotional')
+        if min_notional and remainder * entry_price < min_notional - 1e-12:
+            # If remainder after micro TP is too small, sell all in micro TP instead
             candidate_sell_all = round_step(float(qty), f.get('stepSize', 0.0))
-            if candidate_sell_all >= f.get('minQty', 0.0):
+            if candidate_sell_all * entry_price >= min_notional:
                 sell_qty = candidate_sell_all
                 remainder = 0.0
             else:
+                notify(f"⚠️ Micro TP remainder too small for future rolls; selling full position.")
                 return None, 0.0, None
 
         if sell_qty <= 0 or sell_qty < f.get('minQty', 0.0):
@@ -1031,18 +1035,16 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         if tick and tick > 0:
             tp_price = math.ceil(tp_price / tick) * tick
 
-        if f.get('minNotional') and sell_qty * tp_price < f['minNotional'] - 1e-12:
+        if min_notional and sell_qty * tp_price < min_notional - 1e-12:
             return None, 0.0, None
 
         qty_str = format_qty(sell_qty, f.get('stepSize', 0.0))
         price_str = format_price(tp_price, f.get('tickSize', 0.0))
 
-        # place limit sell and poll for short time
         try:
             order = c.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str)
         except Exception as e:
             try:
-                # alternative client method name
                 order = c.create_order(symbol=symbol, side='SELL', type='LIMIT', quantity=qty_str, price=price_str, timeInForce='GTC')
             except Exception:
                 return None, 0.0, None
@@ -1051,7 +1053,6 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         if isinstance(order, dict):
             order_id = order.get('orderId') or order.get('orderId')
         if not order_id:
-            # if we don't get order id, we still can return the raw response (best-effort)
             return order, 0.0, tp_price
 
         poll_interval = 0.6
@@ -1067,7 +1068,6 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
             executed_qty = 0.0
             avg_fill_price = None
 
-            # try executedQty first
             try:
                 ex = status.get('executedQty')
                 if ex is not None:
@@ -1108,7 +1108,6 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
             time.sleep(poll_interval)
             waited += poll_interval
 
-        # timed out without fill -> try cancel
         try:
             c.cancel_order(symbol=symbol, orderId=order_id)
         except Exception:
@@ -1118,6 +1117,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
 
     except Exception:
         return None, 0.0, None
+
 
 # -------------------------
 # Monitor and roll (updated)
@@ -1203,6 +1203,18 @@ def monitor_and_roll(symbol, qty, entry_price, f,
                 price_now >= last_roll_price * (1 + globals().get('ROLL_STEP_PCT', 0.0) / 100.0) or
                 price_now - last_roll_price >= globals().get('ROLL_STEP_ABS', 0.0)
             )
+
+            # --- NEW: minNotional check before rolling ---
+            if min_notional and available_for_sell * price_now < min_notional - 1e-12:
+                notify(f"⚠️ Remaining qty for {symbol} too small to roll (qty*price={available_for_sell*price_now:.8f} < minNotional). Attempting market sell immediately.")
+                resp = place_market_sell_fallback(symbol, available_for_sell, f)
+                if resp:
+                    notify(f"✅ Market sell fallback successful for {symbol}")
+                    return True, price_now, (price_now-entry_price) * available_for_sell, available_for_sell
+                else:
+                    notify(f"❌ Market sell fallback failed for {symbol}. Manual intervention needed.")
+                last_roll_ts = now_ts
+                continue
 
             if step_trigger and available_for_sell >= min_qty and can_roll and allowed_to_start:
                 if roll_count >= globals().get('MAX_ROLLS_PER_POSITION', 20):
@@ -1308,7 +1320,8 @@ def monitor_and_roll(symbol, qty, entry_price, f,
         except Exception as e:
             notify(f"⚠️ Error in monitor_and_roll: {e}")
             return False, entry_price, 0.0, 0.0
-            
+
+
 # -------------------------
 # SAFE SELL FALLBACK (market)
 # -------------------------
