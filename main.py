@@ -173,6 +173,8 @@ def notify(msg: str, priority: bool = False, category: str = None):
                     allow = True
                 elif msg.startswith("🔁 Rolled"):
                     allow = True
+                elif msg.startswith("📌 OCO"):
+                    allow = True
                 elif msg.startswith("📍 Micro"):
                     allow = True
                 elif msg.startswith("💸 Profit"):
