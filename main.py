@@ -289,6 +289,7 @@ def ceil_step(n, step):
     except Exception:
         return n
 
+# Decorator to centralize BinanceAPIException handling and set RATE_LIMIT_BACKOFF/TEMP_SKIP
 def safe_api_call(func):
     def wrapper(*args, **kwargs):
         global RATE_LIMIT_BACKOFF
@@ -297,16 +298,21 @@ def safe_api_call(func):
         except BinanceAPIException as e:
             err = str(e)
             notify(f"⚠️ BinanceAPIException in {func.__name__}: {err}")
+            # common rate-limit detection
             if '-1003' in err or 'Too much request weight' in err or 'Way too much request weight' in err or 'Request has been rejected' in err:
                 prev = RATE_LIMIT_BACKOFF if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP
                 RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
                 notify(f"❗ Rate-limit detected, backing off {RATE_LIMIT_BACKOFF}s.")
+            # re-raise for calling code to handle if necessary
             raise
         except Exception as e:
             notify(f"⚠️ Unexpected API error in {func.__name__}: {e}")
             raise
     return wrapper
 
+# -------------------------
+# BALANCES / FILTERS
+# -------------------------
 def get_free_usdt():
     try:
         bal = client.get_asset_balance(asset=QUOTE)
@@ -340,7 +346,6 @@ def get_filters(symbol_info):
         'tickSize': float(pricef['tickSize']) if pricef else 0.0,
         'minNotional': float(min_notional) if min_notional else None
     }
-    
 # --- Compatibility wrapper so trade_cycle can keep using get_trade_candidates() ---
 def get_trade_candidates():
     """
@@ -1012,14 +1017,18 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         step_size = f.get('stepSize', 0.0)
         tick_size = f.get('tickSize', 0.0)
         
+        # Calculate micro sell qty
         sell_qty = round_step(qty * fraction, step_size)
         remainder = round_step(qty - sell_qty, step_size)
 
+        # Check if remainder will be rollable
         if min_notional and remainder * entry_price < min_notional - 1e-12:
+            # If not, sell whole position in micro TP
             sell_qty = round_step(qty, step_size)
             remainder = 0.0
             notify(f"⚠️ Micro TP remainder would be unrollable for {symbol}; selling full position instead.")
 
+        # Check if sell_qty itself can be sold
         if sell_qty < f.get('minQty', 0.0) or (min_notional and sell_qty * entry_price < min_notional - 1e-12):
             notify(f"❌ Micro TP sell_qty too small for {symbol}; skipping micro TP.")
             return None, 0.0, None
@@ -1035,6 +1044,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
         qty_str = format_qty(sell_qty, step_size)
         price_str = format_price(tp_price, tick_size)
 
+        # Place limit sell
         try:
             order = c.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str)
         except Exception as e:
@@ -1111,6 +1121,7 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
 
     except Exception:
         return None, 0.0, None
+
 
 # -------------------------
 # Monitor and roll (updated)
