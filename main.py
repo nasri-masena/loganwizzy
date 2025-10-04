@@ -371,6 +371,63 @@ def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
         notify(f"⚠️ Failed to fetch symbol info for {symbol}: {e}")
         return None
 
+def get_filters(symbol_info):
+    try:
+        # If caller passed a symbol string, fetch info
+        if isinstance(symbol_info, str):
+            info = get_symbol_info_cached(symbol_info)
+        else:
+            info = symbol_info
+
+        if not info:
+            notify("⚠️ get_filters: symbol info not available; returning safe defaults.")
+            return {'stepSize': 0.0, 'minQty': 0.0, 'tickSize': 0.0, 'minNotional': None}
+
+        filters = info.get('filters') or []
+        fs = {f.get('filterType'): f for f in filters if isinstance(f, dict)}
+
+        lot = fs.get('LOT_SIZE') or {}
+        pricef = fs.get('PRICE_FILTER') or {}
+
+        # MIN_NOTIONAL or NOTIONAL may exist depending on exchange version
+        min_notional = None
+        if fs.get('MIN_NOTIONAL'):
+            min_notional = fs.get('MIN_NOTIONAL', {}).get('minNotional')
+        elif fs.get('NOTIONAL'):
+            min_notional = fs.get('NOTIONAL', {}).get('minNotional')
+
+        # normalize numeric fields defensively
+        def to_float(v):
+            try:
+                if v is None or v == '':
+                    return 0.0
+                return float(v)
+            except Exception:
+                return 0.0
+
+        stepSize = to_float(lot.get('stepSize') or lot.get('step_size') or 0.0)
+        minQty = to_float(lot.get('minQty') or lot.get('min_qty') or 0.0)
+        tickSize = to_float(pricef.get('tickSize') or pricef.get('tick_size') or 0.0)
+
+        mn = None
+        try:
+            if min_notional is not None and min_notional != '':
+                mn = float(min_notional)
+        except Exception:
+            mn = None
+
+        return {
+            'stepSize': stepSize,
+            'minQty': minQty,
+            'tickSize': tickSize,
+            'minNotional': mn
+        }
+
+    except Exception as e:
+        notify(f"⚠️ get_filters failed: {e}")
+        # safe fallback so callers don't crash
+        return {'stepSize': 0.0, 'minQty': 0.0, 'tickSize': 0.0, 'minNotional': None}
+        
 def get_open_orders_cached(symbol=None):
     now = time.time()
     with OPEN_ORDERS_LOCK:
