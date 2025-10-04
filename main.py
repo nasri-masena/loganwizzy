@@ -457,6 +457,25 @@ def get_price_cached(symbol):
     else:
         notify(f"⚠️ get_price_cached fallback failed for {symbol}: {res}")
         return None
+        
+def get_free_usdt():
+    """
+    Return free USDT balance as float. Safe: catches exceptions and logs via notify().
+    """
+    try:
+        bal = client.get_asset_balance(asset=QUOTE)
+        if not bal:
+            return 0.0
+        # Binance may return strings; be defensive
+        free = bal.get('free') or bal.get('freeBalance') or bal.get('available') or 0.0
+        return float(free)
+    except Exception as e:
+        notify(f"⚠️ get_free_usdt failed: {e}")
+        # If get_free_asset exists, fallback to that
+        try:
+            return float(get_free_asset(QUOTE))
+        except Exception:
+            return 0.0
 
 def get_klines_cached(symbol, interval='5m', limit=KLINES_LIMIT, ttl=10):
     key = f"klines::{symbol}::{interval}::{limit}"
