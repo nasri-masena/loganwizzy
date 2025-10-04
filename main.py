@@ -24,7 +24,7 @@ QUOTE = "USDT"
 
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 800_000
+MIN_VOLUME = 500_000
 
 RECENT_PCT_MIN = 0.6
 RECENT_PCT_MAX = 4.0
@@ -37,7 +37,7 @@ MOVEMENT_MIN_PCT = 1.0
 EMA_UPLIFT_MIN_PCT = 0.0008
 SCORE_MIN_THRESHOLD = 13.0
 
-TRADE_USD = 8.0
+TRADE_USD = 7.0
 SLEEP_BETWEEN_CHECKS = 8
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
@@ -275,6 +275,34 @@ def ceil_step(n, step):
     except Exception:
         return n
 
+def get_free_asset(asset):
+    """Return float free balance for asset (safe)."""
+    try:
+        bal = client.get_asset_balance(asset=asset)
+        if not bal:
+            return 0.0
+        free = bal.get('free') or bal.get('freeBalance') or bal.get('available') or 0.0
+        return float(free)
+    except Exception as e:
+        notify(f"⚠️ get_free_asset failed: {e}")
+        try:
+            # last-resort: try reading account info minimally
+            acc = client.get_account()
+            for b in acc.get('balances', []):
+                if b.get('asset') == asset:
+                    return float(b.get('free') or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+def get_free_usdt():
+    """Return free USDT balance as float (safe fallback)."""
+    try:
+        return get_free_asset(QUOTE)
+    except Exception as e:
+        notify(f"⚠️ get_free_usdt fallback error: {e}")
+        return 0.0
+
 # -------------------------
 # SAFE REST WRAPPER
 # -------------------------
@@ -373,7 +401,6 @@ def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
 
 def get_filters(symbol_info):
     try:
-        # If caller passed a symbol string, fetch info
         if isinstance(symbol_info, str):
             info = get_symbol_info_cached(symbol_info)
         else:
@@ -388,15 +415,13 @@ def get_filters(symbol_info):
 
         lot = fs.get('LOT_SIZE') or {}
         pricef = fs.get('PRICE_FILTER') or {}
-
-        # MIN_NOTIONAL or NOTIONAL may exist depending on exchange version
+        # Some exchanges use MIN_NOTIONAL or NOTIONAL
         min_notional = None
         if fs.get('MIN_NOTIONAL'):
             min_notional = fs.get('MIN_NOTIONAL', {}).get('minNotional')
         elif fs.get('NOTIONAL'):
             min_notional = fs.get('NOTIONAL', {}).get('minNotional')
 
-        # normalize numeric fields defensively
         def to_float(v):
             try:
                 if v is None or v == '':
@@ -411,7 +436,7 @@ def get_filters(symbol_info):
 
         mn = None
         try:
-            if min_notional is not None and min_notional != '':
+            if min_notional not in (None, ''):
                 mn = float(min_notional)
         except Exception:
             mn = None
@@ -425,7 +450,6 @@ def get_filters(symbol_info):
 
     except Exception as e:
         notify(f"⚠️ get_filters failed: {e}")
-        # safe fallback so callers don't crash
         return {'stepSize': 0.0, 'minQty': 0.0, 'tickSize': 0.0, 'minNotional': None}
         
 def get_open_orders_cached(symbol=None):
