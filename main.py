@@ -1118,44 +1118,64 @@ def place_micro_tp(symbol, qty, entry_price, f, pct=MICRO_TP_PCT, fraction=MICRO
 def monitor_and_roll(symbol, qty, entry_price, f,
                      price_getter=None,
                      use_websocket_price=False):
-    try:
-        orig_qty = qty
-        curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
-        curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
+    # --- read tunables (fall back to safe defaults) ---
+    MICRO_TP_PCT = globals().get('MICRO_TP_PCT', 0.5)
+    MICRO_TP_FRACTION = globals().get('MICRO_TP_FRACTION', globals().get('MICRO_TP_FRACTION', 0.20))
+    MICRO_MAX_WAIT = globals().get('MICRO_MAX_WAIT', 8.0)
+    MICRO_ROLL_COOLDOWN_BASE = globals().get('MICRO_ROLL_COOLDOWN_BASE', 1.0)
+    # None means unlimited micro-rolls
+    MAX_MICRO_ROLLS_PER_POSITION_MICRO = globals().get('MAX_MICRO_ROLLS_PER_POSITION_MICRO', None)
 
-        # Place initial OCO (standard)
-        oco = place_oco_sell(symbol, qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-        if oco is None:
-            notify(f"❌ Initial OCO failed for {symbol}, aborting monitor.")
-            return False, entry_price, 0.0, 0.0
+    # ROLL configs (use your existing ones)
+    ROLL_STEP_PCT = globals().get('ROLL_STEP_PCT', 0.2)
+    ROLL_STEP_ABS = globals().get('ROLL_STEP_ABS', 0.001)
+    ROLL_ON_RISE_PCT = globals().get('ROLL_ON_RISE_PCT', 0.2)
+    ROLL_TP_STEP_ABS = globals().get('ROLL_TP_STEP_ABS', 0.010)
+    ROLL_SL_STEP_ABS = globals().get('ROLL_SL_STEP_ABS', 0.0015)
+    ROLL_COOLDOWN_SECONDS = globals().get('ROLL_COOLDOWN_SECONDS', 5)
+    MAX_ROLLS_PER_POSITION = globals().get('MAX_ROLLS_PER_POSITION', 9999999)
+    ROLL_POST_CANCEL_JITTER = globals().get('ROLL_POST_CANCEL_JITTER', (0.5, 0.18))
 
-        tick = float(f.get('tickSize', 0.0) or 0.0)
-        step_size = float(f.get('stepSize', 0.0) or 0.0)
-        min_qty = float(f.get('minQty', 0.0) or 0.0)
-        min_notional = float(f.get('minNotional', 0.0) or 0.0)
+    orig_qty = qty
+    curr_tp = entry_price * (1 + BASE_TP_PCT / 100.0)
+    curr_sl = entry_price * (1 - BASE_SL_PCT / 100.0)
 
-        if price_getter is None:
-            price_getter = get_price_cached
+    # initial OCO
+    oco = place_oco_sell(symbol, qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
+    if oco is None:
+        notify(f"❌ Initial OCO failed for {symbol}, aborting monitor.")
+        return False, entry_price, 0.0, 0.0
 
-        last_roll_price = entry_price
-        last_roll_ts = 0.0
-        roll_count = 0
-        CHECK_BALANCE_EVERY = globals().get('CHECK_BALANCE_EVERY', 3)
-        CHECK_OPEN_ORDERS_EVERY = globals().get('CHECK_OPEN_ORDERS_EVERY', 2)
-        loop_count = 0
+    tick = float(f.get('tickSize', 0.0) or 0.0)
+    step_size = float(f.get('stepSize', 0.0) or 0.0)
+    min_qty = float(f.get('minQty', 0.0) or 0.0)
+    min_notional = float(f.get('minNotional', 0.0) or 0.0)
 
-        last_free_qty = orig_qty
-        last_open_orders = []
-        asset = symbol[:-len(QUOTE)]
+    if price_getter is None:
+        price_getter = get_price_cached
 
-        # To avoid spamming repeated "too small" msgs, remember market-fallback attempts
-        did_market_fallback_for_symbol = False
+    last_roll_price = entry_price
+    last_roll_ts = 0.0
+    roll_count = 0
+    micro_roll_count = 0
+    last_micro_roll_ts = 0.0
 
-        while True:
+    CHECK_BALANCE_EVERY = globals().get('CHECK_BALANCE_EVERY', 3)
+    CHECK_OPEN_ORDERS_EVERY = globals().get('CHECK_OPEN_ORDERS_EVERY', 2)
+    loop_count = 0
+
+    last_free_qty = orig_qty
+    last_open_orders = []
+    asset = symbol[:-len(QUOTE)]
+
+    did_market_fallback_for_symbol = False
+
+    while True:
+        try:
             loop_count += 1
             time.sleep(SLEEP_BETWEEN_CHECKS)
 
-            # get current price
+            # --- price fetch ---
             price_now = price_getter(symbol)
             if price_now is None:
                 try:
@@ -1164,7 +1184,7 @@ def monitor_and_roll(symbol, qty, entry_price, f,
                     notify(f"⚠️ Failed to fetch price in monitor (fallback): {e}")
                     continue
 
-            # balance check (cached every N loops)
+            # --- free qty (cached) ---
             if loop_count % CHECK_BALANCE_EVERY == 0:
                 try:
                     free_qty = get_free_asset(asset)
@@ -1176,7 +1196,7 @@ def monitor_and_roll(symbol, qty, entry_price, f,
 
             available_for_sell = min(round_step(free_qty, step_size), orig_qty)
 
-            # open orders check (cached every M loops)
+            # --- open orders (cached) ---
             if loop_count % CHECK_OPEN_ORDERS_EVERY == 0:
                 try:
                     open_orders = get_open_orders_cached(symbol)
@@ -1186,80 +1206,110 @@ def monitor_and_roll(symbol, qty, entry_price, f,
             else:
                 open_orders = last_open_orders
 
-            # If nothing left to sell and no open orders => position closed
+            # --- closed detection ---
             if available_for_sell < round_step(orig_qty * 0.05, step_size) and len(open_orders) == 0:
                 exit_price = price_now
                 profit_usd = (exit_price - entry_price) * orig_qty
                 notify(f"✅ Position closed for {symbol}: exit={exit_price:.8f}, profit≈${profit_usd:.6f}")
                 return True, exit_price, profit_usd, available_for_sell
 
-            # if available_for_sell is zero or effectively zero, avoid trying to roll
             if available_for_sell <= 0:
-                # If we have open sell orders, continue waiting; otherwise warn and exit
+                # wait a bit if open orders exist, otherwise stop
                 if len(open_orders) > 0:
-                    # there are outstanding open sell orders — wait for them to execute or be canceled
-                    time.sleep(random.uniform(0.05, 0.15))
+                    time.sleep(random.uniform(0.05, 0.12))
                     continue
-                else:
-                    notify(f"⚠️ No available qty to sell for {symbol} (available_for_sell={available_for_sell}). Stopping monitor.")
-                    return False, entry_price, 0.0, available_for_sell
+                notify(f"⚠️ No available qty to sell for {symbol} (available_for_sell={available_for_sell}). Stopping monitor.")
+                return False, entry_price, 0.0, available_for_sell
 
             now_ts = time.time()
-            can_roll = (now_ts - last_roll_ts) >= globals().get('ROLL_COOLDOWN_SECONDS', 1.0)
-            roll_on_rise_pct = globals().get('ROLL_ON_RISE_PCT', None)
+            can_roll = (now_ts - last_roll_ts) >= ROLL_COOLDOWN_SECONDS
+            roll_on_rise_pct = ROLL_ON_RISE_PCT
             if roll_count == 0 and roll_on_rise_pct is not None:
                 allowed_to_start = price_now >= entry_price * (1 + roll_on_rise_pct / 100.0)
             else:
                 allowed_to_start = True
 
             step_trigger = (
-                price_now >= last_roll_price * (1 + globals().get('ROLL_STEP_PCT', 0.0) / 100.0) or
-                price_now - last_roll_price >= globals().get('ROLL_STEP_ABS', 0.0)
+                price_now >= last_roll_price * (1 + ROLL_STEP_PCT / 100.0) or
+                price_now - last_roll_price >= ROLL_STEP_ABS
             )
 
-            # --- minNotional handling BEFORE attempting a limit roll ---
-            if min_notional and (available_for_sell * price_now) < (min_notional - 1e-12):
-                # Try a single market-sell fallback once (to avoid endless retries)
-                if not did_market_fallback_for_symbol:
-                    did_market_fallback_for_symbol = True
-                    notify(f"⚠️ Remaining qty for {symbol} too small to roll (qty*price={available_for_sell*price_now:.8f} < minNotional). Attempting market sell fallback.")
-                    try:
-                        resp = place_market_sell_fallback(symbol, available_for_sell, f)
-                        if resp:
-                            notify(f"✅ Market sell fallback successful for {symbol}")
-                            profit_usd = (price_now - entry_price) * available_for_sell
-                            return True, price_now, profit_usd, available_for_sell
-                        else:
-                            notify(f"❌ Market sell fallback failed for {symbol}. Manual intervention needed.")
-                            # suppress retries for a while
-                            TEMP_SKIP[symbol] = time.time() + 24*60*60
-                            return False, entry_price, 0.0, available_for_sell
-                    except Exception as ex:
-                        notify(f"❌ Exception during market sell fallback for {symbol}: {ex}")
-                        TEMP_SKIP[symbol] = time.time() + 24*60*60
-                        return False, entry_price, 0.0, available_for_sell
-                else:
-                    # Already attempted market fallback — suppress and exit
-                    notify(f"⚠️ Already attempted market fallback for {symbol} and it failed. Suppressing further attempts.")
-                    TEMP_SKIP[symbol] = time.time() + 24*60*60
-                    return False, entry_price, 0.0, available_for_sell
+            sell_qty_candidate = available_for_sell
+            is_micro_candidate = False
 
-            # --- Rolling logic ---
-            if step_trigger and available_for_sell >= min_qty and can_roll and allowed_to_start:
-                if roll_count >= globals().get('MAX_ROLLS_PER_POSITION', 20):
-                    notify(f"⚠️ Reached max rolls ({globals().get('MAX_ROLLS_PER_POSITION', 20)}) for {symbol}.")
+            # --- Try to meet minNotional first ---
+            if min_notional and (available_for_sell * price_now) < (min_notional - 1e-12):
+                needed_qty = ceil_step(min_notional / max(price_now, 1e-12), step_size)
+                if needed_qty <= available_for_sell + 1e-12:
+                    sell_qty_candidate = needed_qty
+                else:
+                    # cannot meet minNotional -> micro-roll candidate
+                    frac = float(MICRO_TP_FRACTION) if 0.0 < float(MICRO_TP_FRACTION) <= 1.0 else 0.20
+                    candidate = round_step(available_for_sell * frac, step_size)
+                    if candidate < min_qty:
+                        candidate = round_step(min(available_for_sell, min_qty), step_size)
+                    if candidate <= 0 or candidate < min_qty:
+                        # give single market fallback attempt if we haven't tried
+                        if not did_market_fallback_for_symbol:
+                            notify(f"⚠️ Remaining qty for {symbol} too small to roll (qty*price={available_for_sell*price_now:.8f} < minNotional). Attempting market sell fallback.")
+                            resp = place_market_sell_fallback(symbol, available_for_sell, f)
+                            did_market_fallback_for_symbol = True
+                            if resp:
+                                notify(f"✅ Market sell fallback successful for {symbol}")
+                                return True, price_now, (price_now-entry_price) * available_for_sell, available_for_sell
+                            else:
+                                notify(f"❌ Market sell fallback failed for {symbol}. Manual intervention needed.")
+                                TEMP_SKIP[symbol] = time.time() + 24*60*60
+                                return False, entry_price, 0.0, available_for_sell
+                        # already tried fallback -> suppress
+                        time.sleep(random.uniform(0.05, 0.12))
+                        continue
+                    sell_qty_candidate = candidate
+                    is_micro_candidate = True
+
+            # --- adaptive micro-roll cooldown check (only apply when micro candidate) ---
+            can_do_micro_now = True
+            if is_micro_candidate:
+                # compute adaptive cooldown: exponential-ish growth capped by MICRO_MAX_WAIT
+                base = float(MICRO_ROLL_COOLDOWN_BASE or 1.0)
+                # if micro_roll_count grows, backoff increases, but cap by MICRO_MAX_WAIT
+                cooldown = min(float(MICRO_MAX_WAIT or 8.0), base * (2 ** max(0, micro_roll_count)))
+                can_do_micro_now = (now_ts - last_micro_roll_ts) >= cooldown
+
+                # if MAX_MICRO_ROLLS_PER_POSITION_MICRO is set and reached, skip micro
+                if MAX_MICRO_ROLLS_PER_POSITION_MICRO is not None:
+                    try:
+                        limit_int = int(MAX_MICRO_ROLLS_PER_POSITION_MICRO)
+                    except Exception:
+                        limit_int = None
+                    if limit_int is not None and micro_roll_count >= limit_int:
+                        # reached micro budget => skip
+                        time.sleep(random.uniform(0.05, 0.12))
+                        continue
+                # else None means unlimited => allow (subject to cooldown)
+
+            # quick estimated fee guard: don't micro-roll if fee > 40% of notional
+            ESTIMATED_FEE_PCT = globals().get('ESTIMATED_FEE_PCT', 0.1)
+            estimated_fee = (sell_qty_candidate * price_now) * (ESTIMATED_FEE_PCT / 100.0)
+            if estimated_fee >= 0.40 * (sell_qty_candidate * price_now):
+                notify(f"⚠️ Estimated fee too large for candidate micro-roll on {symbol}; skipping this iteration.")
+                time.sleep(random.uniform(0.05, 0.12))
+                continue
+
+            # --- proceed with roll if triggered and allowed ---
+            if step_trigger and sell_qty_candidate >= min_qty and can_roll and allowed_to_start and (not is_micro_candidate or can_do_micro_now):
+                if roll_count >= MAX_ROLLS_PER_POSITION:
                     last_roll_ts = now_ts
                     continue
 
-                notify(f"🔎 Roll triggered for {symbol}: price={price_now:.8f}, last_roll_price={last_roll_price:.8f}, curr_tp={curr_tp:.8f}")
+                notify(f"🔎 Roll triggered for {symbol}: price={price_now:.8f}, last_roll_price={last_roll_price:.8f}, curr_tp={curr_tp:.8f}, sell_qty={sell_qty_candidate}, micro={is_micro_candidate}")
 
-                candidate_tp = curr_tp + globals().get('ROLL_TP_STEP_ABS', 0.0)
-                candidate_sl = curr_sl + globals().get('ROLL_SL_STEP_ABS', 0.0)
+                candidate_tp = curr_tp + ROLL_TP_STEP_ABS
+                candidate_sl = curr_sl + ROLL_SL_STEP_ABS
                 if candidate_sl > entry_price:
                     candidate_sl = entry_price
 
                 tick_step = tick or 0.0
-                # compute new TP/SL snapping to tick
                 if tick_step > 0:
                     new_tp = math.ceil(candidate_tp / tick_step) * tick_step
                     new_sl = math.floor(candidate_sl / tick_step) * tick_step
@@ -1267,66 +1317,22 @@ def monitor_and_roll(symbol, qty, entry_price, f,
                     new_tp = candidate_tp
                     new_sl = candidate_sl
 
-                # ensure new_tp > new_sl with some buffer
                 if new_tp <= new_sl + (tick_step or 0.0):
-                    new_tp = new_sl + (tick_step * 2 if tick_step > 0 else max(1e-8, globals().get('ROLL_TP_STEP_ABS', 1e-8)))
-                if new_tp <= curr_tp:
-                    if tick_step > 0:
-                        new_tp = math.ceil((curr_tp + tick_step) / tick_step) * tick_step
-                    else:
-                        new_tp = curr_tp + max(1e-8, globals().get('ROLL_TP_STEP_ABS', 1e-8))
+                    new_tp = new_sl + max(1e-8, ROLL_TP_STEP_ABS)
 
-                sell_qty = round_step(available_for_sell, step_size)
+                sell_qty = round_step(sell_qty_candidate, step_size)
                 if sell_qty <= 0 or sell_qty < min_qty:
-                    notify(f"⚠️ Roll skipped: sell_qty {sell_qty} too small or < minQty.")
                     last_roll_ts = now_ts
                     continue
 
-                # single-pass minNotional adjustment by bumping TP or qty
-                if min_notional and sell_qty * new_tp < (min_notional - 1e-12):
-                    max_adj = 10
-                    adj = 0
-                    while adj < max_adj and sell_qty * new_tp < (min_notional - 1e-12):
-                        if tick_step > 0:
-                            new_tp = math.ceil((new_tp + tick_step) / tick_step) * tick_step
-                        else:
-                            new_tp = new_tp + max(1e-8, new_tp * 0.001)
-                        adj += 1
-
-                    if sell_qty * new_tp < (min_notional - 1e-12):
-                        needed_qty = ceil_step(min_notional / new_tp, step_size)
-                        if needed_qty <= available_for_sell + 1e-12 and needed_qty > sell_qty:
-                            notify(f"ℹ️ Increasing sell_qty to {needed_qty} to meet minNotional for roll.")
-                            sell_qty = needed_qty
-                        else:
-                            notify(f"⚠️ Roll aborted: cannot meet minNotional for {symbol} even after TP bumps. Attempting market sell fallback if feasible.")
-                            # try market fallback if current market price would make it possible
-                            if sell_qty * price_now >= min_notional - 1e-12:
-                                try:
-                                    resp = place_market_sell_fallback(symbol, sell_qty, f)
-                                    if resp:
-                                        notify(f"✅ Market sell fallback successful for {symbol}")
-                                        profit_usd = (price_now - entry_price) * sell_qty
-                                        return True, price_now, profit_usd, sell_qty
-                                    else:
-                                        notify(f"❌ Market sell fallback failed for {symbol}. Manual intervention needed.")
-                                except Exception as ex:
-                                    notify(f"❌ Exception during fallback market sell: {ex}")
-                            else:
-                                notify(f"⚠️ Remaining qty for {symbol} too small for any sell (even market). Position will be stuck until manually handled.")
-                            last_roll_ts = now_ts
-                            continue
-
-                last_roll_ts = now_ts
-
-                # decide whether to cancel existing sell orders
+                # cancel misaligned sell orders if needed
                 need_cancel = False
                 try:
                     sell_orders = [o for o in (open_orders or []) if str(o.get('side','')).upper() == 'SELL']
                     if sell_orders:
                         for o in sell_orders:
                             ord_price = 0.0
-                            for key in ('price', 'stopPrice', 'avgPrice'):
+                            for key in ('price','stopPrice','avgPrice'):
                                 if o.get(key) is not None:
                                     try:
                                         ord_price = float(o.get(key))
@@ -1342,37 +1348,30 @@ def monitor_and_roll(symbol, qty, entry_price, f,
                 if need_cancel:
                     try:
                         cancel_all_open_orders(symbol)
-                        time.sleep(random.uniform(0.05, 0.15))
+                        time.sleep(random.uniform(*ROLL_POST_CANCEL_JITTER))
                     except Exception as e:
                         notify(f"⚠️ cancel_all_open_orders failed: {e}")
 
-                # place the rolled OCO
+                last_roll_ts = now_ts
+                # place OCO for computed sell_qty
                 oco2 = place_oco_sell(symbol, sell_qty, entry_price, explicit_tp=new_tp, explicit_sl=new_sl)
                 if oco2:
                     roll_count += 1
+                    if is_micro_candidate:
+                        micro_roll_count += 1
+                        last_micro_roll_ts = now_ts
                     curr_tp = new_tp
                     curr_sl = new_sl
                     last_roll_price = price_now
-                    notify(f"🔁 Rolled OCO (step): new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty}")
+                    notify(f"🔁 Rolled OCO: new TP={curr_tp:.8f}, new SL={curr_sl:.8f}, qty={sell_qty}, micro={is_micro_candidate}")
                 else:
                     notify("⚠️ Roll attempt failed; will try fallback OCO next loop")
                     time.sleep(0.35)
-                    try:
-                        fallback = place_oco_sell(symbol, sell_qty, entry_price, tp_pct=BASE_TP_PCT, sl_pct=BASE_SL_PCT)
-                        if fallback:
-                            notify("ℹ️ Fallback OCO re-placed after failed roll.")
-                        else:
-                            notify("❌ Fallback OCO also failed; TEMP skipping symbol.")
-                            TEMP_SKIP[symbol] = time.time() + globals().get('SKIP_SECONDS_ON_MARKET_CLOSED', 30)
-                    except Exception as ex:
-                        notify(f"❌ Exception trying fallback OCO: {ex}")
-                        TEMP_SKIP[symbol] = time.time() + globals().get('SKIP_SECONDS_ON_MARKET_CLOSED', 30)
 
-            # end of main while loop iteration
-    except Exception as e:
-        notify(f"⚠️ Error in monitor_and_roll: {e}")
-        return False, entry_price, 0.0, 0.0
-
+        except Exception as e:
+            notify(f"⚠️ Error in monitor_and_roll (adaptive micro): {e}")
+            return False, entry_price, 0.0, 0.0
+            
 # -------------------------
 # SAFE SELL FALLBACK (market)
 # -------------------------
