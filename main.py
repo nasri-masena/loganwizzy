@@ -114,8 +114,7 @@ _LAST_NOTIFY_NONPRIO = 0.0
 _NOTIFY_LAST_MSG_TS = {}
 _NOTIFY_MSG_LOCK = Lock()
 
-
-def _send_telegram(text: str) -> bool:
+def _send_telegram(text: str):
     BOT_TOK = globals().get('BOT_TOKEN')
     CHAT_ID_LOCAL = globals().get('CHAT_ID')
     if not BOT_TOK or not CHAT_ID_LOCAL:
@@ -134,40 +133,6 @@ def _send_telegram(text: str) -> bool:
         time.sleep(0.25 * attempt)
     return False
 
-def _start_notify_thread():
-    global _NOTIFY_THREAD_STARTED
-    with _NOTIFY_LOCK:
-        if _NOTIFY_THREAD_STARTED:
-            return
-        def _worker():
-            while True:
-                text = None
-                try:
-                    text = _NOTIFY_Q.get()
-                except Exception:
-                    time.sleep(0.1)
-                    continue
-                if text is None:
-                    break
-                try:
-                    ok = _send_telegram(text)
-                    if not ok:
-                        # final best-effort synchronous fallback
-                        try:
-                            requests.post(f"https://api.telegram.org/bot{globals().get('BOT_TOKEN')}/sendMessage",
-                                          data={"chat_id": globals().get('CHAT_ID'), "text": text}, timeout=2)
-                        except Exception:
-                            pass
-                finally:
-                    try:
-                        _NOTIFY_Q.task_done()
-                    except Exception:
-                        pass
-            # thread exiting
-        t = Thread(target=_worker, daemon=True)
-        t.start()
-        _NOTIFY_THREAD_STARTED = True
-
 def notify(msg: str, priority: bool = False, category: str = None):
     now_ts = time.time()
     text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -176,58 +141,52 @@ def notify(msg: str, priority: bool = False, category: str = None):
     except Exception:
         pass
 
-    # decide which messages are allowed to be sent to Telegram
-    allowed = False
-    try:
-        if category == 'daily':
-            allowed = True
-        else:
-            if isinstance(msg, str):
-                if msg.startswith("✅ BUY"):
-                    allowed = True
-                elif msg.startswith("✅ Position closed"):
-                    allowed = True
-                elif msg.startswith("🔁 Rolled") or msg.startswith("🔁 Rolled OCO"):
-                    allowed = True
-                elif msg.startswith("📍 Micro"):
-                    allowed = True
-                elif msg.startswith("📌 OCO"):
-                    allowed = True
-                elif msg.startswith("💸"):
-                    allowed = True
-                elif msg.startswith("⚠️") or msg.startswith("❌"):
-                    allowed = True
-    except Exception:
-        allowed = False
-
-    if not allowed and not priority:
-        return
-
-    # immediate send for forced priority messages
+    # send immediate if forced priority
     if priority:
         try:
             Thread(target=_send_telegram, args=(text,), daemon=True).start()
         except Exception:
             pass
-        with _NOTIFY_MSG_LOCK:
-            _NOTIFY_LAST_MSG_TS[text] = now_ts
         return
 
-    # duplicate suppression window (avoid identical messages many times)
-    dup_window = float(globals().get('NOTIFY_DUPLICATE_WINDOW', 300.0))  # seconds
-    with _NOTIFY_MSG_LOCK:
-        last = _NOTIFY_LAST_MSG_TS.get(text)
-        if last and (now_ts - last) < dup_window:
-            return
-        # throttle short-term for non-priority messages
-        suppress = float(globals().get('NOTIFY_PRIORITY_SUPPRESS', 0.08))
-        global _LAST_NOTIFY_NONPRIO
+    # allow only selected prefixes or daily category
+    allow = False
+    try:
+        if category == 'daily':
+            allow = True
+        else:
+            if isinstance(msg, str):
+                if msg.startswith("✅ BUY"):
+                    allow = True
+                elif msg.startswith("✅ Position closed"):
+                    allow = True
+                elif msg.startswith("🔁 Rolled"):
+                    allow = True
+                elif msg.startswith("📌 OCO"):
+                    allow = True
+                elif msg.startswith("📍 Micro"):
+                    allow = True
+                elif msg.startswith("💸 Profit"):
+                    allow = True
+                elif msg.startswith("⚠️") or msg.startswith("❌"):
+                    allow = True
+    except Exception:
+        allow = False
+
+    if not allow:
+        # suppressed for Telegram but printed locally
+        return
+
+    # throttle non-priority slightly
+    suppress = float(globals().get('NOTIFY_PRIORITY_SUPPRESS', 0.08))
+    global _LAST_NOTIFY_NONPRIO
+    try:
         if now_ts - _LAST_NOTIFY_NONPRIO < suppress:
             return
         _LAST_NOTIFY_NONPRIO = now_ts
-        _NOTIFY_LAST_MSG_TS[text] = now_ts
+    except Exception:
+        _LAST_NOTIFY_NONPRIO = now_ts
 
-    # queue the message (worker will send). fallback to background thread if queue full
     try:
         _start_notify_thread()
         _NOTIFY_Q.put_nowait(text)
@@ -241,7 +200,7 @@ def notify(msg: str, priority: bool = False, category: str = None):
             Thread(target=_send_telegram, args=(text,), daemon=True).start()
         except Exception:
             pass
-        
+
 def format_price(value, tick_size):
     try:
         tick = Decimal(str(tick_size))
