@@ -60,8 +60,8 @@ ROLL_TRIGGER_DELTA_ABS = 0.001
 ROLL_TP_STEP_ABS = 0.010
 ROLL_SL_STEP_ABS = 0.0015
 ROLL_COOLDOWN_SECONDS = 5
-MAX_ROLLS_PER_POSITION = 9999999
-ROLL_POST_CANCEL_JITTER = (0.5, 0.18)
+MAX_ROLLS_PER_POSITION = 60
+ROLL_POST_CANCEL_JITTER = (0.5, 0.15)
 
 ROLL_FAIL_COUNTER = {}
 FAILED_ROLL_THRESHOLD = 3
@@ -617,7 +617,7 @@ def pick_coin():
         # localizable tuning (can be overridden via globals())
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.08)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.25)
 
@@ -725,11 +725,11 @@ def pick_coin():
         # deep-evaluate sampled symbols
         for sym, last_price, qvol, change_pct in sampled:
             try:
-                time.sleep(REQUEST_SLEEP)
+                time.sleep(max(REQUEST_SLEEP, 0.06) + random.random() * 0.09)
 
                 # fetch klines
                 try:
-                    klines = client.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
+                    klines = cached_get_klines(sym, interval='5m', limit=KLINES_LIMIT)
                 except Exception as e:
                     err = str(e)
                     if '-1003' in err or 'Too much request weight' in err or 'Way too much request weight' in err:
@@ -1654,7 +1654,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=3.0, sl_pct=0.9,
     return None
 
 # --- Cancel all open orders ---
-def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.25):
+def cancel_all_open_orders(symbol, max_cancel=6, inter_delay=0.05):
     result = {'cancelled': 0, 'errors': 0, 'partial': False}
     try:
         open_orders = get_open_orders_cached(symbol)
