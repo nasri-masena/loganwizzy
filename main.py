@@ -396,7 +396,6 @@ LAST_FETCH = 0
 SYMBOL_INFO_CACHE = {}
 SYMBOL_INFO_TTL = 120
 OPEN_ORDERS_CACHE = {'ts': 0, 'data': None}
-OPEN_ORDERS_TTL = 80
 
 def get_symbol_info_cached(symbol, ttl=SYMBOL_INFO_TTL):
     now = time.time()
