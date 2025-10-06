@@ -24,7 +24,7 @@ QUOTE = "USDT"
 
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 2000_000
+MIN_VOLUME = 1000_000
 
 RECENT_PCT_MIN = 0.8
 RECENT_PCT_MAX = 8.0
@@ -49,7 +49,7 @@ BASE_SL_PCT = 2.0
 
 MICRO_TP_PCT = 0.5
 MICRO_TP_FRACTION = 0.20
-MICRO_MAX_WAIT = 12.0   # give a bit more time for micro fills
+MICRO_MAX_WAIT = 10.0   # give a bit more time for micro fills
 
 ROLL_STEP_PCT = 0.2
 ROLL_STEP_ABS = 0.001
@@ -103,7 +103,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BASE_SLEEP = 30
 RATE_LIMIT_BACKOFF_MAX = 180
-CACHE_TTL = 500
+CACHE_TTL = 600
 OPEN_ORDERS_TTL = 120
 
 # notify subsystem
@@ -586,8 +586,8 @@ def pick_coin():
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 30)
-        DEEP_EVAL = globals().get('DEEP_EVAL', 2)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        DEEP_EVAL = globals().get('DEEP_EVAL', 3)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.03)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 8)
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
@@ -1879,6 +1879,123 @@ def enforce_oco_max_life_and_exit_if_needed():
     except Exception as e:
         notify(f"⚠️ enforce_oco_max_life error: {e}")
 
+def sniper_buy_and_monitor(symbol, usd_amount: float = None, require_orderbook: bool = False):
+    try:
+        usd_amount = float(usd_amount) if usd_amount is not None else float(globals().get('TRADE_USD', 12.0))
+        c = get_client()
+        if not c:
+            notify("⚠️ sniper_buy_and_monitor: Binance client not available.")
+            return False, 0.0, 0.0, 0.0
+
+        info = get_symbol_info_cached(symbol)
+        if not info:
+            notify(f"⚠️ sniper: couldn't fetch symbol info for {symbol}; skipping.")
+            return False, 0.0, 0.0, 0.0
+
+        f = get_filters(info)
+        step = float(f.get('stepSize') or 0.0)
+        tick = float(f.get('tickSize') or 0.0)
+        min_notional = float(f.get('minNotional') or 0.0)
+        min_qty = float(f.get('minQty') or 0.0)
+        asset = symbol[:-len(QUOTE)]
+
+        # quick prefilter: if minNotional requires more than our buy amount, skip
+        if min_notional and min_notional > usd_amount * 1.2:
+            notify(f"⚠️ sniper: skipping {symbol} because minNotional ${min_notional:.4f} > buy ${usd_amount:.4f}")
+            return False, 0.0, 0.0, 0.0
+
+        # place market buy
+        executed_qty, avg_price = place_safe_market_buy(symbol, usd_amount, require_orderbook=require_orderbook)
+        if not executed_qty or not avg_price:
+            notify(f"❌ sniper: market buy failed for {symbol}")
+            return False, 0.0, 0.0, 0.0
+
+        qty = round_step(executed_qty, step)
+        if qty <= 0 or qty < min_qty:
+            notify(f"❌ sniper: executed qty {qty} invalid (< minQty {min_qty}) for {symbol}.")
+            return False, 0.0, 0.0, 0.0
+
+        notify(f"ℹ️ sniper: bought {symbol} qty={qty} ~price={avg_price:.8f} notional≈${qty*avg_price:.6f}")
+
+        # attempt micro TP (may sell fraction)
+        micro_order, micro_sold_qty, micro_tp_price = None, 0.0, None
+        try:
+            micro_order, micro_sold_qty, micro_tp_price = place_micro_tp(symbol, qty, avg_price, f)
+        except Exception as e:
+            notify(f"⚠️ Micro TP placement error for {symbol}: {e}")
+
+        # compute remaining qty
+        qty_remaining = round_step(max(0.0, qty - (micro_sold_qty or 0.0)), step)
+
+        # if nothing left to monitor (micro sold all / too small), treat as closed
+        if qty_remaining <= 0 or qty_remaining < min_qty or (min_notional and qty_remaining * avg_price < min_notional - 1e-12):
+            total_profit_usd = 0.0
+            try:
+                if micro_sold_qty and micro_tp_price:
+                    total_profit_usd += (micro_tp_price - avg_price) * micro_sold_qty
+            except Exception:
+                pass
+            # closed by micro TP (or effectively closed)
+            notify(f"ℹ️ sniper: position closed by micro TP or too small to monitor for {symbol}. profit≈${total_profit_usd:.6f}")
+            return True, (micro_tp_price or avg_price), total_profit_usd, (micro_sold_qty or 0.0)
+
+        # before handing to monitor_and_roll, ensure we meet minNotional when monitor tries to place OCO
+        tp_guess = avg_price * (1 + globals().get('BASE_TP_PCT', BASE_TP_PCT) / 100.0)
+        tp_guess = _ceil_to_tick(tp_guess, tick)
+        if min_notional and qty_remaining * tp_guess < min_notional - 1e-12:
+            # attempt to increase qty from free balance
+            needed_qty = ceil_step(min_notional / tp_guess, step)
+            free_qty = get_free_asset(asset)
+            if needed_qty <= free_qty + 1e-12:
+                notify(f"ℹ️ sniper: increasing qty_remaining from {qty_remaining} to {needed_qty} to meet minNotional for {symbol}")
+                qty_remaining = needed_qty
+            else:
+                notify(f"⚠️ sniper: Cannot meet minNotional for {symbol} after micro TP. qty*tp={qty_remaining*tp_guess:.6f} < {min_notional}")
+                # increment fail counter and TEMP_SKIP if repeated
+                ROLL_FAIL_COUNTER[symbol] = ROLL_FAIL_COUNTER.get(symbol, 0) + 1
+                if ROLL_FAIL_COUNTER[symbol] >= FAILED_ROLL_THRESHOLD:
+                    notify(f"⚠️ {symbol} reached failed roll threshold; TEMP skipping for {FAILED_ROLL_SKIP_SECONDS}s.")
+                    TEMP_SKIP[symbol] = time.time() + FAILED_ROLL_SKIP_SECONDS
+                    ROLL_FAIL_COUNTER[symbol] = 0
+                # return as open position but not monitored (safer)
+                return False, avg_price, 0.0, 0.0
+
+        # now call monitor_and_roll to place OCO and manage rolling
+        try:
+            res = monitor_and_roll(symbol, qty_remaining, avg_price, f)
+        except Exception as e:
+            notify(f"⚠️ monitor_and_roll exception for {symbol}: {e}")
+            return False, avg_price, 0.0, 0.0
+
+        # support both 3-tuple and 4-tuple returns from monitor_and_roll
+        try:
+            if isinstance(res, tuple):
+                if len(res) == 4:
+                    closed, exit_price, profit_usd, filled_qty = res
+                elif len(res) == 3:
+                    closed, exit_price, profit_usd = res
+                    filled_qty = 0.0
+                else:
+                    # unknown shape
+                    closed, exit_price, profit_usd, filled_qty = bool(res), 0.0, 0.0, 0.0
+            else:
+                closed, exit_price, profit_usd, filled_qty = bool(res), 0.0, 0.0, 0.0
+        except Exception:
+            closed, exit_price, profit_usd, filled_qty = False, 0.0, 0.0, 0.0
+
+        # combine micro profit (if any)
+        try:
+            micro_profit = (micro_tp_price - avg_price) * micro_sold_qty if (micro_sold_qty and micro_tp_price) else 0.0
+            profit_total = (profit_usd or 0.0) + micro_profit
+        except Exception:
+            profit_total = profit_usd or 0.0
+
+        return bool(closed), float(exit_price or 0.0), float(profit_total or 0.0), float(filled_qty or 0.0)
+
+    except Exception as e:
+        notify(f"⚠️ sniper_buy_and_monitor unexpected error for {symbol}: {e}")
+        return False, 0.0, 0.0, 0.0
+        
 _DAILY_REPORTER_STARTED = False
 _DAILY_REPORTER_LOCK = Lock()
 
@@ -1931,6 +2048,10 @@ def _start_daily_reporter_once():
 # -------------------------
 # UPDATED TRADE CYCLE
 # -------------------------
+ACTIVE_SYMBOL = None
+LAST_BUY_TS = 0.0
+BUY_LOCK_SECONDS = globals().get('BUY_LOCK_SECONDS', 30)
+
 def trade_cycle():
     global start_balance_usdt, ACTIVE_SYMBOL, LAST_BUY_TS, RATE_LIMIT_BACKOFF
 
@@ -1986,7 +2107,7 @@ def trade_cycle():
 
             info = get_symbol_info_cached(symbol)
             f = get_filters(info) if info else {}
-            min_notional = f.get('minNotional', 0.0)
+            min_notional = float(f.get('minNotional') or 0.0)
             min_safe_trade = min_notional * 1.2
             if usd_to_buy < min_safe_trade:
                 notify(f"⏭️ Skipping buy for {symbol}: not enough USDT to safely trade (need at least ${min_safe_trade:.2f})")
@@ -2004,108 +2125,23 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            try:
-                buy_res = place_safe_market_buy(symbol, usd_to_buy, require_orderbook=globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', False))
-            except Exception as e:
-                err = str(e)
-                if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
-                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP,
-                                             RATE_LIMIT_BACKOFF_MAX)
-                    notify(f"❌ Rate limit detected during buy attempt: backing off for {RATE_LIMIT_BACKOFF}s.")
-                    time.sleep(RATE_LIMIT_BACKOFF)
-                else:
-                    notify(f"❌ Exception during market buy attempt for {symbol}: {err}")
-                    time.sleep(CYCLE_DELAY)
-                continue
-
-            if not buy_res or buy_res == (None, None):
-                time.sleep(CYCLE_DELAY)
-                continue
-
-            qty, entry_price = buy_res
-            if qty is None or entry_price is None:
-                time.sleep(CYCLE_DELAY)
-                continue
-
-            if globals().get('NOTIFY_ON_BUY', True):
-                notify(f"✅ BUY {symbol}: qty={qty} ~price={entry_price:.8f} notional≈${qty*entry_price:.6f}")
-
-            try:
-                now_datekey = (datetime.utcnow() + __import__('datetime').timedelta(hours=3)).date().isoformat()
-                ent = METRICS.get(now_datekey) or {'picks': 0, 'wins': 0, 'losses': 0, 'profit': 0.0}
-                ent['picks'] = ent.get('picks', 0) + 1
-                METRICS[now_datekey] = ent
-            except Exception:
-                pass
-
-            RECENT_BUYS[symbol] = {'ts': time.time(), 'price': entry_price, 'profit': None, 'cooldown': REBUY_COOLDOWN}
-
-            info = get_symbol_info_cached(symbol)
-            f = get_filters(info) if info else {}
-            if not f:
-                notify(f"⚠️ Could not fetch filters for {symbol} after buy; aborting monitoring for safety.")
-                try:
-                    place_market_sell_fallback(symbol, qty, f)
-                except Exception:
-                    pass
-                time.sleep(CYCLE_DELAY)
-                continue
-
-            micro_order, micro_sold_qty, micro_tp_price = None, 0.0, None
-            try:
-                micro_order, micro_sold_qty, micro_tp_price = place_micro_tp(symbol, qty, entry_price, f)
-            except Exception as e:
-                notify(f"⚠️ Micro TP placement error for {symbol}: {e}")
-
-            qty_remaining = round_step(max(0.0, qty - micro_sold_qty), f.get('stepSize', 0.0))
-            if qty_remaining <= 0 or qty_remaining < f.get('minQty', 0.0) or (f.get('minNotional') and qty_remaining * entry_price < f.get('minNotional') - 1e-12):
-                total_profit_usd = 0.0
-                try:
-                    if micro_sold_qty and micro_tp_price:
-                        total_profit_usd += (micro_tp_price - entry_price) * micro_sold_qty
-                except Exception:
-                    pass
-
-                try:
-                    was_win = total_profit_usd > 0
-                    date_key, m = _update_metrics_for_profit(total_profit_usd, picked_symbol=symbol, was_win=was_win)
-                    if globals().get('NOTIFY_ON_CLOSE', True):
-                        notify(f"🔁 Position closed for {symbol}: profit≈${total_profit_usd:.6f}")
-                except Exception:
-                    pass
-                LAST_BUY_TS = time.time()
-                time.sleep(CYCLE_DELAY)
-                continue
-
+            # PREP: mark active and buy-lock
             ACTIVE_SYMBOL = symbol
             LAST_BUY_TS = time.time()
 
-            try:
-                OPEN_ORDERS_CACHE['data'] = None
-            except Exception:
-                pass
+            notify(f"🎯 trade_cycle: attempting sniper buy for {symbol} (usd={usd_to_buy:.2f})")
 
-            try:
-                closed, exit_price, profit_usd, filled_qty = monitor_and_roll(symbol, qty_remaining, entry_price, f)
-            finally:
-                ACTIVE_SYMBOL = None
-                try:
-                    OPEN_ORDERS_CACHE['data'] = None
-                except Exception:
-                    pass
+            # Call sniper (live)
+            ok, exit_price, profit_usd, filled_qty = sniper_buy_and_monitor(symbol, usd_amount=usd_to_buy, require_orderbook=globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', False))
 
-            total_profit = 0.0
+            # if sniper reported rollback or fail, ok==False; but still use info to update metrics
+            # Build total_profit: sniper already included micro profit
+            total_profit = float(profit_usd or 0.0)
             try:
-                total_profit = profit_usd or 0.0
-                if micro_order and micro_sold_qty and micro_tp_price:
-                    total_profit += (micro_tp_price - entry_price) * micro_sold_qty
-            except Exception:
-                pass
-
-            try:
+                # update metrics & RECENT_BUYS similar to original logic
                 ent = RECENT_BUYS.get(symbol, {})
                 ent['ts'] = time.time()
-                ent['price'] = entry_price
+                ent['price'] = price
                 ent['profit'] = total_profit
                 ent['cooldown'] = LOSS_COOLDOWN if total_profit < 0 else REBUY_COOLDOWN
                 RECENT_BUYS[symbol] = ent
@@ -2116,14 +2152,15 @@ def trade_cycle():
                 was_win = (total_profit > 0)
                 date_key, m = _update_metrics_for_profit(total_profit, picked_symbol=symbol, was_win=was_win)
                 if globals().get('NOTIFY_ON_CLOSE', True):
-                    if (micro_sold_qty and micro_sold_qty > 0) or (filled_qty and filled_qty > 0):
+                    if ok:
                         sign = "+" if total_profit >= 0 else "-"
                         notify(f"✅ Position closed for {symbol}: exit={exit_price:.8f}, profit≈{sign}${abs(total_profit):.6f}")
                     else:
-                        notify(f"⚠️ Position closed for {symbol} but no executed sell detected (filled_qty=0). profit≈${total_profit:.6f}")
+                        # sniper didn't fully close or indicated failure — still notify result
+                        notify(f"⚠️ Sniper flow for {symbol} finished: closed={ok}, exit={exit_price:.8f}, profit≈${total_profit:.6f}")
             except Exception as e:
                 if globals().get('NOTIFY_ON_ERROR', True):
-                    notify(f"⚠️ Error updating metrics after position closed for {symbol}: {e}")
+                    notify(f"⚠️ Error updating metrics after sniper for {symbol}: {e}")
 
             try:
                 if total_profit and total_profit > 0:
@@ -2149,8 +2186,9 @@ def trade_cycle():
                 notify(f"❌ Trade cycle unexpected error: {e}")
             time.sleep(CYCLE_DELAY)
 
+        # small breathing before next cycle
         time.sleep(CYCLE_DELAY)
-
+        
 # # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
