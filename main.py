@@ -1881,7 +1881,7 @@ def enforce_oco_max_life_and_exit_if_needed():
 
 def sniper_buy_and_monitor(symbol, usd_amount: float = None, require_orderbook: bool = False):
     try:
-        usd_amount = float(usd_amount) if usd_amount is not None else float(globals().get('TRADE_USD', 12.0))
+        usd_amount = float(usd_amount) if usd_amount is not None else float(globals().get('TRADE_USD', 10.0))
         c = get_client()
         if not c:
             notify("⚠️ sniper_buy_and_monitor: Binance client not available.")
