@@ -103,7 +103,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BASE_SLEEP = 30
 RATE_LIMIT_BACKOFF_MAX = 180
-CACHE_TTL = 450
+CACHE_TTL = 480
 OPEN_ORDERS_TTL = 120
 
 SELL_FRACTION = Decimal(os.environ.get('SELL_FRACTION', '0.99'))   # use 99% of available when placing sells
@@ -655,7 +655,7 @@ def pick_coin():
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 40)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.03)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 8)
