@@ -37,15 +37,15 @@ MOVEMENT_MIN_PCT = 1.5
 EMA_UPLIFT_MIN_PCT = 0.0012
 SCORE_MIN_THRESHOLD = 15.0
 
-TRADE_USD = 8.0
+TRADE_USD = 10.0
 SLEEP_BETWEEN_CHECKS = 8
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
 
 TRIGGER_PROXIMITY = 0.010
 STEP_INCREMENT_PCT = 0.01
-BASE_TP_PCT = 3.8
-BASE_SL_PCT = 1.6
+BASE_TP_PCT = 2.8
+BASE_SL_PCT = 1.0
 
 NOTIFY_QUEUE_MAX = 1000
 NOTIFY_RETRY = 2
@@ -106,7 +106,7 @@ _LAST_NOTIFY_NONPRIO = 0.0
 _NOTIFY_LAST_MSG_TS = {}
 _NOTIFY_MSG_LOCK = Lock()
 
-def _send_telegram(text: str) -> bool:
+def _send_telegram(text: str):
     BOT_TOK = globals().get('BOT_TOKEN')
     CHAT_ID_LOCAL = globals().get('CHAT_ID')
     if not BOT_TOK or not CHAT_ID_LOCAL:
@@ -125,38 +125,6 @@ def _send_telegram(text: str) -> bool:
         time.sleep(0.25 * attempt)
     return False
 
-def _start_notify_thread():
-    global _NOTIFY_THREAD_STARTED
-    with _NOTIFY_LOCK:
-        if _NOTIFY_THREAD_STARTED:
-            return
-        def _worker():
-            while True:
-                text = None
-                try:
-                    text = _NOTIFY_Q.get()
-                except Exception:
-                    time.sleep(0.1)
-                    continue
-                if text is None:
-                    break
-                try:
-                    ok = _send_telegram(text)
-                    if not ok:
-                        try:
-                            requests.post(f"https://api.telegram.org/bot{globals().get('BOT_TOKEN')}/sendMessage",
-                                          data={"chat_id": globals().get('CHAT_ID'), "text": text}, timeout=2)
-                        except Exception:
-                            pass
-                finally:
-                    try:
-                        _NOTIFY_Q.task_done()
-                    except Exception:
-                        pass
-        t = Thread(target=_worker, daemon=True)
-        t.start()
-        _NOTIFY_THREAD_STARTED = True
-
 def notify(msg: str, priority: bool = False, category: str = None):
     now_ts = time.time()
     text = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -165,48 +133,46 @@ def notify(msg: str, priority: bool = False, category: str = None):
     except Exception:
         pass
 
-    allowed = False
-    try:
-        if category == 'daily':
-            allowed = True
-        else:
-            if isinstance(msg, str):
-                if msg.startswith("✅ BUY"):
-                    allowed = True
-                elif msg.startswith("✅ Position closed"):
-                    allowed = True
-                elif msg.startswith("📌 OCO"):
-                    allowed = True
-                elif msg.startswith("💸"):
-                    allowed = True
-                elif msg.startswith("⚠️") or msg.startswith("❌"):
-                    allowed = True
-    except Exception:
-        allowed = False
-
-    if not allowed and not priority:
-        return
-
+    # send immediate if forced priority
     if priority:
         try:
             Thread(target=_send_telegram, args=(text,), daemon=True).start()
         except Exception:
             pass
-        with _NOTIFY_MSG_LOCK:
-            _NOTIFY_LAST_MSG_TS[text] = now_ts
         return
 
-    dup_window = float(globals().get('NOTIFY_DUPLICATE_WINDOW', 300.0))  # seconds
-    with _NOTIFY_MSG_LOCK:
-        last = _NOTIFY_LAST_MSG_TS.get(text)
-        if last and (now_ts - last) < dup_window:
-            return
-        suppress = float(globals().get('NOTIFY_PRIORITY_SUPPRESS', 0.08))
-        global _LAST_NOTIFY_NONPRIO
+    # allow only selected prefixes or daily category
+    allow = False
+    try:
+        if category == 'daily':
+            allow = True
+        else:
+            if isinstance(msg, str):
+                if msg.startswith("✅ BUY"):
+                    allow = True
+                elif msg.startswith("✅ Position closed"):
+                    allow = True
+                elif msg.startswith("📌 OCO"):
+                    allow = True
+                elif msg.startswith("💸 Profit"):
+                    allow = True
+                elif msg.startswith("⚠️") or msg.startswith("❌"):
+                    allow = True
+    except Exception:
+        allow = False
+
+    if not allow:
+        # suppressed for Telegram but printed locally
+        return
+    # throttle non-priority slightly
+    suppress = float(globals().get('NOTIFY_PRIORITY_SUPPRESS', 0.08))
+    global _LAST_NOTIFY_NONPRIO
+    try:
         if now_ts - _LAST_NOTIFY_NONPRIO < suppress:
             return
         _LAST_NOTIFY_NONPRIO = now_ts
-        _NOTIFY_LAST_MSG_TS[text] = now_ts
+    except Exception:
+        _LAST_NOTIFY_NONPRIO = now_ts
 
     try:
         _start_notify_thread()
@@ -403,11 +369,9 @@ def send_profit_to_funding(amount, asset='USDT'):
         except Exception as e2:
             notify(f"❌ Failed to transfer profit: {e} | {e2}")
             return None
-
 # -------------------------
 # CACHES & UTIL
 # -------------------------
-
 TICKER_CACHE = None
 LAST_FETCH = 0
 SYMBOL_INFO_CACHE = {}
@@ -453,7 +417,6 @@ def get_open_orders_cached(symbol=None):
         with OPEN_ORDERS_LOCK:
             return OPEN_ORDERS_CACHE.get('data') or []
 
-
 # per-symbol price cache
 PER_SYMBOL_PRICE_CACHE = {}  # symbol -> (price, ts)
 PRICE_CACHE_TTL = 2.0  # seconds
@@ -482,9 +445,6 @@ def get_tickers_cached():
 
 
 def get_price_cached(symbol):
-    """
-    First try per-symbol short TTL cache, then fall back to TICKER_CACHE; last fallback uses client.get_symbol_ticker.
-    """
     now = time.time()
     ent = PER_SYMBOL_PRICE_CACHE.get(symbol)
     if ent and now - ent[1] < PRICE_CACHE_TTL:
@@ -603,12 +563,12 @@ def pick_coin():
         now = time.time()
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.06)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.04)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD if 'SCORE_MIN_THRESHOLD' in globals() else 14.0)
         REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
-        PREBUY_BREAKOUT_MARGIN = globals().get('PREBUY_BREAKOUT_MARGIN', 0.0015)
+        PREBUY_BREAKOUT_MARGIN = globals().get('PREBUY_BREAKOUT_MARGIN', 0.008)
 
         tickers = get_tickers_cached() or []
         prefiltered = []
@@ -907,7 +867,7 @@ def place_safe_market_buy(symbol, usd_amount, require_orderbook: bool = False):
     if require_orderbook:
         try:
             if not orderbook_bullish(symbol, depth=5, min_imbalance=1.1, max_spread_pct=0.6):
-                notify(f"⚠️ Orderbook not bullish for {symbol}; aborting market buy.")
+                notify(f"Orderbook not bullish for {symbol}; aborting market buy.")
                 return None, None
         except Exception as e:
             notify(f"⚠️ Orderbook check error for {symbol}: {e}")
@@ -1071,7 +1031,7 @@ def place_market_sell_fallback(symbol, qty, f):
 # -------------------------
 # OCO SELL with robust fallbacks & minNotional & qty adjustment
 # -------------------------
-def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=1.0,
+def place_oco_sell(symbol, qty, buy_price, tp_pct=2.8, sl_pct=1.0,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
     global RATE_LIMIT_BACKOFF
