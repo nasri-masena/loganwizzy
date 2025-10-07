@@ -24,7 +24,7 @@ QUOTE = "USDT"
 
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 3000_000
+MIN_VOLUME = 2000_000
 
 RECENT_PCT_MIN = 0.8
 RECENT_PCT_MAX = 5.0
@@ -2102,7 +2102,11 @@ def trade_cycle():
 
             info = get_symbol_info_cached(symbol)
             f = get_filters(info) if info else {}
-            min_notional = f.get('minNotional', 0.0)
+            # === CAST filter numeric values to float to avoid Decimal * float errors ===
+            min_notional = float(f.get('minNotional') or 0.0)
+            min_qty = float(f.get('minQty') or 0.0)
+            step_size = float(f.get('stepSize') or 0.0)
+
             min_safe_trade = min_notional * 1.2
             if usd_to_buy < min_safe_trade:
                 notify(f"⏭️ Skipping buy for {symbol}: not enough USDT to safely trade (need at least ${min_safe_trade:.2f})")
@@ -2173,8 +2177,9 @@ def trade_cycle():
             except Exception as e:
                 notify(f"⚠️ Micro TP placement error for {symbol}: {e}")
 
-            qty_remaining = round_step(max(0.0, qty - micro_sold_qty), f.get('stepSize', 0.0))
-            if qty_remaining <= 0 or qty_remaining < f.get('minQty', 0.0) or (f.get('minNotional') and qty_remaining * entry_price < f.get('minNotional') - 1e-12):
+            # Use step_size cast for rounding
+            qty_remaining = round_step(max(0.0, qty - micro_sold_qty), float(f.get('stepSize', step_size)))
+            if qty_remaining <= 0 or qty_remaining < float(f.get('minQty', min_qty)) or (float(f.get('minNotional', min_notional)) and qty_remaining * entry_price < float(f.get('minNotional', min_notional)) - 1e-12):
                 total_profit_usd = 0.0
                 try:
                     if micro_sold_qty and micro_tp_price:
@@ -2266,7 +2271,7 @@ def trade_cycle():
             time.sleep(CYCLE_DELAY)
 
         time.sleep(CYCLE_DELAY)
-
+        
 # # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
