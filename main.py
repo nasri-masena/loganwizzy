@@ -45,7 +45,7 @@ COOLDOWN_AFTER_EXIT = 10
 TRIGGER_PROXIMITY = 0.010
 STEP_INCREMENT_PCT = 0.01
 BASE_TP_PCT = 2.8
-BASE_SL_PCT = 1.0
+BASE_SL_PCT = 0.9
 
 NOTIFY_QUEUE_MAX = 1000
 NOTIFY_RETRY = 2
@@ -90,7 +90,7 @@ REQUIRE_ORDERBOOK_BEFORE_BUY = True
 ORDERBOOK_DEPTH_FOR_CONFIRM = 5
 ORDERBOOK_MIN_IMBALANCE = 1.15
 
-BREAKEVEN_TRIGGER_PCT = 0.018
+BREAKEVEN_TRIGGER_PCT = 0.012
 BREAKEVEN_BUFFER_PCT = 0.0025
 BREAKEVEN_MONITOR_SECONDS = 60 * 25
 BREAKEVEN_POLL_INTERVAL = 3
@@ -586,8 +586,8 @@ def pick_coin():
         now = time.time()
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.05)
-        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.04)
+        KLINES_LIMIT = globals().get('KLINES_LIMIT', 8)
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD if 'SCORE_MIN_THRESHOLD' in globals() else 14.0)
         REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
@@ -1054,7 +1054,7 @@ def place_market_sell_fallback(symbol, qty, f):
 # -------------------------
 # OCO SELL with robust fallbacks & minNotional & qty adjustment
 # -------------------------
-def place_oco_sell(symbol, qty, buy_price, tp_pct=2.8, sl_pct=1.0,
+def place_oco_sell(symbol, qty, buy_price, tp_pct=2.8, sl_pct=0.9,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
     global RATE_LIMIT_BACKOFF
