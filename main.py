@@ -37,7 +37,7 @@ MOVEMENT_MIN_PCT = 1.0
 EMA_UPLIFT_MIN_PCT = 0.0008
 SCORE_MIN_THRESHOLD = 13.0
 
-TRADE_USD = 10.0
+TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 8
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
@@ -83,7 +83,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BASE_SLEEP = 30
 RATE_LIMIT_BACKOFF_MAX = 180
-CACHE_TTL = 300
+CACHE_TTL = 250
 OPEN_ORDERS_TTL = 120
 
 REQUIRE_ORDERBOOK_BEFORE_BUY = True
@@ -1050,7 +1050,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
     global RATE_LIMIT_BACKOFF
-
     try:
         info = get_symbol_info_cached(symbol)
         if not info:
@@ -1073,7 +1072,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
                 return v
             return math.ceil(v / step) * step
 
-        # Make sure qty respects step
         qty = clip_floor(qty, f.get('stepSize', 0.0))
         tp = clip_ceil(tp, f.get('tickSize', 0.0))
         sp = clip_floor(sp, f.get('tickSize', 0.0))
@@ -1083,7 +1081,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
             notify("❌ place_oco_sell: quantity too small after clipping")
             return None
 
-        # ensure enough free asset
         free_qty = get_free_asset(asset)
         safe_margin = f.get('stepSize') if f.get('stepSize') and f.get('stepSize') > 0 else 0.0
         if free_qty + 1e-12 < qty:
@@ -1094,31 +1091,21 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
             notify(f"ℹ️ Adjusting sell qty down from {qty} to available {new_qty} to avoid insufficient balance.")
             qty = new_qty
 
-        # BEFORE trying OCO: ensure minNotional satisfied
         min_notional = float(f.get('minNotional') or 0.0)
         if min_notional:
             if qty * tp < min_notional - 1e-12:
-                needed_qty = ceil_step(min_notional / tp, f.get('stepSize'))
-                if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
-                    notify(f"ℹ️ Increasing qty from {qty} to {needed_qty} to meet minNotional (qty*tp >= {min_notional}).")
-                    qty = needed_qty
+                q_adj, tp_adj, reason = _ensure_notional_by_price_or_qty(symbol, qty, tp, f, available_for_sell=free_qty)
+                if q_adj is None:
+                    notify(f"⚠️ Cannot meet minNotional for OCO on {symbol} using price bumps. Will attempt fallback flow.")
                 else:
-                    attempts = 0
-                    while attempts < 40 and qty * tp < min_notional - 1e-12:
-                        if f.get('tickSize') and f.get('tickSize') > 0:
-                            tp = clip_ceil(tp + f.get('tickSize'), f.get('tickSize'))
-                        else:
-                            tp = tp + max(1e-8, tp * 0.001)
-                        attempts += 1
-                    if qty * tp < min_notional - 1e-12:
-                        notify(f"⚠️ Cannot meet minNotional for OCO on {symbol} (qty*tp={qty*tp:.8f} < {min_notional}). Will attempt fallback flow.")
+                    qty = q_adj
+                    tp = tp_adj
 
         qty_str = format_qty(qty, f.get('stepSize'))
         tp_str = format_price(tp, f.get('tickSize'))
         sp_str = format_price(sp, f.get('tickSize'))
         sl_str = format_price(sl, f.get('tickSize'))
 
-        # ensure price ordering using last price
         last_price = None
         try:
             tks = get_tickers_cached() or []
@@ -1133,7 +1120,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
             last_price = None
 
         if last_price:
-            # SELL must satisfy: tp > last_price > sp
             if tp <= last_price:
                 tp = _ceil_to_tick(last_price + (f.get('tickSize') or 0.0), f.get('tickSize'))
                 tp_str = format_price(tp, f.get('tickSize'))
@@ -1143,7 +1129,6 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
                 sl = _floor_to_tick(sp * 0.999, f.get('tickSize'))
                 sl_str = format_price(sl, f.get('tickSize'))
 
-        # Attempt main OCO creation with retries
         for attempt in range(1, retries + 1):
             try:
                 oco = client.create_oco_order(
@@ -1159,11 +1144,12 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
                     OPEN_ORDERS_CACHE['data'] = None
                 except Exception:
                     pass
-                notify(f"📌 OCO SELL placed (standard) TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty_str}")
+                notify(f"📌 OCO SELL placed TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty_str}")
+                time.sleep(1.0)
                 return {'tp': tp, 'sl': sp, 'method': 'oco', 'raw': oco}
             except BinanceAPIException as e:
                 err = str(e)
-                notify(f"⚠️ OCO SELL attempt {attempt} (standard) failed: {err}")
+                notify(f"⚠️ OCO SELL attempt {attempt} failed: {err}")
                 if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err:
                     if min_notional:
                         needed_qty = ceil_step(min_notional / float(tp), f.get('stepSize'))
@@ -1176,7 +1162,8 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
                 if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
                     notify("❗ Rate-limit detected while placing OCO — backing off and TEMP skipping symbol.")
                     TEMP_SKIP[symbol] = time.time() + max(60, RATE_LIMIT_BACKOFF or RATE_LIMIT_BASE_SLEEP)
-                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
+                    prev = RATE_LIMIT_BACKOFF if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP
+                    RATE_LIMIT_BACKOFF = min(prev * 2 if prev else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
                     return None
                 if attempt < retries:
                     time.sleep(delay)
@@ -1186,54 +1173,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
                 notify(f"⚠️ Unexpected error on OCO attempt: {e}")
                 time.sleep(0.2)
 
-        # Alternative param attempt (some client variants)
-        for attempt in range(1, retries + 1):
-            try:
-                oco2 = client.create_oco_order(
-                    symbol=symbol,
-                    side='SELL',
-                    quantity=qty_str,
-                    aboveType="LIMIT_MAKER",
-                    abovePrice=tp_str,
-                    belowType="STOP_LOSS_LIMIT",
-                    belowStopPrice=sp_str,
-                    belowPrice=sl_str,
-                    belowTimeInForce="GTC"
-                )
-                try:
-                    OPEN_ORDERS_CACHE['data'] = None
-                except Exception:
-                    pass
-                notify(f"📌 OCO SELL placed (alt params) ✅ TP={tp_str}, SL={sp_str}/{sl_str}, qty={qty_str}")
-                return {'tp': tp, 'sl': sp, 'method': 'oco_abovebelow', 'raw': oco2}
-            except BinanceAPIException as e:
-                err = str(e)
-                notify(f"⚠️ OCO SELL attempt {attempt} (alt) failed: {err}")
-                if 'NOTIONAL' in err or 'minNotional' in err or 'Filter failure' in err:
-                    if min_notional:
-                        needed_qty = ceil_step(min_notional / float(tp), f.get('stepSize'))
-                        if needed_qty <= free_qty + 1e-12 and needed_qty > qty:
-                            qty = needed_qty
-                            qty_str = format_qty(qty, f.get('stepSize'))
-                            notify(f"ℹ️ Adjusted qty to {qty_str} to attempt to satisfy minNotional for alt OCO.")
-                            time.sleep(0.25)
-                            continue
-                if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
-                    notify("❗ Rate-limit detected while placing OCO (alt) — backing off and TEMP skipping symbol.")
-                    TEMP_SKIP[symbol] = time.time() + max(60, RATE_LIMIT_BACKOFF or RATE_LIMIT_BASE_SLEEP)
-                    RATE_LIMIT_BACKOFF = min(RATE_LIMIT_BACKOFF * 2 if RATE_LIMIT_BACKOFF else RATE_LIMIT_BASE_SLEEP, RATE_LIMIT_BACKOFF_MAX)
-                    return None
-                if attempt < retries:
-                    time.sleep(delay)
-                else:
-                    time.sleep(0.2)
-            except Exception as e:
-                notify(f"⚠️ Unexpected error on OCO alt attempt: {e}")
-                time.sleep(0.2)
-
-        # Fallback to separate TP + SL
-        notify("⚠️ All OCO attempts failed — falling back to separate TP (limit) + SL (stop-limit) or MARKET.")
-
+        notify("⚠️ All OCO attempts failed — falling back to separate TP/SL or market.")
         tp_order = None
         sl_order = None
         try:
@@ -1267,11 +1207,10 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
         if (tp_order or sl_order):
             return {'tp': tp, 'sl': sp, 'method': 'fallback_separate', 'raw': {'tp': tp_order, 'sl': sl_order}}
 
-        # Final fallback: market sell
         try:
             fallback_market = place_market_sell_fallback(symbol, qty, f)
-            if fallback_market:
-                return {'tp': tp, 'sl': sp, 'method': 'market_fallback', 'raw': fallback_market}
+            if fallback_market and fallback_market[0]:
+                return {'tp': tp, 'sl': sp, 'method': 'market_fallback', 'raw': {'sold_qty': fallback_market[0], 'avg': fallback_market[1]}}
         except Exception:
             pass
 
@@ -1282,7 +1221,7 @@ def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
     except Exception as e:
         notify(f"⚠️ place_oco_sell unexpected error for {symbol}: {e}")
         return None
-       
+
 def monitor_and_move_stop_to_breakeven(symbol, entry_price, qty, f,
                                        trigger_pct=None, buffer_pct=None,
                                        monitor_seconds=None, poll_interval=None):
