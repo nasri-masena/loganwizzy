@@ -584,7 +584,7 @@ def pick_coin():
     global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
     try:
         now = time.time()
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.05)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
