@@ -24,7 +24,7 @@ QUOTE = "USDT"
 
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 2000_000
+MIN_VOLUME = 800_000
 
 RECENT_PCT_MIN = 0.8
 RECENT_PCT_MAX = 6.0
@@ -584,9 +584,9 @@ def pick_coin():
     global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
     try:
         now = time.time()
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 30)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.05)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.03)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD if 'SCORE_MIN_THRESHOLD' in globals() else 14.0)
