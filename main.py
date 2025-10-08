@@ -45,7 +45,7 @@ COOLDOWN_AFTER_EXIT = 10
 TRIGGER_PROXIMITY = 0.010
 STEP_INCREMENT_PCT = 0.01
 BASE_TP_PCT = 3.0
-BASE_SL_PCT = 2.0
+BASE_SL_PCT = 1.0
 
 NOTIFY_QUEUE_MAX = 1000
 NOTIFY_RETRY = 2
@@ -585,10 +585,10 @@ def pick_coin():
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 30)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.03)
-        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
+        KLINES_LIMIT = globals().get('KLINES_LIMIT', 4)
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD if 'SCORE_MIN_THRESHOLD' in globals() else 14.0)
         REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
