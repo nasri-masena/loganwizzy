@@ -83,7 +83,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BASE_SLEEP = 45
 RATE_LIMIT_BACKOFF_MAX = 240
-CACHE_TTL = 300
+CACHE_TTL = 400
 OPEN_ORDERS_TTL = 120
 
 REQUIRE_ORDERBOOK_BEFORE_BUY = True
@@ -133,7 +133,7 @@ def notify(msg: str, priority: bool = False, category: str = None):
     except Exception:
         pass
 
-    # send immediate if forced priority
+    # send immediate if forced priority (skip queue)
     if priority:
         try:
             Thread(target=_send_telegram, args=(text,), daemon=True).start()
@@ -148,13 +148,18 @@ def notify(msg: str, priority: bool = False, category: str = None):
             allow = True
         else:
             if isinstance(msg, str):
+                # keep existing allowed prefixes and add the new Position-closed variants
                 if msg.startswith("✅ BUY"):
                     allow = True
                 elif msg.startswith("✅ Position closed"):
                     allow = True
+                elif msg.startswith("✔️ Position closed"):
+                    allow = True
+                elif msg.startswith("⭕ Position closed"):
+                    allow = True
                 elif msg.startswith("📌 OCO"):
                     allow = True
-                elif msg.startswith("💸 Profit"):
+                elif msg.startswith("💸") or msg.startswith("💸 Profit"):
                     allow = True
                 elif msg.startswith("⚠️") or msg.startswith("❌"):
                     allow = True
@@ -162,9 +167,10 @@ def notify(msg: str, priority: bool = False, category: str = None):
         allow = False
 
     if not allow:
-        # suppressed for Telegram but printed locally
+        # suppressed for Telegram but printed locally (we already did print)
         return
-    # throttle non-priority slightly
+
+    # throttle non-priority slightly (keep the small delay guard)
     suppress = float(globals().get('NOTIFY_PRIORITY_SUPPRESS', 0.08))
     global _LAST_NOTIFY_NONPRIO
     try:
@@ -188,6 +194,23 @@ def notify(msg: str, priority: bool = False, category: str = None):
         except Exception:
             pass
 
+def notify_position_closed(symbol, exit_price, total_profit, micro_sold_qty=0, filled_qty=0):
+    try:
+        executed_sell = (micro_sold_qty and micro_sold_qty > 0) or (filled_qty and filled_qty > 0)
+        profit_val = float(total_profit or 0.0)
+        if executed_sell:
+            prefix = "✔️" if profit_val > 0 else "⭕"
+            sign = "+" if profit_val >= 0 else "-"
+            notify(f"{prefix} Position closed for {symbol}: exit={exit_price:.8f}, profit≈{sign}${abs(profit_val):.6f}")
+        else:
+            notify(f"⚠️ Position closed for {symbol} but no executed sell detected (filled_qty=0). profit≈${profit_val:.6f}")
+    except Exception as e:
+        try:
+            notify(f"⚠️ Position closed for {symbol}: exit={exit_price}, profit≈${total_profit} (notify helper error: {e})")
+        except Exception:
+            pass
+        
+        
 def format_price(value, tick_size):
     try:
         tick = Decimal(str(tick_size))
@@ -563,7 +586,7 @@ def pick_coin():
         now = time.time()
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.04)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.05)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD if 'SCORE_MIN_THRESHOLD' in globals() else 14.0)
@@ -1559,6 +1582,13 @@ def trade_cycle():
             except Exception:
                 pass
 
+            # If API banned, sleep a bit and continue (if you implemented API_BAN_UNTIL guard)
+            if globals().get('API_BAN_UNTIL') and time.time() < globals().get('API_BAN_UNTIL', 0):
+                remaining = int(globals().get('API_BAN_UNTIL') - time.time())
+                notify(f"⏸ API banned — sleeping {remaining}s before next checks.")
+                time.sleep(min(max(30, remaining), 600))
+                continue
+
             open_orders_global = get_open_orders_cached()
             if open_orders_global:
                 notify("⏸️ Waiting on open orders before next buy.")
@@ -1633,7 +1663,6 @@ def trade_cycle():
             if globals().get('NOTIFY_ON_BUY', True):
                 notify(f"✅ BUY {symbol}: qty={qty} ~price={entry_price:.8f} notional≈${qty*entry_price:.6f}")
 
-            # record pick metric
             try:
                 now_datekey = eat_datekey()
                 ent = METRICS.get(now_datekey) or {'picks': 0, 'wins': 0, 'losses': 0, 'profit': 0.0}
@@ -1644,7 +1673,6 @@ def trade_cycle():
 
             RECENT_BUYS[symbol] = {'ts': time.time(), 'price': entry_price, 'profit': None, 'cooldown': REBUY_COOLDOWN, 'qty': qty}
 
-            # safety: ensure filters present
             info = get_symbol_info_cached(symbol)
             f = get_filters(info) if info else {}
             if not f:
@@ -1657,15 +1685,16 @@ def trade_cycle():
                 time.sleep(CYCLE_DELAY)
                 continue
 
-            # 1) Place OCO protective orders immediately
+            # Protect and optionally partial TP
             try:
-                oco_res = place_oco_sell(symbol, qty, entry_price, tp_pct=globals().get('BASE_TP_PCT', BASE_TP_PCT), sl_pct=globals().get('BASE_SL_PCT', BASE_SL_PCT))
+                oco_res = place_oco_sell(symbol, qty, entry_price,
+                                         tp_pct=globals().get('BASE_TP_PCT', BASE_TP_PCT),
+                                         sl_pct=globals().get('BASE_SL_PCT', BASE_SL_PCT))
                 if oco_res is None:
                     notify(f"⚠️ place_oco_sell did not place protective orders for {symbol}.")
             except Exception as e:
                 notify(f"⚠️ place_oco_sell immediate protection failed for {symbol}: {e}")
 
-            # 2) Optional partial TP (limit) to lock small profit
             try:
                 if globals().get('PARTIAL_TP_ENABLED', True) and float(globals().get('PARTIAL_TP_FRACTION', 0.0)) > 0:
                     part = float(globals().get('PARTIAL_TP_FRACTION', 0.2))
@@ -1681,22 +1710,118 @@ def trade_cycle():
             except Exception:
                 pass
 
-            # 3) Spawn monitor thread to move SL to breakeven when conditions met (single-pass)
+            # Spawn breakeven mover (best-effort)
             try:
                 Thread(target=monitor_and_move_stop_to_breakeven, args=(symbol, entry_price, qty, f), daemon=True).start()
             except Exception:
                 pass
 
-            # update LAST_BUY_TS lock so buys respect lock interval
+            # mark active symbol to avoid concurrent buys
+            ACTIVE_SYMBOL = symbol
             LAST_BUY_TS = time.time()
 
-            # clear open orders hint
+            # monitor until position is closed (TP/SL) or timeout
             try:
-                with OPEN_ORDERS_LOCK:
-                    OPEN_ORDERS_CACHE['data'] = None
-                    OPEN_ORDERS_CACHE['ts'] = 0
-            except Exception:
-                pass
+                monitor_deadline = time.time() + max(int(globals().get('OCO_MAX_LIFE_SECONDS', OCO_MAX_LIFE_SECONDS)), 60*10)
+                sold_detected = False
+                exit_price = None
+                sold_qty = 0.0
+                step = float(f.get('stepSize') or 0.0)
+                min_qty = float(f.get('minQty') or 0.0)
+                asset = symbol[:-len(QUOTE)]
+
+                while time.time() < monitor_deadline:
+                    # respect API ban if present
+                    if globals().get('API_BAN_UNTIL') and time.time() < globals().get('API_BAN_UNTIL', 0):
+                        time.sleep(min(30, max(5, globals().get('API_BAN_UNTIL') - time.time())))
+                        continue
+
+                    # get open orders for this symbol; if still present, position not fully closed
+                    try:
+                        open_orders = get_open_orders_cached(symbol) or []
+                    except Exception:
+                        open_orders = []
+
+                    # check current free asset
+                    try:
+                        free_after = get_free_asset(asset)
+                    except Exception:
+                        free_after = None
+
+                    # If free_after is small (near zero) or less than minQty => likely sold
+                    if free_after is not None:
+                        free_after_clip = round_step(max(0.0, free_after), step) if step else free_after
+                        # sold_qty approximated as initial qty - current free balance
+                        approx_sold = max(0.0, (qty - free_after_clip))
+                        # if approx_sold sufficiently large (>= min_qty or close to qty), consider sold
+                        if approx_sold >= max(min_qty, qty * 0.999) or (approx_sold >= min_qty and not open_orders):
+                            sold_detected = True
+                            sold_qty = round_step(approx_sold, step) if step else approx_sold
+                            # get a recent price to approximate exit price
+                            exit_price = get_price_cached(symbol) or exit_price or entry_price
+                            break
+
+                    # Another indicator: no open orders and price moved significantly (conservative)
+                    if not open_orders:
+                        # maybe orders executed; attempt to infer using last price and assume full sell
+                        lp = get_price_cached(symbol)
+                        if lp:
+                            # if price currently well above entry and TP likely triggered, or well below for SL
+                            # we will check balances again next cycle; here wait a bit then re-loop
+                            pass
+
+                    time.sleep(max(2.0, globals().get('BREAKEVEN_POLL_INTERVAL', 3)))
+                # end monitor loop
+
+                # If sold_detected -> compute profit and notify + metrics updates
+                total_profit = 0.0
+                filled_qty = 0.0
+                try:
+                    if sold_detected and sold_qty and exit_price:
+                        filled_qty = sold_qty
+                        total_profit = (float(exit_price) - float(entry_price)) * float(filled_qty)
+                        # Update RECENT_BUYS
+                        try:
+                            ent = RECENT_BUYS.get(symbol, {})
+                            ent['ts'] = time.time()
+                            ent['price'] = entry_price
+                            ent['profit'] = total_profit
+                            ent['cooldown'] = LOSS_COOLDOWN if total_profit < 0 else REBUY_COOLDOWN
+                            RECENT_BUYS[symbol] = ent
+                        except Exception:
+                            pass
+
+                        # update metrics and send notify using the unified notifier
+                        try:
+                            was_win = (total_profit > 0)
+                            date_key, m = _update_metrics_for_profit(total_profit, picked_symbol=symbol, was_win=was_win)
+                            if globals().get('NOTIFY_ON_CLOSE', True):
+                                notify_position_closed(symbol, exit_price, total_profit, micro_sold_qty=0, filled_qty=filled_qty)
+                        except Exception as e:
+                            notify(f"⚠️ Error updating metrics after position closed for {symbol}: {e}")
+
+                        # attempt to send profit to funding (best-effort)
+                        try:
+                            if total_profit and total_profit > 0:
+                                send_profit_to_funding(max(0.0, float(total_profit)))
+                        except Exception:
+                            pass
+
+                    else:
+                        # didn't detect a sell within monitor window
+                        notify(f"⚠️ Monitoring timeout for {symbol}: no sell detected within monitoring window. Leaving OCO/orders as-is.")
+                except Exception as e:
+                    notify(f"⚠️ Error while finalizing position monitoring for {symbol}: {e}")
+
+            finally:
+                # cleanup: mark inactive, invalidate open orders cache
+                ACTIVE_SYMBOL = None
+                try:
+                    with OPEN_ORDERS_LOCK:
+                        OPEN_ORDERS_CACHE['data'] = None
+                        OPEN_ORDERS_CACHE['ts'] = 0
+                except Exception:
+                    pass
 
             RATE_LIMIT_BACKOFF = 0
 
@@ -1713,7 +1838,7 @@ def trade_cycle():
                 notify(f"❌ Trade cycle unexpected error: {e}")
             time.sleep(CYCLE_DELAY)
         time.sleep(CYCLE_DELAY)
-        
+
 # -------------------------
 # FLASK KEEPALIVE
 # -------------------------
