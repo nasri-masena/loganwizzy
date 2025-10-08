@@ -1088,7 +1088,7 @@ def place_partial_tp(symbol, qty, entry_price, f):
 # -------------------------
 # place_oco_sell (updated: use globals defaults, try alt-first, minNotional handling)
 # -------------------------
-def place_oco_sell(symbol, qty, buy_price, tp_pct=None, sl_pct=None,
+def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.9,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
     global RATE_LIMIT_BACKOFF
