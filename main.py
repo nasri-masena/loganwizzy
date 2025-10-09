@@ -37,7 +37,7 @@ MOVEMENT_MIN_PCT = 1.5
 EMA_UPLIFT_MIN_PCT = 0.0008
 SCORE_MIN_THRESHOLD = 13.0
 
-TRADE_USD = 10.0
+TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 8
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
@@ -594,23 +594,12 @@ def pick_coin():
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 30)
-        DEEP_EVAL = globals().get('DEEP_EVAL', 5)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.005)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
+        DEEP_EVAL = globals().get('DEEP_EVAL', 3)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.1)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', 0.0012)
-        SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', 12.0)
         REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
         PREBUY_BREAKOUT_MARGIN = globals().get('PREBUY_BREAKOUT_MARGIN', 0.008)
-
-        PRICE_MIN = globals().get('PRICE_MIN', 0.8)
-        PRICE_MAX = globals().get('PRICE_MAX', 3.0)
-        MIN_VOLUME = globals().get('MIN_VOLUME', 800_000)
-        MAX_24H_CHANGE_ABS = globals().get('MAX_24H_CHANGE_ABS', 9.0)
-        MAX_24H_RISE_PCT = globals().get('MAX_24H_RISE_PCT', 7.0)
-        REBUY_MAX_RISE_PCT = globals().get('REBUY_MAX_RISE_PCT', 9.0)
-        REBUY_COOLDOWN = globals().get('REBUY_COOLDOWN', 60 * 60)
-
         ORDERBOOK_DEPTH_FOR_CONFIRM = globals().get('ORDERBOOK_DEPTH_FOR_CONFIRM', 5)
         ORDERBOOK_MIN_IMBALANCE = globals().get('ORDERBOOK_MIN_IMBALANCE', 1.13)
 
