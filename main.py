@@ -29,8 +29,8 @@ MIN_VOLUME = 500_000
 RECENT_PCT_MIN = 0.6
 RECENT_PCT_MAX = 4.0
 
-MAX_24H_RISE_PCT = 7.0
-MAX_24H_CHANGE_ABS = 6.0
+MAX_24H_RISE_PCT = 4.0
+MAX_24H_CHANGE_ABS = 5.0
 
 MOVEMENT_MIN_PCT = 1.0
 
@@ -586,7 +586,7 @@ def pick_coin():
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 30))
+        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 50))
         DEEP_EVAL = int(globals().get('DEEP_EVAL', 3))
         REQUEST_SLEEP = float(globals().get('REQUEST_SLEEP', 0.4))
         KLINES_LIMIT = int(globals().get('KLINES_LIMIT', 4))
