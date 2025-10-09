@@ -26,7 +26,7 @@ QUOTE = "USDT"
 # price / liquidity filters
 PRICE_MIN = 0.8
 PRICE_MAX = 3.0
-MIN_VOLUME = 300_000          # daily quote volume baseline
+MIN_VOLUME = 200_000          # daily quote volume baseline
 
 # require small recent move (we prefer coins that just started moving)
 RECENT_PCT_MIN = 0.6
@@ -39,13 +39,13 @@ MAX_24H_CHANGE_ABS = 5.0        # require abs(24h change) <= 5.0
 MOVEMENT_MIN_PCT = 1.0
 
 # picker tuning
-EMA_UPLIFT_MIN_PCT = 0.001        # fractional uplift threshold (0.001 = 0.1%)
-SCORE_MIN_THRESHOLD = 15.0        # floor score required to accept a candidate
+EMA_UPLIFT_MIN_PCT = 0.0015
+SCORE_MIN_THRESHOLD = 11.5       # floor score required to accept a candidate
 
 # runtime / pacing
 TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 8
-CYCLE_DELAY = 15
+CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
 
 # order / protection
@@ -114,7 +114,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
 RATE_LIMIT_BASE_SLEEP = 80
-CACHE_TTL = 250
+CACHE_TTL = 300
 
 # -------------------------
 # HELPERS: formatting & rounding
@@ -616,13 +616,13 @@ def pick_coin():
         now = t0
 
         # localizable tuning (can be overridden via globals())
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 30)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.05)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.25)
 
-        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', globals().get('EMA_UPLIFT_MIN_PCT', 0.0008))
+        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', globals().get('EMA_UPLIFT_MIN_PCT', 0.0001))
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', globals().get('SCORE_MIN_THRESHOLD', 13.0))
 
         REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
