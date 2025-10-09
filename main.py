@@ -578,30 +578,26 @@ def orderbook_bullish(symbol, depth=3, min_imbalance=1.02, max_spread_pct=1.0):
 def pick_coin():
     global RATE_LIMIT_BACKOFF, TEMP_SKIP, RECENT_BUYS
 
-    # ---- Blacklist for fan tokens ----
     BLACKLISTED_TOKENS = [
-        "ASRUSDT",    # AS Roma Fan Token
-        "ATMUSDT",    # Atlético de Madrid Fan Token
-        "PSGUSDT",    # Paris Saint-Germain Fan Token
-        "JUVUSDT",    # Juventus Fan Token
-        "BARUSDT",    # Barcelona Fan Token
-        "CITYUSDT"    # Manchester City Fan Token
+        "ASRUSDT", "ATMUSDT", "PSGUSDT", "JUVUSDT", "BARUSDT", "CITYUSDT"
     ]
-    BLACKLISTED_KEYWORDS = [
-        "ASR", "ATM", "PSG", "JUV", "BAR", "CITY"
-    ]
+    BLACKLISTED_KEYWORDS = ["ASR", "ATM", "PSG", "JUV", "BAR", "CITY"]
 
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
-        DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.1)
-        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
-        REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
-        PREBUY_BREAKOUT_MARGIN = globals().get('PREBUY_BREAKOUT_MARGIN', 0.008)
-        ORDERBOOK_DEPTH_FOR_CONFIRM = globals().get('ORDERBOOK_DEPTH_FOR_CONFIRM', 5)
-        ORDERBOOK_MIN_IMBALANCE = globals().get('ORDERBOOK_MIN_IMBALANCE', 1.13)
+        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 80))
+        DEEP_EVAL = int(globals().get('DEEP_EVAL', 3))
+        REQUEST_SLEEP = float(globals().get('REQUEST_SLEEP', 0.2))
+        KLINES_LIMIT = int(globals().get('KLINES_LIMIT', 8))
+        REQUIRE_OB_IN_PICK = bool(globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True))
+        PREBUY_BREAKOUT_MARGIN = float(globals().get('PREBUY_BREAKOUT_MARGIN', 0.008))
+        ORDERBOOK_DEPTH_FOR_CONFIRM = int(globals().get('ORDERBOOK_DEPTH_FOR_CONFIRM', 5))
+        ORDERBOOK_MIN_IMBALANCE = float(globals().get('ORDERBOOK_MIN_IMBALANCE', 1.13))
+
+        # thresholds from config (avoid NameError)
+        EMA_MIN = float(globals().get('EMA_UPLIFT_MIN_PCT', globals().get('EMA_UPLIFT_MIN', 0.0008)))
+        SCORE_MIN = float(globals().get('SCORE_MIN_THRESHOLD', 13.0))
 
         tickers = get_tickers_cached() or []
         prefiltered = []
@@ -609,7 +605,6 @@ def pick_coin():
             sym = t.get('symbol')
             if not sym or not sym.endswith(QUOTE):
                 continue
-            # ---- Blacklist check ----
             if sym in BLACKLISTED_TOKENS or any(bad in sym for bad in BLACKLISTED_KEYWORDS):
                 continue
             skip_until = TEMP_SKIP.get(sym)
@@ -621,21 +616,21 @@ def pick_coin():
                 change_pct = float(t.get('priceChangePercent') or 0.0)
             except Exception:
                 continue
-            if not (PRICE_MIN <= price <= PRICE_MAX):
+            if not (float(globals().get('PRICE_MIN', PRICE_MIN)) <= price <= float(globals().get('PRICE_MAX', PRICE_MAX))):
                 continue
-            if qvol < MIN_VOLUME:
+            if qvol < float(globals().get('MIN_VOLUME', MIN_VOLUME)):
                 continue
-            if abs(change_pct) > MAX_24H_CHANGE_ABS:
+            if abs(change_pct) > float(globals().get('MAX_24H_CHANGE_ABS', MAX_24H_CHANGE_ABS)):
                 continue
-            if change_pct > MAX_24H_RISE_PCT:
+            if change_pct > float(globals().get('MAX_24H_RISE_PCT', MAX_24H_RISE_PCT)):
                 continue
             last_buy = RECENT_BUYS.get(sym)
             if last_buy:
-                cd = last_buy.get('cooldown', REBUY_COOLDOWN)
+                cd = last_buy.get('cooldown', globals().get('REBUY_COOLDOWN', REBUY_COOLDOWN))
                 if now < last_buy['ts'] + cd:
                     continue
                 last_price = last_buy.get('price')
-                if last_price and price > last_price * (1 + REBUY_MAX_RISE_PCT / 100.0):
+                if last_price and price > last_price * (1 + float(globals().get('REBUY_MAX_RISE_PCT', REBUY_MAX_RISE_PCT)) / 100.0):
                     continue
             prefiltered.append((sym, price, qvol, change_pct))
 
@@ -644,12 +639,10 @@ def pick_coin():
 
         prefiltered.sort(key=lambda x: x[2], reverse=True)
         top_pool = prefiltered[:TOP_CANDIDATES]
-        if len(top_pool) > DEEP_EVAL:
-            sampled = random.sample(top_pool, DEEP_EVAL)
-        else:
-            sampled = list(top_pool)
+        sampled = random.sample(top_pool, min(len(top_pool), DEEP_EVAL)) if len(top_pool) > DEEP_EVAL else list(top_pool)
 
         candidates = []
+
         def ema_local(values, period):
             if not values or period <= 0:
                 return None
@@ -658,6 +651,7 @@ def pick_coin():
             for v in values[1:]:
                 e = alpha * float(v) + (1 - alpha) * e
             return e
+
         def compute_rsi_local(closes, period=14):
             if not closes or len(closes) < period + 1:
                 return None
@@ -667,6 +661,7 @@ def pick_coin():
                 diff = closes[i] - closes[i-1]
                 gains.append(max(0.0, diff))
                 losses.append(max(0.0, -diff))
+            # initial averages
             avg_gain = sum(gains[:period]) / period
             avg_loss = sum(losses[:period]) / period if sum(losses[:period]) != 0 else 1e-9
             for i in range(period, len(gains)):
@@ -678,26 +673,39 @@ def pick_coin():
         for sym, last_price, qvol, change_pct in sampled:
             try:
                 time.sleep(REQUEST_SLEEP)
-                c = get_client()
-                if not c:
+                if not get_client():
                     continue
-                klines = c.get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
+
+                # try cached klines first
+                klines = get_klines_cached(sym, interval="5m", limit=KLINES_LIMIT)
+                if not klines:
+                    # fallback to direct client call
+                    klines = get_client().get_klines(symbol=sym, interval='5m', limit=KLINES_LIMIT)
+
                 if not klines or len(klines) < 4:
                     continue
+
                 closes = [float(k[4]) for k in klines]
-                vols = [float(k[7]) if len(k) > 7 and k[7] is not None else float(k[5]) * float(k[4]) for k in klines]
-                recent_vol = vols[-1]
-                prev_avg = (sum(vols[:-1]) / max(1, len(vols[:-1]))) if len(vols) > 1 else recent_vol
+                vols = []
+                for k in klines:
+                    # some kline formats differ; try to be robust
+                    try:
+                        vols.append(float(k[7]) if len(k) > 7 and k[7] is not None else float(k[5]) * float(k[4]))
+                    except Exception:
+                        vols.append(0.0)
+                recent_vol = vols[-1] if vols else 0.0
+                prev_avg = (sum(vols[:-1]) / max(1, len(vols[:-1]))) if len(vols) > 1 else max(1.0, recent_vol)
                 vol_ratio = recent_vol / (prev_avg + 1e-12)
+
                 recent_pct = 0.0
                 if len(closes) >= 4 and closes[-4] > 0:
                     recent_pct = (closes[-1] - closes[-4]) / (closes[-4] + 1e-12) * 100.0
 
-                # -- Only pick coins with strong upward momentum --
+                # momentum checks
                 if len(closes) >= 4 and closes[-1] <= max(closes[:-1]):
-                    continue  # not breaking out
+                    continue
                 if vol_ratio < 1.2:
-                    continue  # skip low volume surge
+                    continue
                 last3 = closes[-3:]
                 ups = 0
                 if len(last3) >= 2 and last3[1] > last3[0]:
@@ -706,28 +714,32 @@ def pick_coin():
                     ups += 1
                 if ups < 1:
                     continue
+
                 short_period = 3
                 long_period = 10
                 short_ema = ema_local(closes[-short_period:], short_period) if len(closes) >= short_period else None
                 long_ema = ema_local(closes[-long_period:], long_period) if len(closes) >= long_period else ema_local(closes, max(len(closes), 1))
                 if short_ema is None or long_ema is None:
                     continue
+
                 ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-                if ema_uplift < EMA_UPLIFT_MIN:
+                if ema_uplift < EMA_MIN:
                     continue
                 if not (short_ema > long_ema * 1.001):
                     continue
+
                 rsi_val = compute_rsi_local(closes, period=14)
                 if rsi_val is not None and (rsi_val > 68 or rsi_val < 20):
                     continue
+
                 if REQUIRE_OB_IN_PICK:
                     try:
                         if not orderbook_bullish(sym, depth=ORDERBOOK_DEPTH_FOR_CONFIRM, min_imbalance=ORDERBOOK_MIN_IMBALANCE, max_spread_pct=0.6):
                             continue
                     except Exception:
                         continue
+
                 score = 0.0
-                # -- Aggressive weights for upward momentum --
                 score += max(0.0, recent_pct) * 18.0
                 try:
                     score += math.log1p(qvol) * 0.5
@@ -738,9 +750,10 @@ def pick_coin():
                 if rsi_val is not None:
                     score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
                 score += max(0.0, change_pct) * 0.6
-                # You may add more scoring features here if desired
+
                 if score < SCORE_MIN:
                     continue
+
                 candidates.append({
                     'symbol': sym,
                     'price': last_price,
