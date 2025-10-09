@@ -45,7 +45,7 @@ SCORE_MIN_THRESHOLD = 15.0        # floor score required to accept a candidate
 # runtime / pacing
 TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 8
-CYCLE_DELAY = 8
+CYCLE_DELAY = 15
 COOLDOWN_AFTER_EXIT = 10
 
 # order / protection
@@ -113,7 +113,7 @@ REBUY_MAX_RISE_PCT = 5.0
 # rate-limit/backoff
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
-RATE_LIMIT_BASE_SLEEP = 90
+RATE_LIMIT_BASE_SLEEP = 80
 CACHE_TTL = 250
 
 # -------------------------
@@ -616,13 +616,13 @@ def pick_coin():
         now = t0
 
         # localizable tuning (can be overridden via globals())
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 50)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 60)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
-        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.03)
-        KLINES_LIMIT = globals().get('KLINES_LIMIT', 4)
+        REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
+        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         MIN_VOL_RATIO = globals().get('MIN_VOL_RATIO', 1.25)
 
-        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', globals().get('EMA_UPLIFT_MIN_PCT', 0.0001))
+        EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', globals().get('EMA_UPLIFT_MIN_PCT', 0.0008))
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', globals().get('SCORE_MIN_THRESHOLD', 13.0))
 
         REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
