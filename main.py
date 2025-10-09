@@ -312,6 +312,26 @@ def get_filters(symbol_info):
         'tickSize': float(pricef['tickSize']) if pricef else 0.0,
         'minNotional': float(min_notional) if min_notional else None
     }
+    
+KLINES_CACHE = {}
+KLINES_CACHE_TS = {}
+KLINES_CACHE_TTL = int(globals().get('KLINES_CACHE_TTL', 60))  # seconds
+
+def get_klines_cached(symbol, interval="5m", limit=6):
+    now = time.time()
+    key = f"{symbol}:{interval}:{limit}"
+    ts = KLINES_CACHE_TS.get(key, 0)
+    if KLINES_CACHE.get(key) is not None and (now - ts) < KLINES_CACHE_TTL:
+        return KLINES_CACHE[key]
+    try:
+        res = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        KLINES_CACHE[key] = res
+        KLINES_CACHE_TS[key] = now
+        return res
+    except Exception as e:
+        notify(f"⚠️ get_klines_cached failed for {symbol}: {e}")
+        return KLINES_CACHE.get(key)
+        
 # --- Compatibility wrapper so trade_cycle can keep using get_trade_candidates() ---
 def get_trade_candidates():
     """
