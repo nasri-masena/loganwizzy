@@ -83,8 +83,8 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 1
 RATE_LIMIT_BASE_SLEEP = 30
 RATE_LIMIT_BACKOFF_MAX = 180
-CACHE_TTL = 80
-OPEN_ORDERS_TTL = 40
+CACHE_TTL = 60
+OPEN_ORDERS_TTL = 30
 
 REQUIRE_ORDERBOOK_BEFORE_BUY = True
 ORDERBOOK_DEPTH_FOR_CONFIRM = 5
@@ -586,10 +586,10 @@ def pick_coin():
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 30))
+        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 35))
         DEEP_EVAL = int(globals().get('DEEP_EVAL', 3))
         REQUEST_SLEEP = float(globals().get('REQUEST_SLEEP', 0.6))
-        KLINES_LIMIT = int(globals().get('KLINES_LIMIT', 5))
+        KLINES_LIMIT = int(globals().get('KLINES_LIMIT', 4))
         REQUIRE_OB_IN_PICK = bool(globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True))
         PREBUY_BREAKOUT_MARGIN = float(globals().get('PREBUY_BREAKOUT_MARGIN', 0.005))
         ORDERBOOK_DEPTH_FOR_CONFIRM = int(globals().get('ORDERBOOK_DEPTH_FOR_CONFIRM', 5))
