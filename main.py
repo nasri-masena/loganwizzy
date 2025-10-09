@@ -32,14 +32,14 @@ RECENT_PCT_MAX = 4.0
 MAX_24H_RISE_PCT = 4.0
 MAX_24H_CHANGE_ABS = 5.0
 
-MOVEMENT_MIN_PCT = 1.5
+MOVEMENT_MIN_PCT = 1.0
 
-EMA_UPLIFT_MIN_PCT = 0.0008
-SCORE_MIN_THRESHOLD = 13.0
+EMA_UPLIFT_MIN_PCT = 0.0012
+SCORE_MIN_THRESHOLD = 12.0
 
 TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 8
-CYCLE_DELAY = 8
+CYCLE_DELAY = 10
 COOLDOWN_AFTER_EXIT = 10
 
 TRIGGER_PROXIMITY = 0.010
@@ -586,7 +586,7 @@ def pick_coin():
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 50))
+        TOP_CANDIDATES = int(globals().get('TOP_CANDIDATES', 30))
         DEEP_EVAL = int(globals().get('DEEP_EVAL', 3))
         REQUEST_SLEEP = float(globals().get('REQUEST_SLEEP', 0.2))
         KLINES_LIMIT = int(globals().get('KLINES_LIMIT', 6))
