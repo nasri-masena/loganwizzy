@@ -24,7 +24,7 @@ QUOTE = "USDT"
 
 PRICE_MIN = 0.5
 PRICE_MAX = 4.0
-MIN_VOLUME = 1_200_000
+MIN_VOLUME = 3_000_000
 
 RECENT_PCT_MIN = 1.0
 RECENT_PCT_MAX = 6.0
@@ -37,7 +37,7 @@ MOVEMENT_MIN_PCT = 1.5
 EMA_UPLIFT_MIN_PCT = 0.002
 SCORE_MIN_THRESHOLD = 16.0
 
-TRADE_USD = 10.0
+TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 5
 CYCLE_DELAY = 8
 COOLDOWN_AFTER_EXIT = 10
@@ -977,7 +977,7 @@ def place_market_sell_fallback(symbol, qty, f):
 # -------------------------
 # OCO SELL with robust fallbacks & minNotional & qty adjustment
 # -------------------------
-def place_oco_sell(symbol, qty, buy_price, tp_pct=2.3, sl_pct=0.8,
+def place_oco_sell(symbol, qty, buy_price, tp_pct=2.4, sl_pct=0.8,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
     global RATE_LIMIT_BACKOFF
