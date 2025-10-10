@@ -39,7 +39,7 @@ SCORE_MIN_THRESHOLD = 13.0
 
 TRADE_USD = 8.0
 SLEEP_BETWEEN_CHECKS = 5
-CYCLE_DELAY = 8
+CYCLE_DELAY = 30
 COOLDOWN_AFTER_EXIT = 10
 
 TRIGGER_PROXIMITY = 0.010
@@ -553,7 +553,7 @@ def pick_coin():
     try:
         t0 = time.time()
         now = t0
-        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 30)
+        TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 80)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.02)
         KLINES_LIMIT = globals().get('KLINES_LIMIT', 12)
