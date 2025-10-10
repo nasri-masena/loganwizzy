@@ -24,7 +24,7 @@ QUOTE = "USDT"
 
 PRICE_MIN = 0.8
 PRICE_MAX = 5.0
-MIN_VOLUME = 3_000_000
+MIN_VOLUME = 2_000_000
 
 RECENT_PCT_MIN = 1.0
 RECENT_PCT_MAX = 6.0
@@ -83,7 +83,7 @@ REBUY_MAX_RISE_PCT = 5.0
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 120
 RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 300
+CACHE_TTL = 250
 
 _NOTIFY_Q = queue.Queue(maxsize=globals().get('NOTIFY_QUEUE_MAX', 1000))
 _NOTIFY_THREAD_STARTED = False
@@ -135,8 +135,6 @@ def notify(msg: str, priority: bool = False, category: str = None):
                 if msg.startswith("✅ BUY"):
                     allow = True
                 elif msg.startswith("✅ Position closed"):
-                    allow = True
-                elif msg.startswith("🔁 Moved"):
                     allow = True
                 elif msg.startswith("📌 OCO "):
                     allow = True
@@ -977,7 +975,7 @@ def place_market_sell_fallback(symbol, qty, f):
 # -------------------------
 # OCO SELL with robust fallbacks & minNotional & qty adjustment
 # -------------------------
-def place_oco_sell(symbol, qty, buy_price, tp_pct=2.3, sl_pct=0.8,
+def place_oco_sell(symbol, qty, buy_price, tp_pct=2.5, sl_pct=0.8,
                    explicit_tp: float = None, explicit_sl: float = None,
                    retries=3, delay=1):
     global RATE_LIMIT_BACKOFF
