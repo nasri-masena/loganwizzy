@@ -23,10 +23,10 @@ CHAT_ID = os.getenv("CHAT_ID")
 QUOTE = "USDT"
 
 PRICE_MIN = 0.8
-PRICE_MAX = 3.0
-MIN_VOLUME = 800_000
+PRICE_MAX = 4.0
+MIN_VOLUME = 3_500_000
 
-RECENT_PCT_MIN = 0.6
+RECENT_PCT_MIN = 1.0
 RECENT_PCT_MAX = 4.0
 
 MAX_24H_RISE_PCT = 4.0
@@ -34,7 +34,7 @@ MAX_24H_CHANGE_ABS = 5.0
 
 MOVEMENT_MIN_PCT = 1.5
 
-EMA_UPLIFT_MIN_PCT = 0.002
+EMA_UPLIFT_MIN_PCT = 0.005
 SCORE_MIN_THRESHOLD = 13.0
 
 TRADE_USD = 8.0
@@ -556,11 +556,11 @@ def pick_coin():
         TOP_CANDIDATES = globals().get('TOP_CANDIDATES', 30)
         DEEP_EVAL = globals().get('DEEP_EVAL', 3)
         REQUEST_SLEEP = globals().get('REQUEST_SLEEP', 0.03)
-        KLINES_LIMIT = globals().get('KLINES_LIMIT', 8)
+        KLINES_LIMIT = globals().get('KLINES_LIMIT', 6)
         EMA_UPLIFT_MIN = globals().get('EMA_UPLIFT_MIN_PCT', EMA_UPLIFT_MIN_PCT if 'EMA_UPLIFT_MIN_PCT' in globals() else 0.001)
         SCORE_MIN = globals().get('SCORE_MIN_THRESHOLD', SCORE_MIN_THRESHOLD if 'SCORE_MIN_THRESHOLD' in globals() else 14.0)
         REQUIRE_OB_IN_PICK = globals().get('REQUIRE_ORDERBOOK_BEFORE_BUY', True)
-        PREBUY_BREAKOUT_MARGIN = globals().get('PREBUY_BREAKOUT_MARGIN', 0.0015)
+        PREBUY_BREAKOUT_MARGIN = globals().get('PREBUY_BREAKOUT_MARGIN', 0.008)
 
         tickers = get_tickers_cached() or []
         prefiltered = []
