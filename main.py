@@ -99,8 +99,8 @@ REBUY_MAX_RISE_PCT = 5.0
 
 RATE_LIMIT_BACKOFF = 0
 RATE_LIMIT_BACKOFF_MAX = 300
-RATE_LIMIT_BASE_SLEEP = 90
-CACHE_TTL = 400
+RATE_LIMIT_BASE_SLEEP = 60
+CACHE_TTL = 180
 
 # notify subsystem (replace existing notify/_send/_start thread block)
 _NOTIFY_Q = queue.Queue(maxsize=globals().get('NOTIFY_QUEUE_MAX', 1000))
