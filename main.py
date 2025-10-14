@@ -78,7 +78,7 @@ SKIP_SECONDS_ON_MARKET_CLOSED = 60 * 60
 
 getcontext().prec = 28
 
-OCO_MAX_LIFE_SECONDS = int(float(os.environ.get('OCO_MAX_LIFE_SECONDS', 6 * 3600)))
+OCO_MAX_LIFE_SECONDS = int(float(os.environ.get('OCO_MAX_LIFE_SECONDS', 3 * 3600)))
 
 METRICS = {}
 METRICS_LOCK = Lock()
@@ -1223,7 +1223,7 @@ def monitor_and_roll(symbol, qty, entry_price, f):
                             notify(f"ℹ️ Increasing sell_qty to {needed_qty} to meet minNotional for roll.")
                             sell_qty = needed_qty
                         else:
-                            notify(f"⚠️ Roll aborted: cannot meet minNotional for {symbol} even after TP bumps.")
+                            notify(f"Roll aborted: cannot meet minNotional for {symbol} even after TP bumps.")
                             last_roll_ts = now_ts
                             continue
 
