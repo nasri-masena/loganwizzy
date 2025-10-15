@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,9 +15,9 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
-PRICE_MIN = 1.0
-PRICE_MAX = 4.0
-MIN_VOLUME = 1_000_000
+PRICE_MIN = 8.0
+PRICE_MAX = 5.0
+MIN_VOLUME = 800_000
 TOP_BY_24H_VOLUME = 6
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "4"))
 KLINES_5M_LIMIT = 6
@@ -34,6 +35,10 @@ MAX_WORKERS = 8
 RECENT_BUYS = {}
 BUY_LOCK_SECONDS = 600
 REQUEST_TIMEOUT = 6
+POOL_SIZE = 50
+SAMPLE_SIZE = 12
+SIGNAL_COOLDOWN = 1800
+RECENT_SIGNALS = {}
 
 # -------------------------
 # Telegram helper
@@ -53,7 +58,7 @@ def send_telegram(message):
         return False
 
 # -------------------------
-# Utilities / indicators
+# Utilities
 # -------------------------
 def pct_change(open_p, close_p):
     try:
@@ -129,7 +134,7 @@ def orderbook_bullish(ob, depth=3, min_imbalance=1.2, max_spread_pct=1.0):
         return False
 
 # -------------------------
-# Cache for public calls
+# Cache
 # -------------------------
 _cache = {}
 _cache_lock = threading.Lock()
@@ -148,7 +153,7 @@ def cache_set(key, val):
         _cache[key] = (time.time(), val)
 
 # -------------------------
-# Binance public endpoints
+# Binance public
 # -------------------------
 def fetch_tickers():
     key = "tickers"
@@ -196,7 +201,7 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
         return {}
 
 # -------------------------
-# Evaluation per symbol
+# Evaluation
 # -------------------------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
@@ -265,18 +270,30 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
 # Strength label helper
 # -------------------------
 def strength_label(score, strong_candidate):
+    # Priority: if strict strong_candidate then strong
     if strong_candidate:
         return "✔️", "strong"
+    # medium if score high enough
     if score >= 15.0:
-        return "🔘", "medium"
+        return "➖", "medium"
+    # otherwise weak
     return "⭕", "weak"
 
+def _cleanup_recent_signals():
+    now = time.time()
+    to_del = [s for s,ts in RECENT_SIGNALS.items() if now - ts > SIGNAL_COOLDOWN]
+    for s in to_del:
+        RECENT_SIGNALS.pop(s, None)
+
 # -------------------------
-# Picker (sends only medium/strong)
+# Picker
 # -------------------------
 def pick_coin():
+    global RECENT_SIGNALS, RECENT_BUYS
     tickers = fetch_tickers()
     now = time.time()
+    _cleanup_recent_signals()
+
     pre = []
     for t in tickers:
         sym = t.get("symbol")
@@ -294,31 +311,66 @@ def pick_coin():
             continue
         if ch < 0.5 or ch > 20.0:
             continue
-        last_buy = RECENT_BUYS.get(sym)
-        if last_buy and now < last_buy['ts'] + BUY_LOCK_SECONDS:
+        if RECENT_SIGNALS.get(sym):
             continue
         pre.append((sym, last, qvol, ch))
+
     if not pre:
         return None
+
     pre.sort(key=lambda x: x[2], reverse=True)
-    candidates = pre[:TOP_BY_24H_VOLUME]
+    pool = pre[:POOL_SIZE]
+    candidates = random.sample(pool, SAMPLE_SIZE) if len(pool) > SAMPLE_SIZE else pool
+
+    # prefer unique bases to reduce repeats (falls back if too strict)
+    seen_bases = set()
+    unique_candidates = []
+    for sym, last, qvol, ch in sorted(candidates, key=lambda x: x[2], reverse=True):
+        base = sym[:-len(QUOTE)] if len(QUOTE) > 0 else sym
+        if base in seen_bases:
+            continue
+        seen_bases.add(base)
+        unique_candidates.append((sym, last, qvol, ch))
+    if not unique_candidates:
+        unique_candidates = candidates
+
     results = []
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
-        futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(unique_candidates) or 1)) as ex:
+        futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in unique_candidates}
         for fut in as_completed(futures):
-            res = fut.result()
+            try:
+                res = fut.result()
+            except Exception:
+                res = None
             if res:
                 results.append(res)
+
     if not results:
         return None
-    strongs = [r for r in results if r['strong_candidate']]
-    chosen_pool = strongs if strongs else results
-    chosen = sorted(chosen_pool, key=lambda x: x['score'], reverse=True)[0]
-    icon, label = strength_label(chosen['score'], chosen['strong_candidate'])
-    # do not send weak signals
-    if label == "weak":
-        print(f"[{time.strftime('%H:%M:%S')}] Skipped weak signal {chosen['symbol']} score={chosen['score']:.2f}")
+
+    # soft recency penalty for already-signaled symbols
+    for r in results:
+        if r['symbol'] in RECENT_SIGNALS:
+            r['score'] *= 0.5
+
+    # keep only medium or strong signals
+    filtered = []
+    for r in results:
+        _, lab = strength_label(r['score'], r['strong_candidate'])
+        if lab in ("medium", "strong"):
+            filtered.append(r)
+
+    if not filtered:
         return None
+
+    strongs = [r for r in filtered if r['strong_candidate']]
+    chosen_pool = strongs if strongs else filtered
+    chosen = sorted(chosen_pool, key=lambda x: x['score'], reverse=True)[0]
+
+    RECENT_SIGNALS[chosen['symbol']] = now
+    RECENT_BUYS[chosen['symbol']] = {"ts": now}
+
+    icon, label = strength_label(chosen['score'], chosen['strong_candidate'])
     msg = (
         f"{icon} *COIN SIGNAL* `{chosen['symbol']}`\n"
         f"Strength: `{label}`\n"
@@ -333,9 +385,8 @@ def pick_coin():
         f"Score: `{chosen['score']:.2f}`"
     )
     send_telegram(msg)
-    RECENT_BUYS[chosen['symbol']] = {"ts": now}
     return chosen
-
+    
 # -------------------------
 # Main loop / healthcheck
 # -------------------------
@@ -349,9 +400,9 @@ def trade_cycle():
         try:
             res = pick_coin()
             if res:
-                print(f"[{time.strftime('%H:%M:%S')}] Sent -> {res['symbol']} score={res['score']:.2f}")
+                print(f"[{time.strftime('%H:%M:%S')}] Signal -> {res['symbol']} score={res['score']:.2f}")
             else:
-                print(f"[{time.strftime('%H:%M:%S')}] No (medium/strong) signal")
+                print(f"[{time.strftime('%H:%M:%S')}] No signal")
         except Exception as e:
             print("cycle error", e)
         time.sleep(CYCLE_SECONDS)
