@@ -53,7 +53,7 @@ def send_telegram(message):
         return False
 
 # -------------------------
-# Utilities
+# Utilities / indicators
 # -------------------------
 def pct_change(open_p, close_p):
     try:
@@ -129,7 +129,7 @@ def orderbook_bullish(ob, depth=3, min_imbalance=1.2, max_spread_pct=1.0):
         return False
 
 # -------------------------
-# Cache
+# Cache for public calls
 # -------------------------
 _cache = {}
 _cache_lock = threading.Lock()
@@ -148,7 +148,7 @@ def cache_set(key, val):
         _cache[key] = (time.time(), val)
 
 # -------------------------
-# Binance public
+# Binance public endpoints
 # -------------------------
 def fetch_tickers():
     key = "tickers"
@@ -196,7 +196,7 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
         return {}
 
 # -------------------------
-# Evaluation
+# Evaluation per symbol
 # -------------------------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
@@ -265,17 +265,14 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
 # Strength label helper
 # -------------------------
 def strength_label(score, strong_candidate):
-    # Priority: if strict strong_candidate then strong
     if strong_candidate:
         return "✔️", "strong"
-    # medium if score high enough
     if score >= 15.0:
         return "🔘", "medium"
-    # otherwise weak
     return "⭕", "weak"
 
 # -------------------------
-# Picker
+# Picker (sends only medium/strong)
 # -------------------------
 def pick_coin():
     tickers = fetch_tickers()
@@ -318,6 +315,10 @@ def pick_coin():
     chosen_pool = strongs if strongs else results
     chosen = sorted(chosen_pool, key=lambda x: x['score'], reverse=True)[0]
     icon, label = strength_label(chosen['score'], chosen['strong_candidate'])
+    # do not send weak signals
+    if label == "weak":
+        print(f"[{time.strftime('%H:%M:%S')}] Skipped weak signal {chosen['symbol']} score={chosen['score']:.2f}")
+        return None
     msg = (
         f"{icon} *COIN SIGNAL* `{chosen['symbol']}`\n"
         f"Strength: `{label}`\n"
@@ -348,9 +349,9 @@ def trade_cycle():
         try:
             res = pick_coin()
             if res:
-                print(f"[{time.strftime('%H:%M:%S')}] Signal -> {res['symbol']} score={res['score']:.2f}")
+                print(f"[{time.strftime('%H:%M:%S')}] Sent -> {res['symbol']} score={res['score']:.2f}")
             else:
-                print(f"[{time.strftime('%H:%M:%S')}] No signal")
+                print(f"[{time.strftime('%H:%M:%S')}] No (medium/strong) signal")
         except Exception as e:
             print("cycle error", e)
         time.sleep(CYCLE_SECONDS)
