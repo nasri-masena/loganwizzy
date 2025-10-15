@@ -17,7 +17,7 @@ BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
 PRICE_MIN = 8.0
 PRICE_MAX = 5.0
-MIN_VOLUME = 800_000
+MIN_VOLUME = 1000_000
 TOP_BY_24H_VOLUME = 6
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "4"))
 KLINES_5M_LIMIT = 6
@@ -35,7 +35,7 @@ MAX_WORKERS = 8
 RECENT_BUYS = {}
 BUY_LOCK_SECONDS = 600
 REQUEST_TIMEOUT = 6
-POOL_SIZE = 50
+POOL_SIZE = 120
 SAMPLE_SIZE = 12
 SIGNAL_COOLDOWN = 1800
 RECENT_SIGNALS = {}
@@ -278,18 +278,18 @@ def strength_label(score, strong_candidate):
         return "➖", "medium"
     # otherwise weak
     return "⭕", "weak"
-
-def _cleanup_recent_signals():
-    now = time.time()
-    to_del = [s for s,ts in RECENT_SIGNALS.items() if now - ts > SIGNAL_COOLDOWN]
-    for s in to_del:
-        RECENT_SIGNALS.pop(s, None)
-
 # -------------------------
 # Picker
 # -------------------------
 def pick_coin():
     global RECENT_SIGNALS, RECENT_BUYS
+
+    def _cleanup_recent_signals():
+        now = time.time()
+        to_del = [s for s, ts in RECENT_SIGNALS.items() if now - ts > SIGNAL_COOLDOWN]
+        for s in to_del:
+            RECENT_SIGNALS.pop(s, None)
+
     tickers = fetch_tickers()
     now = time.time()
     _cleanup_recent_signals()
