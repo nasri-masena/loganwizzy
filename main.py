@@ -1,6 +1,5 @@
 import os
 import time
-import random
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,8 +15,8 @@ CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
 PRICE_MIN = 8.0
-PRICE_MAX = 5.0
-MIN_VOLUME = 1000_000
+PRICE_MAX = 4.0
+MIN_VOLUME = 3_000_000
 TOP_BY_24H_VOLUME = 6
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "4"))
 KLINES_5M_LIMIT = 6
@@ -35,20 +34,16 @@ MAX_WORKERS = 8
 RECENT_BUYS = {}
 BUY_LOCK_SECONDS = 600
 REQUEST_TIMEOUT = 6
-POOL_SIZE = 120
-SAMPLE_SIZE = 12
-SIGNAL_COOLDOWN = 1800
-RECENT_SIGNALS = {}
 
 # -------------------------
 # Telegram helper
 # -------------------------
 def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured. Message:")
         print(message)
         return False
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
@@ -275,25 +270,16 @@ def strength_label(score, strong_candidate):
         return "✔️", "strong"
     # medium if score high enough
     if score >= 15.0:
-        return "➖", "medium"
+        return "🔘", "medium"
     # otherwise weak
     return "⭕", "weak"
+
 # -------------------------
 # Picker
 # -------------------------
 def pick_coin():
-    global RECENT_SIGNALS, RECENT_BUYS
-
-    def _cleanup_recent_signals():
-        now = time.time()
-        to_del = [s for s, ts in RECENT_SIGNALS.items() if now - ts > SIGNAL_COOLDOWN]
-        for s in to_del:
-            RECENT_SIGNALS.pop(s, None)
-
     tickers = fetch_tickers()
     now = time.time()
-    _cleanup_recent_signals()
-
     pre = []
     for t in tickers:
         sym = t.get("symbol")
@@ -311,65 +297,26 @@ def pick_coin():
             continue
         if ch < 0.5 or ch > 20.0:
             continue
-        if RECENT_SIGNALS.get(sym):
+        last_buy = RECENT_BUYS.get(sym)
+        if last_buy and now < last_buy['ts'] + BUY_LOCK_SECONDS:
             continue
         pre.append((sym, last, qvol, ch))
-
     if not pre:
         return None
-
     pre.sort(key=lambda x: x[2], reverse=True)
-    pool = pre[:POOL_SIZE]
-    candidates = random.sample(pool, SAMPLE_SIZE) if len(pool) > SAMPLE_SIZE else pool
-
-    # prefer unique bases to reduce repeats (falls back if too strict)
-    seen_bases = set()
-    unique_candidates = []
-    for sym, last, qvol, ch in sorted(candidates, key=lambda x: x[2], reverse=True):
-        base = sym[:-len(QUOTE)] if len(QUOTE) > 0 else sym
-        if base in seen_bases:
-            continue
-        seen_bases.add(base)
-        unique_candidates.append((sym, last, qvol, ch))
-    if not unique_candidates:
-        unique_candidates = candidates
-
+    candidates = pre[:TOP_BY_24H_VOLUME]
     results = []
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(unique_candidates) or 1)) as ex:
-        futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in unique_candidates}
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
+        futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
         for fut in as_completed(futures):
-            try:
-                res = fut.result()
-            except Exception:
-                res = None
+            res = fut.result()
             if res:
                 results.append(res)
-
     if not results:
         return None
-
-    # soft recency penalty for already-signaled symbols
-    for r in results:
-        if r['symbol'] in RECENT_SIGNALS:
-            r['score'] *= 0.5
-
-    # keep only medium or strong signals
-    filtered = []
-    for r in results:
-        _, lab = strength_label(r['score'], r['strong_candidate'])
-        if lab in ("medium", "strong"):
-            filtered.append(r)
-
-    if not filtered:
-        return None
-
-    strongs = [r for r in filtered if r['strong_candidate']]
-    chosen_pool = strongs if strongs else filtered
+    strongs = [r for r in results if r['strong_candidate']]
+    chosen_pool = strongs if strongs else results
     chosen = sorted(chosen_pool, key=lambda x: x['score'], reverse=True)[0]
-
-    RECENT_SIGNALS[chosen['symbol']] = now
-    RECENT_BUYS[chosen['symbol']] = {"ts": now}
-
     icon, label = strength_label(chosen['score'], chosen['strong_candidate'])
     msg = (
         f"{icon} *COIN SIGNAL* `{chosen['symbol']}`\n"
@@ -385,8 +332,9 @@ def pick_coin():
         f"Score: `{chosen['score']:.2f}`"
     )
     send_telegram(msg)
+    RECENT_BUYS[chosen['symbol']] = {"ts": now}
     return chosen
-    
+
 # -------------------------
 # Main loop / healthcheck
 # -------------------------
