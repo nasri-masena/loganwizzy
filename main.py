@@ -14,7 +14,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
-PRICE_MIN = 8.0
+PRICE_MIN = 1.0
 PRICE_MAX = 4.0
 MIN_VOLUME = 1_000_000        # 24h quote volume threshold
 TOP_BY_24H_VOLUME = 6
