@@ -21,21 +21,24 @@ PRICE_MAX = 4.0
 MIN_VOLUME = 1_000_000        # 24h quote volume threshold
 TOP_BY_24H_VOLUME = 6
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "4"))
-KLINES_5M_LIMIT = 12
-KLINES_1M_LIMIT = 12
+KLINES_5M_LIMIT = 6
+KLINES_1M_LIMIT = 6
 EMA_SHORT = 5
 EMA_LONG = 20
-RSI_PERIOD = 9
-MIN_OB_IMBALANCE = 1.5
-MAX_OB_SPREAD_PCT = 0.4
+RSI_PERIOD = 14
+OB_DEPTH = 3
+MIN_OB_IMBALANCE = 1.2
+MAX_OB_SPREAD_PCT = 1.0
 MIN_5M_PCT = 0.4
 MIN_1M_PCT = 0.2
-PREBUY_BREAKOUT_MARGIN = 0.004
-MIN_FINAL_EMA_UPLIFT = 0.001
-OB_DEPTH = 10
-PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "4"))
+CACHE_TTL = 1.0               # seconds - cache public calls briefly
+MAX_WORKERS = 8
+RECENT_BUYS = {}
+BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "900"))  # default 15 minutes
+
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "6"))
 PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "6"))
+
 # persistence file
 RECENT_BUYS_DB = os.path.join(os.getcwd(), "recent_buys.db")
 
@@ -121,22 +124,6 @@ def ema_local(values, period):
         e = alpha * float(v) + (1 - alpha) * e
     return e
 
-def fetch_agg_trades(symbol, limit=100):
-    key = f"agg:{symbol}:{limit}"
-    cached = cache_get(key)
-    if cached:
-        return cached
-    try:
-        params = {"symbol": symbol, "limit": limit}
-        with REQUESTS_SEMAPHORE:
-            resp = requests.get(BINANCE_REST + "/api/v3/aggTrades", params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        cache_set(key, data)
-        return data
-    except Exception:
-        return []
-
 def compute_rsi_local(closes, period=14):
     if not closes or len(closes) < period + 1:
         return None
@@ -195,7 +182,7 @@ def orderbook_bullish(ob, depth=10, min_imbalance=1.5, max_spread_pct=0.4, min_q
         return (imbalance >= min_imbalance) and (spread_pct <= max_spread_pct)
     except Exception:
         return False
-        
+
 # -------------------------
 # Binance public calls (cached + semaphore)
 # -------------------------
@@ -250,71 +237,38 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
 # -------------------------
 # Candidate evaluation (parallel)
 # -------------------------
-def evaluate_symbol(ticker):
+def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
-        sym = ticker.get("symbol")
-        last_price = float(ticker.get("lastPrice") or 0.0)
-        qvol = float(ticker.get("quoteVolume") or 0.0)
-        change_24h = float(ticker.get("priceChangePercent") or 0.0)
-
-        # base filters (as before)
         if not (PRICE_MIN <= last_price <= PRICE_MAX):
             return None
         if qvol < MIN_VOLUME:
             return None
         if change_24h < 0.5 or change_24h > 20.0:
             return None
-
-        # quick taker-buy ratio filter (prefer real buy pressure)
-        taker_buy_q = float(ticker.get("takerBuyQuoteAssetVolume") or 0.0)
-        if (taker_buy_q / (qvol + 1e-12)) < 0.25:
-            return None
-
         kl5 = fetch_klines(sym, "5m", KLINES_5M_LIMIT)
         kl1 = fetch_klines(sym, "1m", KLINES_1M_LIMIT)
         ob = fetch_order_book(sym, limit=OB_DEPTH)
-        if not kl5 or len(kl5) < 4 or not kl1 or len(kl1) < 2:
+        if not kl5 or len(kl5) < 3 or not kl1 or len(kl1) < 2:
             return None
-
         closes_5m = [float(k[4]) for k in kl5]
         closes_1m = [float(k[4]) for k in kl1]
         pct_5m = pct_change(float(kl5[0][1]), closes_5m[-1])
         pct_1m = pct_change(float(kl1[0][1]), closes_1m[-1])
         if pct_5m < MIN_5M_PCT or pct_1m < MIN_1M_PCT:
             return None
-
         vol_5m = compute_recent_volatility(closes_5m)
+        vol_1m = compute_recent_volatility(closes_1m, lookback=3)
         short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
         long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
         ema_ok = False
         ema_uplift = 0.0
         if short_ema and long_ema and long_ema != 0:
             ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-            ema_ok = short_ema > long_ema * (1.0 + MIN_FINAL_EMA_UPLIFT)
-
+            ema_ok = short_ema > long_ema * 1.0005
         rsi_val = compute_rsi_local(closes_5m[-(RSI_PERIOD+1):], RSI_PERIOD) if len(closes_5m) >= RSI_PERIOD+1 else None
-        if rsi_val is not None and rsi_val > 72:
+        if rsi_val is not None and rsi_val > 70:
             return None
-
         ob_bull = orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT)
-
-        # quick aggTrades check: recent buyer-initiated volume in last N trades
-        agg = fetch_agg_trades(sym, limit=200)
-        buy_quote = 0.0
-        total_quote = 0.0
-        for a in agg[-60:]:  # last ~60 agg trades
-            price = float(a.get('p', a.get('price', 0)))
-            qty = float(a.get('q', a.get('qty', 0)))
-            is_buyer_maker = a.get('m')  # True when buyer is maker => SELL trade
-            quote = price * qty
-            total_quote += quote
-            if not is_buyer_maker:
-                buy_quote += quote
-        buy_ratio = buy_quote / (total_quote + 1e-12)
-        if buy_ratio < 0.45:
-            return None
-
-        # scoring (same as before, adjusted)
         score = 0.0
         score += max(0.0, pct_5m) * 4.0
         score += max(0.0, pct_1m) * 2.0
@@ -326,10 +280,7 @@ def evaluate_symbol(ticker):
             score += max(0.0, (60.0 - min(rsi_val, 60.0))) * 1.0
         if ob_bull:
             score += 25.0
-        if buy_ratio > 0.65:
-            score += 30.0
-
-        strong_candidate = (pct_5m >= MIN_5M_PCT and pct_1m >= MIN_1M_PCT and ema_ok and ob_bull and buy_ratio > 0.5)
+        strong_candidate = (pct_5m >= MIN_5M_PCT and pct_1m >= MIN_1M_PCT and ema_ok and ob_bull)
         return {
             "symbol": sym,
             "last_price": last_price,
@@ -338,17 +289,17 @@ def evaluate_symbol(ticker):
             "pct_5m": pct_5m,
             "pct_1m": pct_1m,
             "vol_5m": vol_5m,
+            "vol_1m": vol_1m,
             "ema_ok": ema_ok,
             "ema_uplift": ema_uplift,
             "rsi": rsi_val,
             "ob_bull": ob_bull,
-            "buy_ratio": buy_ratio,
             "score": score,
             "strong_candidate": strong_candidate
         }
     except Exception:
         return None
-        
+
 # -------------------------
 # Main picker (atomic + persistence)
 # -------------------------
@@ -357,8 +308,6 @@ def pick_coin():
         tickers = fetch_tickers()
         now = time.time()
         pre = []
-
-        # collect full ticker dicts and skip recent buys
         for t in tickers:
             sym = t.get("symbol")
             if not sym or not sym.endswith(QUOTE):
@@ -375,21 +324,22 @@ def pick_coin():
                 continue
             if ch < 0.5 or ch > 20.0:
                 continue
+            # quick atomic recent buy check
             with RECENT_BUYS_LOCK:
                 last_buy = RECENT_BUYS.get(sym)
                 if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
                     continue
-            pre.append(t)
+            pre.append((sym, last, qvol, ch))
 
         if not pre:
             return None
 
-        # evaluate top-by-volume candidates in parallel
-        pre.sort(key=lambda x: float(x.get("quoteVolume", 0.0)), reverse=True)
+        # top by 24h quote volume then evaluate in parallel
+        pre.sort(key=lambda x: x[2], reverse=True)
         candidates = pre[:TOP_BY_24H_VOLUME]
         results = []
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
-            futures = {ex.submit(evaluate_symbol, cand): cand.get("symbol") for cand in candidates}
+            futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
             for fut in as_completed(futures):
                 try:
                     res = fut.result()
@@ -401,25 +351,25 @@ def pick_coin():
         if not results:
             return None
 
-        # prefer strong candidates, else pick highest score
+        # prefer strong candidates, else highest score
         strongs = [r for r in results if r.get("strong_candidate")]
         chosen_pool = strongs if strongs else results
         chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
-        sym = chosen["symbol"]
 
-        # FINAL stricter verification with fresh market data
+        # FINAL stricter verification to reduce false positives and duplicates
+        sym = chosen["symbol"]
+        # fetch fresh market data (public)
         kl5 = fetch_klines(sym, "5m", KLINES_5M_LIMIT)
         kl1 = fetch_klines(sym, "1m", KLINES_1M_LIMIT)
         ob = fetch_order_book(sym, limit=OB_DEPTH)
         reason = None
-
         if not kl5 or len(kl5) < 4:
             reason = "klines insufficient"
         else:
             closes_5m = [float(k[4]) for k in kl5]
             closes_1m = [float(k[4]) for k in kl1] if kl1 and len(kl1) >= 2 else []
-            # breakout
-            PREBUY_BREAKOUT_MARGIN = globals().get("PREBUY_BREAKOUT_MARGIN", 0.004)
+            # breakout: current > recent highs * (1 + margin)
+            PREBUY_BREAKOUT_MARGIN = 0.008
             recent_high = max(closes_5m[:-1]) if len(closes_5m) > 1 else closes_5m[-1]
             if not (closes_5m[-1] > recent_high * (1.0 + PREBUY_BREAKOUT_MARGIN)):
                 reason = "no breakout"
@@ -434,38 +384,19 @@ def pick_coin():
             ema_uplift = 0.0
             if short_ema and long_ema and long_ema != 0:
                 ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-            MIN_FINAL_EMA_UPLIFT = globals().get("MIN_FINAL_EMA_UPLIFT", 0.001)
-            if not (short_ema and long_ema and ema_uplift >= MIN_FINAL_EMA_UPLIFT and short_ema > long_ema * (1.0 + MIN_FINAL_EMA_UPLIFT)):
+            MIN_FINAL_EMA_UPLIFT = 0.0005
+            if not (short_ema and long_ema and ema_uplift >= MIN_FINAL_EMA_UPLIFT and short_ema > long_ema * 1.0005):
                 reason = "ema fail"
             # orderbook quick check
             if not orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT):
                 reason = "orderbook weak"
-            # volatility guard
+            # volatility guard (avoid insane spikes)
             vol5 = compute_recent_volatility(closes_5m) or 0.0
-            if vol5 > 0.05:
+            if vol5 > 0.05:  # >5% step volatility is too noisy
                 reason = "volatility high"
-            # aggTrades re-check buy pressure
-            agg = fetch_agg_trades(sym, limit=200)
-            if agg:
-                buy_quote = 0.0
-                total_quote = 0.0
-                recent_agg = agg[-60:]
-                for a in recent_agg:
-                    price = float(a.get('p', a.get('price', 0)))
-                    qty = float(a.get('q', a.get('qty', 0)))
-                    is_buyer_maker = a.get('m')  # True => buyer is maker => SELL trade
-                    quote = price * qty
-                    total_quote += quote
-                    if not is_buyer_maker:
-                        buy_quote += quote
-                buy_ratio = buy_quote / (total_quote + 1e-12)
-                if buy_ratio < 0.45:
-                    reason = "agg buy weak"
-            else:
-                # if no agg data treat as weak
-                reason = reason or "agg missing"
 
         if reason:
+            # mark short cooldown to avoid immediate re-eval
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS[sym] = {"ts": now, "reserved": False}
                 try:
@@ -475,17 +406,17 @@ def pick_coin():
             print(f"[{time.strftime('%H:%M:%S')}] Candidate {sym} rejected: {reason}")
             return None
 
-        # prepare message
+        # prepare message with verification details
         msg = (
             f"🚀 *COIN SIGNAL*: `{sym}`\n"
-            f"Price: `{chosen.get('last_price')}`\n"
-            f"24h Change: `{chosen.get('24h_change')}`%\n"
+            f"Price: `{chosen['last_price']}`\n"
+            f"24h Change: `{chosen['24h_change']}`%\n"
             f"5m Change: `{pct_5m:.2f}`%\n"
             f"1m Change: `{pct_1m:.2f}`%\n"
             f"Volatility 5m: `{vol5}`\n"
             f"EMA Uplift: `{ema_uplift:.6f}`\n"
             f"Orderbook Bullish: `{orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT)}`\n"
-            f"Score: `{chosen.get('score'):.2f}`"
+            f"Score: `{chosen['score']:.2f}`"
         )
 
         # atomic reserve/persist, then send
@@ -509,7 +440,7 @@ def pick_coin():
                     persist_recent_buys()
                 except Exception:
                     pass
-            print(f"[{time.strftime('%H:%M:%S')}] Signal -> {sym} score={chosen.get('score'):.2f}")
+            print(f"[{time.strftime('%H:%M:%S')}] Signal -> {sym} score={chosen['score']:.2f}")
             return chosen
         else:
             with RECENT_BUYS_LOCK:
