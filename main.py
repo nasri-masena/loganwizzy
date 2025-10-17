@@ -5,6 +5,7 @@ import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import statistics
+import shelve
 
 # -------------------------
 # Config
@@ -32,9 +33,26 @@ MIN_1M_PCT = 0.3
 CACHE_TTL = 1.0               # seconds - cache public calls briefly
 MAX_WORKERS = 8
 RECENT_BUYS = {}
-BUY_LOCK_SECONDS = 600
+BUY_LOCK_SECONDS = 300
 
 REQUEST_TIMEOUT = 6
+REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=int(os.environ.get("PUBLIC_CONCURRENCY", 6)))
+RECENT_BUYS_LOCK = threading.Lock()
+RECENT_BUYS_DB = os.path.join(os.getcwd(), "recent_buys.db")
+
+# load persisted recent buys (best-effort)
+try:
+    with shelve.open(RECENT_BUYS_DB) as _db:
+        RECENT_BUYS.update(_db.get("data", {}))
+except Exception:
+    pass
+
+def persist_recent_buys():
+    try:
+        with shelve.open(RECENT_BUYS_DB) as _db:
+            _db["data"] = RECENT_BUYS
+    except Exception:
+        pass
 
 # -------------------------
 # Telegram helper
@@ -152,7 +170,7 @@ def cache_set(key, val):
         _cache[key] = (time.time(), val)
 
 # -------------------------
-# Binance public calls
+# Binance public calls (with semaphore + cache)
 # -------------------------
 def fetch_tickers():
     key = "tickers"
@@ -160,7 +178,8 @@ def fetch_tickers():
     if cached:
         return cached
     try:
-        resp = requests.get(BINANCE_REST + "/api/v3/ticker/24hr", timeout=REQUEST_TIMEOUT)
+        with REQUESTS_SEMAPHORE:
+            resp = requests.get(BINANCE_REST + "/api/v3/ticker/24hr", timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         cache_set(key, data)
@@ -176,7 +195,8 @@ def fetch_klines(symbol, interval, limit):
         return cached
     try:
         params = {"symbol": symbol, "interval": interval, "limit": limit}
-        resp = requests.get(BINANCE_REST + "/api/v3/klines", params=params, timeout=REQUEST_TIMEOUT)
+        with REQUESTS_SEMAPHORE:
+            resp = requests.get(BINANCE_REST + "/api/v3/klines", params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         cache_set(key, data)
@@ -192,7 +212,8 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
         return cached
     try:
         params = {"symbol": symbol, "limit": max(5, limit)}
-        resp = requests.get(BINANCE_REST + "/api/v3/depth", params=params, timeout=REQUEST_TIMEOUT)
+        with REQUESTS_SEMAPHORE:
+            resp = requests.get(BINANCE_REST + "/api/v3/depth", params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         cache_set(key, data)
@@ -268,13 +289,11 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
             "score": score,
             "strong_candidate": strong_candidate
         }
-    except Exception as e:
-        # keep worker silent on intermittent errors
-        # print("eval error", sym, e)
+    except Exception:
         return None
 
 # -------------------------
-# Main picker
+# Main picker (improved atomic checks + persistence)
 # -------------------------
 def pick_coin():
     tickers = fetch_tickers()
@@ -296,17 +315,17 @@ def pick_coin():
             continue
         if ch < 0.5 or ch > 20.0:
             continue
-        last_buy = RECENT_BUYS.get(sym)
-        if last_buy and now < last_buy['ts'] + BUY_LOCK_SECONDS:
-            continue
+        # check under lock to avoid races inside same process
+        with RECENT_BUYS_LOCK:
+            last_buy = RECENT_BUYS.get(sym)
+            if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
+                continue
         pre.append((sym, last, qvol, ch))
     if not pre:
         return None
-    # top by 24h quote volume
     pre.sort(key=lambda x: x[2], reverse=True)
     candidates = pre[:TOP_BY_24H_VOLUME]
     results = []
-    # evaluate in parallel
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
         futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
         for fut in as_completed(futures):
@@ -315,10 +334,9 @@ def pick_coin():
                 results.append(res)
     if not results:
         return None
-    # prefer strong candidates
-    strongs = [r for r in results if r['strong_candidate']]
+    strongs = [r for r in results if r["strong_candidate"]]
     chosen_pool = strongs if strongs else results
-    chosen = sorted(chosen_pool, key=lambda x: x['score'], reverse=True)[0]
+    chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
 
     # prepare message
     msg = (
@@ -334,22 +352,41 @@ def pick_coin():
         f"Score: `{chosen['score']:.2f}`"
     )
 
-    # final duplicate check right before sending
-    now = time.time()
-    last_buy = RECENT_BUYS.get(chosen['symbol'])
-    if last_buy and now < last_buy['ts'] + BUY_LOCK_SECONDS:
-        print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate: {chosen['symbol']} (last at {time.strftime('%H:%M:%S', time.localtime(last_buy['ts']))})")
-        return None
+    # atomic reserve/check then send. This prevents duplicates inside this process.
+    now_send = time.time()
+    with RECENT_BUYS_LOCK:
+        last_buy = RECENT_BUYS.get(chosen["symbol"])
+        if last_buy and now_send < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
+            print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate (reserved): {chosen['symbol']} (last at {time.strftime('%H:%M:%S', time.localtime(last_buy.get('ts',0)))})")
+            return None
+        # reserve tentatively
+        RECENT_BUYS[chosen["symbol"]] = {"ts": now_send, "reserved": True}
+        try:
+            persist_recent_buys()
+        except Exception:
+            pass
 
     sent = send_telegram(msg)
     if sent:
-        RECENT_BUYS[chosen['symbol']] = {"ts": now}
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
+            try:
+                persist_recent_buys()
+            except Exception:
+                pass
         print(f"[{time.strftime('%H:%M:%S')}] Signal -> {chosen['symbol']} score={chosen['score']:.2f}")
         return chosen
     else:
+        # clear reservation on failure so next cycle can retry
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS.pop(chosen["symbol"], None)
+            try:
+                persist_recent_buys()
+            except Exception:
+                pass
         print(f"[{time.strftime('%H:%M:%S')}] Telegram send failed for {chosen['symbol']}")
         return None
-        
+
 # -------------------------
 # Main loop / web healthcheck
 # -------------------------
@@ -373,8 +410,6 @@ def trade_cycle():
         time.sleep(CYCLE_SECONDS)
 
 if __name__ == "__main__":
-    # start cycle thread
     t = threading.Thread(target=trade_cycle, daemon=True)
     t.start()
-    # run simple flask for healthcheck
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), threaded=True)
