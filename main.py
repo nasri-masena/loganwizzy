@@ -32,7 +32,7 @@ MIN_1M_PCT = 0.3
 CACHE_TTL = 1.0               # seconds - cache public calls briefly
 MAX_WORKERS = 8
 RECENT_BUYS = {}
-BUY_LOCK_SECONDS = 300
+BUY_LOCK_SECONDS = 600
 
 REQUEST_TIMEOUT = 6
 
