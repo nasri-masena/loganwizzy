@@ -32,7 +32,7 @@ MIN_1M_PCT = 0.3
 CACHE_TTL = 1.0               # seconds - cache public calls briefly
 MAX_WORKERS = 8
 RECENT_BUYS = {}
-BUY_LOCK_SECONDS = 600
+BUY_LOCK_SECONDS = 300
 
 REQUEST_TIMEOUT = 6
 
@@ -319,7 +319,8 @@ def pick_coin():
     strongs = [r for r in results if r['strong_candidate']]
     chosen_pool = strongs if strongs else results
     chosen = sorted(chosen_pool, key=lambda x: x['score'], reverse=True)[0]
-    # message
+
+    # prepare message
     msg = (
         f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
         f"Price: `{chosen['last_price']}`\n"
@@ -332,11 +333,23 @@ def pick_coin():
         f"Orderbook Bullish: `{chosen['ob_bull']}`\n"
         f"Score: `{chosen['score']:.2f}`"
     )
-    send_telegram(msg)
-    # mark as recent buy-signal to avoid repeats
-    RECENT_BUYS[chosen['symbol']] = {"ts": now}
-    return chosen
 
+    # final duplicate check right before sending
+    now = time.time()
+    last_buy = RECENT_BUYS.get(chosen['symbol'])
+    if last_buy and now < last_buy['ts'] + BUY_LOCK_SECONDS:
+        print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate: {chosen['symbol']} (last at {time.strftime('%H:%M:%S', time.localtime(last_buy['ts']))})")
+        return None
+
+    sent = send_telegram(msg)
+    if sent:
+        RECENT_BUYS[chosen['symbol']] = {"ts": now}
+        print(f"[{time.strftime('%H:%M:%S')}] Signal -> {chosen['symbol']} score={chosen['score']:.2f}")
+        return chosen
+    else:
+        print(f"[{time.strftime('%H:%M:%S')}] Telegram send failed for {chosen['symbol']}")
+        return None
+        
 # -------------------------
 # Main loop / web healthcheck
 # -------------------------
