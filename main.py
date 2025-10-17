@@ -1,10 +1,10 @@
 import os
 import time
+import math
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import statistics
-from flask import Flask
 
 # -------------------------
 # Config
@@ -16,7 +16,7 @@ BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
 PRICE_MIN = 8.0
 PRICE_MAX = 4.0
-MIN_VOLUME = 500_000
+MIN_VOLUME = 1_000_000        # 24h quote volume threshold
 TOP_BY_24H_VOLUME = 6
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "4"))
 KLINES_5M_LIMIT = 6
@@ -29,10 +29,11 @@ MIN_OB_IMBALANCE = 1.2
 MAX_OB_SPREAD_PCT = 1.0
 MIN_5M_PCT = 0.6
 MIN_1M_PCT = 0.3
-CACHE_TTL = 1.0
+CACHE_TTL = 1.0               # seconds - cache public calls briefly
 MAX_WORKERS = 8
 RECENT_BUYS = {}
 BUY_LOCK_SECONDS = 600
+
 REQUEST_TIMEOUT = 6
 
 # -------------------------
@@ -44,7 +45,7 @@ def send_telegram(message):
         print(message)
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         return r.status_code == 200
@@ -53,7 +54,7 @@ def send_telegram(message):
         return False
 
 # -------------------------
-# Utilities
+# Utility math/indicators
 # -------------------------
 def pct_change(open_p, close_p):
     try:
@@ -81,6 +82,7 @@ def compute_rsi_local(closes, period=14):
         diff = closes[i] - closes[i-1]
         gains.append(max(0.0, diff))
         losses.append(max(0.0, -diff))
+    # initial averages
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period if sum(losses[:period]) != 0 else 1e-9
     for i in range(period, len(gains)):
@@ -129,10 +131,11 @@ def orderbook_bullish(ob, depth=3, min_imbalance=1.2, max_spread_pct=1.0):
         return False
 
 # -------------------------
-# Cache
+# Simple short-lived cache for public endpoints
 # -------------------------
 _cache = {}
 _cache_lock = threading.Lock()
+
 def cache_get(key):
     with _cache_lock:
         v = _cache.get(key)
@@ -143,12 +146,13 @@ def cache_get(key):
             _cache.pop(key, None)
             return None
         return val
+
 def cache_set(key, val):
     with _cache_lock:
         _cache[key] = (time.time(), val)
 
 # -------------------------
-# Binance public
+# Binance public calls
 # -------------------------
 def fetch_tickers():
     key = "tickers"
@@ -177,7 +181,8 @@ def fetch_klines(symbol, interval, limit):
         data = resp.json()
         cache_set(key, data)
         return data
-    except Exception:
+    except Exception as e:
+        # print("klines error", symbol, e)
         return []
 
 def fetch_order_book(symbol, limit=OB_DEPTH):
@@ -192,20 +197,23 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
         data = resp.json()
         cache_set(key, data)
         return data
-    except Exception:
+    except Exception as e:
+        # print("orderbook error", symbol, e)
         return {}
 
 # -------------------------
-# Evaluation
+# Candidate evaluation (parallel)
 # -------------------------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
+        # quick checks
         if not (PRICE_MIN <= last_price <= PRICE_MAX):
             return None
         if qvol < MIN_VOLUME:
             return None
         if change_24h < 0.5 or change_24h > 20.0:
             return None
+        # fetch data in parallel inside this worker
         kl5 = fetch_klines(sym, "5m", KLINES_5M_LIMIT)
         kl1 = fetch_klines(sym, "1m", KLINES_1M_LIMIT)
         ob = fetch_order_book(sym, limit=OB_DEPTH)
@@ -219,6 +227,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
             return None
         vol_5m = compute_recent_volatility(closes_5m)
         vol_1m = compute_recent_volatility(closes_1m, lookback=3)
+        # EMA check over 5m closes
         short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
         long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
         ema_ok = False
@@ -230,6 +239,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         if rsi_val is not None and rsi_val > 70:
             return None
         ob_bull = orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT)
+        # Score
         score = 0.0
         score += max(0.0, pct_5m) * 4.0
         score += max(0.0, pct_1m) * 2.0
@@ -258,24 +268,13 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
             "score": score,
             "strong_candidate": strong_candidate
         }
-    except Exception:
+    except Exception as e:
+        # keep worker silent on intermittent errors
+        # print("eval error", sym, e)
         return None
 
 # -------------------------
-# Strength label helper
-# -------------------------
-def strength_label(score, strong_candidate):
-    # Priority: if strict strong_candidate then strong
-    if strong_candidate:
-        return "✔️", "strong"
-    # medium if score high enough
-    if score >= 15.0:
-        return "🔘", "medium"
-    # otherwise weak
-    return "⭕", "weak"
-
-# -------------------------
-# Picker
+# Main picker
 # -------------------------
 def pick_coin():
     tickers = fetch_tickers()
@@ -303,9 +302,11 @@ def pick_coin():
         pre.append((sym, last, qvol, ch))
     if not pre:
         return None
+    # top by 24h quote volume
     pre.sort(key=lambda x: x[2], reverse=True)
     candidates = pre[:TOP_BY_24H_VOLUME]
     results = []
+    # evaluate in parallel
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
         futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
         for fut in as_completed(futures):
@@ -314,13 +315,13 @@ def pick_coin():
                 results.append(res)
     if not results:
         return None
+    # prefer strong candidates
     strongs = [r for r in results if r['strong_candidate']]
     chosen_pool = strongs if strongs else results
     chosen = sorted(chosen_pool, key=lambda x: x['score'], reverse=True)[0]
-    icon, label = strength_label(chosen['score'], chosen['strong_candidate'])
+    # message
     msg = (
-        f"{icon} *COIN SIGNAL* `{chosen['symbol']}`\n"
-        f"Strength: `{label}`\n"
+        f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
         f"Price: `{chosen['last_price']}`\n"
         f"24h Change: `{chosen['24h_change']}`%\n"
         f"5m Change: `{chosen['pct_5m']:.2f}`%\n"
@@ -332,13 +333,16 @@ def pick_coin():
         f"Score: `{chosen['score']:.2f}`"
     )
     send_telegram(msg)
+    # mark as recent buy-signal to avoid repeats
     RECENT_BUYS[chosen['symbol']] = {"ts": now}
     return chosen
 
 # -------------------------
-# Main loop / healthcheck
+# Main loop / web healthcheck
 # -------------------------
+from flask import Flask
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return "Signal bot running"
@@ -356,6 +360,8 @@ def trade_cycle():
         time.sleep(CYCLE_SECONDS)
 
 if __name__ == "__main__":
+    # start cycle thread
     t = threading.Thread(target=trade_cycle, daemon=True)
     t.start()
+    # run simple flask for healthcheck
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), threaded=True)
