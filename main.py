@@ -6,6 +6,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import statistics
 import shelve
+from flask import Flask
 
 # -------------------------
 # Config
@@ -33,26 +34,58 @@ MIN_1M_PCT = 0.3
 CACHE_TTL = 1.0               # seconds - cache public calls briefly
 MAX_WORKERS = 8
 RECENT_BUYS = {}
-BUY_LOCK_SECONDS = 300
+BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "900"))  # default 15 minutes
 
-REQUEST_TIMEOUT = 6
-REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=int(os.environ.get("PUBLIC_CONCURRENCY", 6)))
-RECENT_BUYS_LOCK = threading.Lock()
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "6"))
+PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "6"))
+
+# persistence file
 RECENT_BUYS_DB = os.path.join(os.getcwd(), "recent_buys.db")
 
-# load persisted recent buys (best-effort)
-try:
-    with shelve.open(RECENT_BUYS_DB) as _db:
-        RECENT_BUYS.update(_db.get("data", {}))
-except Exception:
-    pass
+# -------------------------
+# Locks / semaphores / cache
+# -------------------------
+REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
+RECENT_BUYS_LOCK = threading.Lock()
+_cache = {}
+_cache_lock = threading.Lock()
+
+def cache_get(key):
+    with _cache_lock:
+        v = _cache.get(key)
+        if not v:
+            return None
+        ts, val = v
+        if time.time() - ts > CACHE_TTL:
+            _cache.pop(key, None)
+            return None
+        return val
+
+def cache_set(key, val):
+    with _cache_lock:
+        _cache[key] = (time.time(), val)
+
+# -------------------------
+# Persist recent buys (shelve)
+# -------------------------
+def load_recent_buys():
+    try:
+        with shelve.open(RECENT_BUYS_DB) as db:
+            data = db.get("data", {})
+            if isinstance(data, dict):
+                RECENT_BUYS.update(data)
+    except Exception:
+        pass
 
 def persist_recent_buys():
     try:
-        with shelve.open(RECENT_BUYS_DB) as _db:
-            _db["data"] = RECENT_BUYS
+        with shelve.open(RECENT_BUYS_DB) as db:
+            db["data"] = RECENT_BUYS
     except Exception:
         pass
+
+# load at startup
+load_recent_buys()
 
 # -------------------------
 # Telegram helper
@@ -72,7 +105,7 @@ def send_telegram(message):
         return False
 
 # -------------------------
-# Utility math/indicators
+# Math / indicators
 # -------------------------
 def pct_change(open_p, close_p):
     try:
@@ -100,7 +133,6 @@ def compute_rsi_local(closes, period=14):
         diff = closes[i] - closes[i-1]
         gains.append(max(0.0, diff))
         losses.append(max(0.0, -diff))
-    # initial averages
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period if sum(losses[:period]) != 0 else 1e-9
     for i in range(period, len(gains)):
@@ -149,28 +181,7 @@ def orderbook_bullish(ob, depth=3, min_imbalance=1.2, max_spread_pct=1.0):
         return False
 
 # -------------------------
-# Simple short-lived cache for public endpoints
-# -------------------------
-_cache = {}
-_cache_lock = threading.Lock()
-
-def cache_get(key):
-    with _cache_lock:
-        v = _cache.get(key)
-        if not v:
-            return None
-        ts, val = v
-        if time.time() - ts > CACHE_TTL:
-            _cache.pop(key, None)
-            return None
-        return val
-
-def cache_set(key, val):
-    with _cache_lock:
-        _cache[key] = (time.time(), val)
-
-# -------------------------
-# Binance public calls (with semaphore + cache)
+# Binance public calls (cached + semaphore)
 # -------------------------
 def fetch_tickers():
     key = "tickers"
@@ -201,8 +212,7 @@ def fetch_klines(symbol, interval, limit):
         data = resp.json()
         cache_set(key, data)
         return data
-    except Exception as e:
-        # print("klines error", symbol, e)
+    except Exception:
         return []
 
 def fetch_order_book(symbol, limit=OB_DEPTH):
@@ -218,8 +228,7 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
         data = resp.json()
         cache_set(key, data)
         return data
-    except Exception as e:
-        # print("orderbook error", symbol, e)
+    except Exception:
         return {}
 
 # -------------------------
@@ -227,14 +236,12 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
 # -------------------------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
-        # quick checks
         if not (PRICE_MIN <= last_price <= PRICE_MAX):
             return None
         if qvol < MIN_VOLUME:
             return None
         if change_24h < 0.5 or change_24h > 20.0:
             return None
-        # fetch data in parallel inside this worker
         kl5 = fetch_klines(sym, "5m", KLINES_5M_LIMIT)
         kl1 = fetch_klines(sym, "1m", KLINES_1M_LIMIT)
         ob = fetch_order_book(sym, limit=OB_DEPTH)
@@ -248,7 +255,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
             return None
         vol_5m = compute_recent_volatility(closes_5m)
         vol_1m = compute_recent_volatility(closes_1m, lookback=3)
-        # EMA check over 5m closes
         short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
         long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
         ema_ok = False
@@ -260,7 +266,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         if rsi_val is not None and rsi_val > 70:
             return None
         ob_bull = orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT)
-        # Score
         score = 0.0
         score += max(0.0, pct_5m) * 4.0
         score += max(0.0, pct_1m) * 2.0
@@ -293,7 +298,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         return None
 
 # -------------------------
-# Main picker (improved atomic checks + persistence)
+# Main picker (atomic + persistence)
 # -------------------------
 def pick_coin():
     tickers = fetch_tickers()
@@ -315,7 +320,6 @@ def pick_coin():
             continue
         if ch < 0.5 or ch > 20.0:
             continue
-        # check under lock to avoid races inside same process
         with RECENT_BUYS_LOCK:
             last_buy = RECENT_BUYS.get(sym)
             if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
@@ -338,7 +342,6 @@ def pick_coin():
     chosen_pool = strongs if strongs else results
     chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
 
-    # prepare message
     msg = (
         f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
         f"Price: `{chosen['last_price']}`\n"
@@ -352,45 +355,32 @@ def pick_coin():
         f"Score: `{chosen['score']:.2f}`"
     )
 
-    # atomic reserve/check then send. This prevents duplicates inside this process.
     now_send = time.time()
     with RECENT_BUYS_LOCK:
         last_buy = RECENT_BUYS.get(chosen["symbol"])
         if last_buy and now_send < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
-            print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate (reserved): {chosen['symbol']} (last at {time.strftime('%H:%M:%S', time.localtime(last_buy.get('ts',0)))})")
+            print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate (reserved): {chosen['symbol']}")
             return None
-        # reserve tentatively
         RECENT_BUYS[chosen["symbol"]] = {"ts": now_send, "reserved": True}
-        try:
-            persist_recent_buys()
-        except Exception:
-            pass
+        persist_recent_buys()
 
     sent = send_telegram(msg)
     if sent:
         with RECENT_BUYS_LOCK:
             RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
-            try:
-                persist_recent_buys()
-            except Exception:
-                pass
+            persist_recent_buys()
         print(f"[{time.strftime('%H:%M:%S')}] Signal -> {chosen['symbol']} score={chosen['score']:.2f}")
         return chosen
     else:
-        # clear reservation on failure so next cycle can retry
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(chosen["symbol"], None)
-            try:
-                persist_recent_buys()
-            except Exception:
-                pass
+            persist_recent_buys()
         print(f"[{time.strftime('%H:%M:%S')}] Telegram send failed for {chosen['symbol']}")
         return None
 
 # -------------------------
 # Main loop / web healthcheck
 # -------------------------
-from flask import Flask
 app = Flask(__name__)
 
 @app.route("/")
