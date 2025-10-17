@@ -40,12 +40,12 @@ REQUEST_TIMEOUT = 6
 # Telegram helper
 # -------------------------
 def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not BOT_TOKEN or not CHAT_ID:
         print("Telegram not configured. Message:")
         print(message)
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         return r.status_code == 200
