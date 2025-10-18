@@ -165,20 +165,17 @@ def compute_recent_volatility(closes, lookback=5):
         vol = statistics.stdev(recent) if len(recent) > 1 else abs(recent[-1])
     return abs(min(vol, 5.0))
 
-def orderbook_bullish(ob, depth=10, min_imbalance=1.5, max_spread_pct=0.4, min_quote_depth=1000.0):
+def orderbook_bullish(ob, depth=3, min_imbalance=1.2, max_spread_pct=1.0):
     try:
         bids = ob.get('bids') or []
         asks = ob.get('asks') or []
-        if len(bids) < 1 or len(asks) < 1:
+        if not bids or not asks:
             return False
-        top_bid = float(bids[0][0]); top_ask = float(asks[0][0])
-        spread_pct = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
-        # use quote-value = price * qty
-        bid_quote = sum(float(b[0]) * float(b[1]) for b in bids[:depth]) + 1e-12
-        ask_quote = sum(float(a[0]) * float(a[1]) for a in asks[:depth]) + 1e-12
-        if bid_quote < min_quote_depth:
-            return False
-        imbalance = bid_quote / ask_quote
+        top_bid_p = float(bids[0][0]); top_ask_p = float(asks[0][0])
+        spread_pct = (top_ask_p - top_bid_p) / (top_bid_p + 1e-12) * 100.0
+        bid_sum = sum(float(b[1]) for b in bids[:depth]) + 1e-12
+        ask_sum = sum(float(a[1]) for a in asks[:depth]) + 1e-12
+        imbalance = bid_sum / ask_sum
         return (imbalance >= min_imbalance) and (spread_pct <= max_spread_pct)
     except Exception:
         return False
