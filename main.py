@@ -165,21 +165,24 @@ def compute_recent_volatility(closes, lookback=5):
         vol = statistics.stdev(recent) if len(recent) > 1 else abs(recent[-1])
     return abs(min(vol, 5.0))
 
-def orderbook_bullish(ob, depth=3, min_imbalance=1.2, max_spread_pct=1.0):
+def orderbook_bullish(ob, depth=10, min_imbalance=1.5, max_spread_pct=0.4, min_quote_depth=1000.0):
     try:
         bids = ob.get('bids') or []
         asks = ob.get('asks') or []
-        if not bids or not asks:
+        if len(bids) < 1 or len(asks) < 1:
             return False
-        top_bid_p = float(bids[0][0]); top_ask_p = float(asks[0][0])
-        spread_pct = (top_ask_p - top_bid_p) / (top_bid_p + 1e-12) * 100.0
-        bid_sum = sum(float(b[1]) for b in bids[:depth]) + 1e-12
-        ask_sum = sum(float(a[1]) for a in asks[:depth]) + 1e-12
-        imbalance = bid_sum / ask_sum
+        top_bid = float(bids[0][0]); top_ask = float(asks[0][0])
+        spread_pct = (top_ask - top_bid) / (top_bid + 1e-12) * 100.0
+        # use quote-value = price * qty
+        bid_quote = sum(float(b[0]) * float(b[1]) for b in bids[:depth]) + 1e-12
+        ask_quote = sum(float(a[0]) * float(a[1]) for a in asks[:depth]) + 1e-12
+        if bid_quote < min_quote_depth:
+            return False
+        imbalance = bid_quote / ask_quote
         return (imbalance >= min_imbalance) and (spread_pct <= max_spread_pct)
     except Exception:
         return False
-
+        
 # -------------------------
 # Binance public calls (cached + semaphore)
 # -------------------------
@@ -301,158 +304,83 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
 # Main picker (atomic + persistence)
 # -------------------------
 def pick_coin():
-    try:
-        tickers = fetch_tickers()
-        now = time.time()
-        pre = []
-        for t in tickers:
-            sym = t.get("symbol")
-            if not sym or not sym.endswith(QUOTE):
-                continue
-            try:
-                last = float(t.get("lastPrice") or 0.0)
-                qvol = float(t.get("quoteVolume") or 0.0)
-                ch = float(t.get("priceChangePercent") or 0.0)
-            except Exception:
-                continue
-            if not (PRICE_MIN <= last <= PRICE_MAX):
-                continue
-            if qvol < MIN_VOLUME:
-                continue
-            if ch < 0.5 or ch > 20.0:
-                continue
-            # quick atomic recent buy check
-            with RECENT_BUYS_LOCK:
-                last_buy = RECENT_BUYS.get(sym)
-                if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
-                    continue
-            pre.append((sym, last, qvol, ch))
-
-        if not pre:
-            return None
-
-        # top by 24h quote volume then evaluate in parallel
-        pre.sort(key=lambda x: x[2], reverse=True)
-        candidates = pre[:TOP_BY_24H_VOLUME]
-        results = []
-        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
-            futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
-            for fut in as_completed(futures):
-                try:
-                    res = fut.result()
-                    if res:
-                        results.append(res)
-                except Exception:
-                    pass
-
-        if not results:
-            return None
-
-        # prefer strong candidates, else highest score
-        strongs = [r for r in results if r.get("strong_candidate")]
-        chosen_pool = strongs if strongs else results
-        chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
-
-        # FINAL stricter verification to reduce false positives and duplicates
-        sym = chosen["symbol"]
-        # fetch fresh market data (public)
-        kl5 = fetch_klines(sym, "5m", KLINES_5M_LIMIT)
-        kl1 = fetch_klines(sym, "1m", KLINES_1M_LIMIT)
-        ob = fetch_order_book(sym, limit=OB_DEPTH)
-        reason = None
-        if not kl5 or len(kl5) < 4:
-            reason = "klines insufficient"
-        else:
-            closes_5m = [float(k[4]) for k in kl5]
-            closes_1m = [float(k[4]) for k in kl1] if kl1 and len(kl1) >= 2 else []
-            # breakout: current > recent highs * (1 + margin)
-            PREBUY_BREAKOUT_MARGIN = 0.008
-            recent_high = max(closes_5m[:-1]) if len(closes_5m) > 1 else closes_5m[-1]
-            if not (closes_5m[-1] > recent_high * (1.0 + PREBUY_BREAKOUT_MARGIN)):
-                reason = "no breakout"
-            # pct checks
-            pct_5m = pct_change(float(kl5[0][1]), closes_5m[-1])
-            pct_1m = pct_change(float(kl1[0][1]), closes_1m[-1]) if closes_1m else 0.0
-            if pct_5m < MIN_5M_PCT or pct_1m < MIN_1M_PCT:
-                reason = f"pct fail 5m={pct_5m:.2f} 1m={pct_1m:.2f}"
-            # EMA uplift
-            short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
-            long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
-            ema_uplift = 0.0
-            if short_ema and long_ema and long_ema != 0:
-                ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
-            MIN_FINAL_EMA_UPLIFT = 0.0005
-            if not (short_ema and long_ema and ema_uplift >= MIN_FINAL_EMA_UPLIFT and short_ema > long_ema * 1.0005):
-                reason = "ema fail"
-            # orderbook quick check
-            if not orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT):
-                reason = "orderbook weak"
-            # volatility guard (avoid insane spikes)
-            vol5 = compute_recent_volatility(closes_5m) or 0.0
-            if vol5 > 0.05:  # >5% step volatility is too noisy
-                reason = "volatility high"
-
-        if reason:
-            # mark short cooldown to avoid immediate re-eval
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS[sym] = {"ts": now, "reserved": False}
-                try:
-                    persist_recent_buys()
-                except Exception:
-                    pass
-            print(f"[{time.strftime('%H:%M:%S')}] Candidate {sym} rejected: {reason}")
-            return None
-
-        # prepare message with verification details
-        msg = (
-            f"🚀 *COIN SIGNAL*: `{sym}`\n"
-            f"Price: `{chosen['last_price']}`\n"
-            f"24h Change: `{chosen['24h_change']}`%\n"
-            f"5m Change: `{pct_5m:.2f}`%\n"
-            f"1m Change: `{pct_1m:.2f}`%\n"
-            f"Volatility 5m: `{vol5}`\n"
-            f"EMA Uplift: `{ema_uplift:.6f}`\n"
-            f"Orderbook Bullish: `{orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT)}`\n"
-            f"Score: `{chosen['score']:.2f}`"
-        )
-
-        # atomic reserve/persist, then send
-        now_send = time.time()
+    tickers = fetch_tickers()
+    now = time.time()
+    pre = []
+    for t in tickers:
+        sym = t.get("symbol")
+        if not sym or not sym.endswith(QUOTE):
+            continue
+        try:
+            last = float(t.get("lastPrice") or 0.0)
+            qvol = float(t.get("quoteVolume") or 0.0)
+            ch = float(t.get("priceChangePercent") or 0.0)
+        except Exception:
+            continue
+        if not (PRICE_MIN <= last <= PRICE_MAX):
+            continue
+        if qvol < MIN_VOLUME:
+            continue
+        if ch < 0.5 or ch > 20.0:
+            continue
         with RECENT_BUYS_LOCK:
             last_buy = RECENT_BUYS.get(sym)
-            if last_buy and now_send < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
-                print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate (reserved): {sym}")
-                return None
-            RECENT_BUYS[sym] = {"ts": now_send, "reserved": True}
-            try:
-                persist_recent_buys()
-            except Exception:
-                pass
-
-        sent = send_telegram(msg)
-        if sent:
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS[sym].update({"ts": time.time(), "reserved": False})
-                try:
-                    persist_recent_buys()
-                except Exception:
-                    pass
-            print(f"[{time.strftime('%H:%M:%S')}] Signal -> {sym} score={chosen['score']:.2f}")
-            return chosen
-        else:
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(sym, None)
-                try:
-                    persist_recent_buys()
-                except Exception:
-                    pass
-            print(f"[{time.strftime('%H:%M:%S')}] Telegram send failed for {sym}")
-            return None
-
-    except Exception as e:
-        print("pick_coin error", e)
+            if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
+                continue
+        pre.append((sym, last, qvol, ch))
+    if not pre:
         return None
-        
+    pre.sort(key=lambda x: x[2], reverse=True)
+    candidates = pre[:TOP_BY_24H_VOLUME]
+    results = []
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
+        futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res:
+                results.append(res)
+    if not results:
+        return None
+    strongs = [r for r in results if r["strong_candidate"]]
+    chosen_pool = strongs if strongs else results
+    chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
+
+    msg = (
+        f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
+        f"Price: `{chosen['last_price']}`\n"
+        f"24h Change: `{chosen['24h_change']}`%\n"
+        f"5m Change: `{chosen['pct_5m']:.2f}`%\n"
+        f"1m Change: `{chosen['pct_1m']:.2f}`%\n"
+        f"Volatility 5m: `{chosen['vol_5m']}`\n"
+        f"EMA OK: `{chosen['ema_ok']}` Uplift: `{chosen['ema_uplift']:.4f}`\n"
+        f"RSI: `{chosen['rsi']}`\n"
+        f"Orderbook Bullish: `{chosen['ob_bull']}`\n"
+        f"Score: `{chosen['score']:.2f}`"
+    )
+
+    now_send = time.time()
+    with RECENT_BUYS_LOCK:
+        last_buy = RECENT_BUYS.get(chosen["symbol"])
+        if last_buy and now_send < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
+            print(f"[{time.strftime('%H:%M:%S')}] Skipped duplicate (reserved): {chosen['symbol']}")
+            return None
+        RECENT_BUYS[chosen["symbol"]] = {"ts": now_send, "reserved": True}
+        persist_recent_buys()
+
+    sent = send_telegram(msg)
+    if sent:
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
+            persist_recent_buys()
+        print(f"[{time.strftime('%H:%M:%S')}] Signal -> {chosen['symbol']} score={chosen['score']:.2f}")
+        return chosen
+    else:
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS.pop(chosen["symbol"], None)
+            persist_recent_buys()
+        print(f"[{time.strftime('%H:%M:%S')}] Telegram send failed for {chosen['symbol']}")
+        return None
+
 # -------------------------
 # Main loop / web healthcheck
 # -------------------------
