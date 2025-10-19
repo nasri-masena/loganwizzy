@@ -30,23 +30,18 @@ MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "5"))
 
 BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
-PRICE_MIN = 0.8
-PRICE_MAX = 5.0
-MIN_VOLUME = 1_000_000
-TOP_BY_24H_VOLUME = 6
+PRICE_MIN = float(os.getenv("PRICE_MIN", "0.8"))
+PRICE_MAX = float(os.getenv("PRICE_MAX", "5.0"))
+MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(1_000_000)))
+TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "6"))
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "4"))
-KLINES_5M_LIMIT = 6
-KLINES_1M_LIMIT = 6
-EMA_SHORT = 3
-EMA_LONG = 10
-RSI_PERIOD = 14
-OB_DEPTH = 3
-MIN_OB_IMBALANCE = 1.2
-MAX_OB_SPREAD_PCT = 1.0
-MIN_5M_PCT = 0.6
-MIN_1M_PCT = 0.3
-CACHE_TTL = 1.0
-MAX_WORKERS = 8
+KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
+KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
+OB_DEPTH = int(os.getenv("OB_DEPTH", "3"))
+MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.2"))
+MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
+CACHE_TTL = float(os.getenv("CACHE_TTL", "1.0"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 RECENT_BUYS = {}
 BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "900"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "6"))
@@ -58,6 +53,7 @@ SHORT_BUY_SELL_DELAY = float(os.getenv("SHORT_BUY_SELL_DELAY", "0.3"))
 HOLD_THRESHOLD_HOURS = float(os.getenv("HOLD_THRESHOLD_HOURS", "4.0"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "60"))
 LIMIT_SELL_RETRIES = int(os.getenv("LIMIT_SELL_RETRIES", "3"))
+VOL_1M_THRESHOLD = float(os.getenv("VOL_1M_THRESHOLD", "0.005"))  # default 0.005
 
 # ---------- caches/locks ----------
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
@@ -128,33 +124,6 @@ def pct_change(open_p, close_p):
         return (close_p - open_p) / open_p * 100.0
     except Exception:
         return 0.0
-
-def ema_local(values, period):
-    if not values or period <= 0:
-        return None
-    alpha = 2.0 / (period + 1.0)
-    e = float(values[0])
-    for v in values[1:]:
-        e = alpha * float(v) + (1 - alpha) * e
-    return e
-
-def compute_rsi_local(closes, period=14):
-    if not closes or len(closes) < period + 1:
-        return None
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(0.0, diff))
-        losses.append(max(0.0, -diff))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period if sum(losses[:period]) != 0 else 1e-9
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
 
 def compute_recent_volatility(closes, lookback=5):
     if not closes or len(closes) < 2:
@@ -369,6 +338,22 @@ def has_stale_positions(threshold_hours=HOLD_THRESHOLD_HOURS):
                 return True
     return False
 
+# ---------- helpers for order monitoring ----------
+def wait_for_order_fill(client, symbol, order_id, timeout=10, poll=1.0):
+    if not client or not order_id:
+        return None
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            o = client.get_order(symbol=symbol, orderId=order_id)
+            status = (o.get("status") or "").upper()
+            if status in ("FILLED", "CANCELED", "REJECTED"):
+                return o
+        except Exception:
+            pass
+        time.sleep(poll)
+    return None
+
 # ---------- market buy helpers ----------
 def place_market_buy_by_quote(symbol, quote_qty):
     client = init_binance_client()
@@ -377,7 +362,7 @@ def place_market_buy_by_quote(symbol, quote_qty):
     try:
         order = client.order_market_buy(symbol=symbol, quoteOrderQty=str(quote_qty))
         return order
-    except BinanceAPIException as e:
+    except BinanceAPIException:
         # fallback compute qty
         book = fetch_order_book(symbol, limit=5)
         if not book:
@@ -473,7 +458,7 @@ def place_market_sell_fallback(symbol, qty, f=None):
         return None
 
 # ---------- place_limit_sell_strict (retries reduced) ----------
-def place_limit_sell_strict(symbol, qty, sell_price, retries=3, delay=0.8):
+def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
     if retries is None:
         retries = LIMIT_SELL_RETRIES
     try:
@@ -672,14 +657,8 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=3, delay=0.8):
         notify(f"⚠️ place_limit_sell_strict unexpected error for {symbol}: {e}")
         return None
 
-# ---------- evaluate_symbol (fast/tight filters per request) ----------
+# ---------- evaluate_symbol (fast/tight filters) ----------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
-    """
-    - 1m change >= 1.0%
-    - volatility (1m lookback) >= 0.0005
-    - orderbook bullish required
-    - score >= 30
-    """
     try:
         if not (PRICE_MIN <= last_price <= PRICE_MAX):
             return None
@@ -698,7 +677,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
             return None
 
         vol_1m = compute_recent_volatility(closes_1m, lookback=3)
-        if vol_1m is None or vol_1m < 0.004:
+        if vol_1m is None or vol_1m < VOL_1M_THRESHOLD:
             return None
 
         ob = fetch_order_book(sym, limit=OB_DEPTH)
@@ -717,7 +696,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
 
         score = 0.0
         score += max(0.0, pct_1m) * 20.0
-        score += max(0.0, (vol_1m - 0.004)) * 10000.0
+        score += max(0.0, (vol_1m - VOL_1M_THRESHOLD)) * 10000.0
         if pct_5m is not None and pct_5m > 0:
             score += pct_5m * 5.0
         if change_24h and change_24h > 0:
@@ -745,7 +724,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
     except Exception:
         return None
 
-# ---------- execute_trade (stores qty & ts immediately; processing flag to avoid races) ----------
+# ---------- execute_trade (stores qty & ts immediately; processing flag) ----------
 def execute_trade(chosen):
     symbol = chosen["symbol"]
     now = time.time()
@@ -798,16 +777,82 @@ def execute_trade(chosen):
         sell_price = avg_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
         sell_resp = place_limit_sell_strict(symbol, executed_qty, sell_price)
         if sell_resp:
+            # extract order id safely
+            sell_order_id = None
+            try:
+                if isinstance(sell_resp, dict):
+                    sell_order_id = sell_resp.get("orderId") or sell_resp.get("order_id") or sell_resp.get("clientOrderId") or sell_resp.get("orderId")
+                else:
+                    # python-binance may return object-like; attempt attribute access
+                    sell_order_id = getattr(sell_resp, "orderId", None) or getattr(sell_resp, "order_id", None) or getattr(sell_resp, "clientOrderId", None)
+            except Exception:
+                sell_order_id = None
+
             with RECENT_BUYS_LOCK:
-                RECENT_BUYS[symbol].update({"sell_price": sell_price, "sell_resp": sell_resp, "sell_ts": time.time(), "closed": False})
+                RECENT_BUYS[symbol].update({
+                    "sell_price": sell_price,
+                    "sell_resp": sell_resp,
+                    "sell_order_id": sell_order_id,
+                    "sell_ts": time.time(),
+                    "closed": False,
+                    "processing": False,
+                })
                 persist_recent_buys()
+
             send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
+
+            # short blocking poll to catch immediate fills
+            try:
+                if sell_order_id:
+                    filled_order = wait_for_order_fill(client, symbol, sell_order_id, timeout=8, poll=1.0)
+                    if filled_order:
+                        st = (filled_order.get("status") or "").upper()
+                        if st == "FILLED":
+                            # compute filled qty & avg price
+                            filled_qty = 0.0
+                            avg_price_fill = 0.0
+                            try:
+                                fills = filled_order.get("fills") or []
+                                if fills:
+                                    tq = 0.0; tq_quote = 0.0
+                                    for f in fills:
+                                        q = float(f.get("qty", 0)); p = float(f.get("price", 0))
+                                        tq += q; tq_quote += q * p
+                                    filled_qty = tq
+                                    avg_price_fill = (tq_quote / tq) if tq else 0.0
+                                else:
+                                    filled_qty = float(filled_order.get("executedQty") or 0.0)
+                                    cquote = float(filled_order.get("cummulativeQuoteQty") or 0.0)
+                                    avg_price_fill = (cquote / filled_qty) if filled_qty else 0.0
+                            except Exception:
+                                filled_qty = executed_qty
+                                avg_price_fill = sell_price
+
+                            with RECENT_BUYS_LOCK:
+                                if symbol in RECENT_BUYS:
+                                    RECENT_BUYS[symbol].update({
+                                        "closed": True,
+                                        "closed_ts": time.time(),
+                                        "close_method": "limit_filled_immediate",
+                                        "close_resp": filled_order,
+                                        "sell_fill_qty": filled_qty,
+                                        "sell_fill_price": avg_price_fill,
+                                    })
+                                    persist_recent_buys()
+                            notify(f"✅ POSITION CLOSED: `{symbol}` sold {filled_qty} @ {avg_price_fill} (limit immediate)")
+            except Exception:
+                pass
+
             return True
         else:
             notify(f"⚠️ limit sell placement failed for {symbol}, attempting market sell fallback.")
-            place_market_sell_fallback(symbol, executed_qty, None)
+            fallback = place_market_sell_fallback(symbol, executed_qty, None)
             with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(symbol, None)
+                # if fallback succeeded mark closed, else remove to avoid blocking
+                if fallback:
+                    RECENT_BUYS[symbol].update({"closed": True, "closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
+                else:
+                    RECENT_BUYS.pop(symbol, None)
                 persist_recent_buys()
             return False
     except BinanceAPIException as e:
@@ -927,7 +972,6 @@ def monitor_positions():
                     if qty <= 0 or processing:
                         continue
                     if now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
-                        # mark processing to avoid concurrent monitor actions
                         RECENT_BUYS[sym]["processing"] = True
                         persist_recent_buys()
                         to_process.append((sym, pos))
@@ -951,6 +995,76 @@ def monitor_positions():
         except Exception:
             time.sleep(MONITOR_INTERVAL)
 
+# ---------- watch_orders: background poller for limit fills ----------
+def watch_orders(poll_interval=12):
+    client = None
+    while True:
+        try:
+            if client is None:
+                client = init_binance_client()
+            with RECENT_BUYS_LOCK:
+                candidates = [(sym, dict(pos)) for sym, pos in RECENT_BUYS.items() if not pos.get("closed") and pos.get("sell_order_id")]
+            for sym, pos in candidates:
+                order_id = pos.get("sell_order_id")
+                if not order_id:
+                    continue
+                try:
+                    o = None
+                    try:
+                        o = client.get_order(symbol=sym, orderId=order_id)
+                    except Exception:
+                        try:
+                            o = client.get_order(symbol=sym, origClientOrderId=str(order_id))
+                        except Exception:
+                            o = None
+                    if not o:
+                        continue
+                    status = (o.get("status") or "").upper()
+                    if status == "FILLED":
+                        filled_qty = 0.0; avg_price = 0.0
+                        try:
+                            fills = o.get("fills") or []
+                            if fills:
+                                tq = 0.0; tq_quote = 0.0
+                                for f in fills:
+                                    q = float(f.get("qty", 0)); p = float(f.get("price", 0))
+                                    tq += q; tq_quote += q * p
+                                filled_qty = tq
+                                avg_price = (tq_quote / tq) if tq else 0.0
+                            else:
+                                filled_qty = float(o.get("executedQty") or 0.0)
+                                cquote = float(o.get("cummulativeQuoteQty") or 0.0)
+                                avg_price = (cquote / filled_qty) if filled_qty else 0.0
+                        except Exception:
+                            filled_qty = pos.get("qty") or 0.0
+                            avg_price = pos.get("sell_price") or 0.0
+
+                        with RECENT_BUYS_LOCK:
+                            if sym in RECENT_BUYS and not RECENT_BUYS[sym].get("closed"):
+                                RECENT_BUYS[sym].update({
+                                    "closed": True,
+                                    "closed_ts": time.time(),
+                                    "close_method": "limit_filled",
+                                    "close_resp": o,
+                                    "sell_fill_qty": filled_qty,
+                                    "sell_fill_price": avg_price,
+                                })
+                                persist_recent_buys()
+                        notify(f"✅ POSITION CLOSED: `{sym}` sold {filled_qty} @ {avg_price} (limit)")
+                    elif status in ("CANCELED", "REJECTED"):
+                        with RECENT_BUYS_LOCK:
+                            if sym in RECENT_BUYS:
+                                RECENT_BUYS[sym].update({"sell_status": status, "sell_resp": o})
+                                persist_recent_buys()
+                        notify(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
+                except Exception as e:
+                    print("watch_orders error for", sym, e)
+                time.sleep(0.4)
+            time.sleep(poll_interval)
+        except Exception as e:
+            print("watch_orders loop error", e)
+            time.sleep(max(5, poll_interval))
+
 # ---------- main loop / web ----------
 app = Flask(__name__)
 
@@ -971,8 +1085,8 @@ def trade_cycle():
         time.sleep(CYCLE_SECONDS)
 
 if __name__ == "__main__":
-    tmon = threading.Thread(target=monitor_positions, daemon=True)
-    tmon.start()
-    t = threading.Thread(target=trade_cycle, daemon=True)
-    t.start()
+    # start background services
+    tmon = threading.Thread(target=monitor_positions, daemon=True); tmon.start()
+    twatch = threading.Thread(target=watch_orders, daemon=True); twatch.start()
+    t = threading.Thread(target=trade_cycle, daemon=True); t.start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), threaded=True)
