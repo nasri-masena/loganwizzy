@@ -698,7 +698,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
             return None
 
         vol_1m = compute_recent_volatility(closes_1m, lookback=3)
-        if vol_1m is None or vol_1m < 0.0005:
+        if vol_1m is None or vol_1m < 0.004:
             return None
 
         ob = fetch_order_book(sym, limit=OB_DEPTH)
@@ -717,7 +717,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
 
         score = 0.0
         score += max(0.0, pct_1m) * 20.0
-        score += max(0.0, (vol_1m - 0.0005)) * 10000.0
+        score += max(0.0, (vol_1m - 0.004)) * 10000.0
         if pct_5m is not None and pct_5m > 0:
             score += pct_5m * 5.0
         if change_24h and change_24h > 0:
