@@ -4,7 +4,6 @@ import math
 import threading
 import requests
 import statistics
-import shelve
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask
 
@@ -23,7 +22,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "True").lower() in ("1", "true", "yes")
 BUY_USDT_AMOUNT = float(os.getenv("BUY_USDT_AMOUNT", "11.0"))
-LIMIT_PROFIT_PCT = float(os.getenv("LIMIT_PROFIT_PCT", "1.1"))
+LIMIT_PROFIT_PCT = float(os.getenv("LIMIT_PROFIT_PCT", "1.2"))
 BUY_BY_QUOTE = os.getenv("BUY_BY_QUOTE", "True").lower() in ("1", "true", "yes")
 BUY_BASE_QTY = float(os.getenv("BUY_BASE_QTY", "0.0"))
 MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "5"))
@@ -42,11 +41,10 @@ MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.2"))
 MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
 CACHE_TTL = float(os.getenv("CACHE_TTL", "1.0"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
-RECENT_BUYS = {}
+RECENT_BUYS = {}  # No shelve, just in-memory
 BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "900"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "6"))
 PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "6"))
-RECENT_BUYS_DB = os.path.join(os.getcwd(), "recent_buys.db")
 
 # new settings
 SHORT_BUY_SELL_DELAY = float(os.getenv("SHORT_BUY_SELL_DELAY", "0.3"))
@@ -80,24 +78,6 @@ def cache_get(key):
 def cache_set(key, val):
     with _cache_lock:
         _cache[key] = (time.time(), val)
-
-def load_recent_buys():
-    try:
-        with shelve.open(RECENT_BUYS_DB) as db:
-            data = db.get("data", {})
-            if isinstance(data, dict):
-                RECENT_BUYS.update(data)
-    except Exception:
-        pass
-
-def persist_recent_buys():
-    try:
-        with shelve.open(RECENT_BUYS_DB) as db:
-            db["data"] = RECENT_BUYS
-    except Exception:
-        pass
-
-load_recent_buys()
 
 # ---------- telegram ----------
 def send_telegram(message):
@@ -733,14 +713,12 @@ def execute_trade(chosen):
             send_telegram(f"⚠️ Max concurrent positions reached. Skipping {symbol}")
             return False
         RECENT_BUYS[symbol] = {"ts": now, "reserved": False, "closed": False, "processing": True}
-        persist_recent_buys()
 
     client = init_binance_client()
     if not client:
         send_telegram(f"⚠️ Trading disabled or client missing. Skipping live trade for {symbol}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            persist_recent_buys()
         return False
 
     try:
@@ -752,7 +730,6 @@ def execute_trade(chosen):
             send_telegram("⚠️ Buy amount not configured. Skipping trade.")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
-                persist_recent_buys()
             return False
 
         executed_qty, avg_price = parse_market_fill(order)
@@ -760,13 +737,11 @@ def execute_trade(chosen):
             send_telegram(f"⚠️ Buy executed but no fill qty for {symbol}. Raw: {order}")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
-                persist_recent_buys()
             return False
 
         # record qty & buy price immediately so monitor can act if needed
         with RECENT_BUYS_LOCK:
             RECENT_BUYS[symbol].update({"qty": executed_qty, "buy_price": avg_price, "ts": now, "processing": False})
-            persist_recent_buys()
 
         send_telegram(f"✅ BUY EXECUTED: `{symbol}` Qty:`{executed_qty}` @ `{avg_price}` Spent:`{round(executed_qty*avg_price,6)}`")
 
@@ -783,7 +758,6 @@ def execute_trade(chosen):
                 if isinstance(sell_resp, dict):
                     sell_order_id = sell_resp.get("orderId") or sell_resp.get("order_id") or sell_resp.get("clientOrderId") or sell_resp.get("orderId")
                 else:
-                    # python-binance may return object-like; attempt attribute access
                     sell_order_id = getattr(sell_resp, "orderId", None) or getattr(sell_resp, "order_id", None) or getattr(sell_resp, "clientOrderId", None)
             except Exception:
                 sell_order_id = None
@@ -797,7 +771,6 @@ def execute_trade(chosen):
                     "closed": False,
                     "processing": False,
                 })
-                persist_recent_buys()
 
             send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
 
@@ -808,7 +781,6 @@ def execute_trade(chosen):
                     if filled_order:
                         st = (filled_order.get("status") or "").upper()
                         if st == "FILLED":
-                            # compute filled qty & avg price
                             filled_qty = 0.0
                             avg_price_fill = 0.0
                             try:
@@ -838,7 +810,6 @@ def execute_trade(chosen):
                                         "sell_fill_qty": filled_qty,
                                         "sell_fill_price": avg_price_fill,
                                     })
-                                    persist_recent_buys()
                             notify(f"✅ POSITION CLOSED: `{symbol}` sold {filled_qty} @ {avg_price_fill} (limit immediate)")
             except Exception:
                 pass
@@ -848,24 +819,20 @@ def execute_trade(chosen):
             notify(f"⚠️ limit sell placement failed for {symbol}, attempting market sell fallback.")
             fallback = place_market_sell_fallback(symbol, executed_qty, None)
             with RECENT_BUYS_LOCK:
-                # if fallback succeeded mark closed, else remove to avoid blocking
                 if fallback:
                     RECENT_BUYS[symbol].update({"closed": True, "closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
                 else:
                     RECENT_BUYS.pop(symbol, None)
-                persist_recent_buys()
             return False
     except BinanceAPIException as e:
         send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            persist_recent_buys()
         return False
     except Exception as e:
         send_telegram(f"‼️ Unexpected error during trade {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            persist_recent_buys()
         return False
 
 # ---------- pick_coin (skip symbols with active open position) ----------
@@ -889,13 +856,7 @@ def pick_coin():
             continue
         if ch < 0.5 or ch > 20.0:
             continue
-        with RECENT_BUYS_LOCK:
-            last_buy = RECENT_BUYS.get(sym)
-            # skip any symbol that has an active (not closed) position
-            if last_buy and not last_buy.get("closed"):
-                continue
-            if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
-                continue
+        # HAPA TUMEONDOA LOCKS ZA RECENT_BUYS NA BUY_LOCK_SECONDS
         pre.append((sym, last, qvol, ch))
     if not pre:
         return None
@@ -928,23 +889,10 @@ def pick_coin():
     )
 
     with RECENT_BUYS_LOCK:
-        last_buy = RECENT_BUYS.get(chosen["symbol"])
-        if last_buy and not last_buy.get("closed"):
-            return None
-        if last_buy and time.time() < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
-            return None
-        # enforce MAX_CONCURRENT_POS
-        if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
-            notify(f"⚠️ Max concurrent positions active ({MAX_CONCURRENT_POS}). Skipping new buy.")
-            return None
-        RECENT_BUYS[chosen["symbol"]] = {"ts": time.time(), "reserved": True, "closed": False, "processing": False}
-        persist_recent_buys()
+        RECENT_BUYS[chosen["symbol"]] = {"ts": time.time(), "reserved": False, "closed": False, "processing": False}
 
     sent = send_telegram(msg)
     if sent:
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
-            persist_recent_buys()
         if ENABLE_TRADING:
             t = threading.Thread(target=execute_trade, args=(chosen,), daemon=True)
             t.start()
@@ -952,7 +900,6 @@ def pick_coin():
     else:
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(chosen["symbol"], None)
-            persist_recent_buys()
         return None
 
 # ---------- monitor_positions: auto market-sell positions older than threshold ----------
@@ -968,12 +915,10 @@ def monitor_positions():
                     ts = pos.get("ts", 0)
                     qty = pos.get("qty") or 0.0
                     processing = pos.get("processing", False)
-                    # skip if no qty known or already being processed
                     if qty <= 0 or processing:
                         continue
                     if now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
                         RECENT_BUYS[sym]["processing"] = True
-                        persist_recent_buys()
                         to_process.append((sym, pos))
             for sym, pos in to_process:
                 notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — executing market sell fallback to close position.")
@@ -983,13 +928,11 @@ def monitor_positions():
                     with RECENT_BUYS_LOCK:
                         if sym in RECENT_BUYS:
                             RECENT_BUYS[sym].update({"closed": True, "closed_ts": time.time(), "close_method": "market_fallback", "close_resp": resp, "processing": False})
-                            persist_recent_buys()
                     notify(f"ℹ️ Position {sym} force-sold by monitor.")
                 except Exception as e:
                     with RECENT_BUYS_LOCK:
                         if sym in RECENT_BUYS:
                             RECENT_BUYS[sym].update({"processing": False})
-                            persist_recent_buys()
                     notify(f"⚠️ Monitor failed to market-sell {sym}: {e}")
             time.sleep(MONITOR_INTERVAL)
         except Exception:
@@ -1049,13 +992,11 @@ def watch_orders(poll_interval=12):
                                     "sell_fill_qty": filled_qty,
                                     "sell_fill_price": avg_price,
                                 })
-                                persist_recent_buys()
                         notify(f"✅ POSITION CLOSED: `{sym}` sold {filled_qty} @ {avg_price} (limit)")
                     elif status in ("CANCELED", "REJECTED"):
                         with RECENT_BUYS_LOCK:
                             if sym in RECENT_BUYS:
                                 RECENT_BUYS[sym].update({"sell_status": status, "sell_resp": o})
-                                persist_recent_buys()
                         notify(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
                 except Exception as e:
                     print("watch_orders error for", sym, e)
@@ -1085,7 +1026,6 @@ def trade_cycle():
         time.sleep(CYCLE_SECONDS)
 
 if __name__ == "__main__":
-    # start background services
     tmon = threading.Thread(target=monitor_positions, daemon=True); tmon.start()
     twatch = threading.Thread(target=watch_orders, daemon=True); twatch.start()
     t = threading.Thread(target=trade_cycle, daemon=True); t.start()
