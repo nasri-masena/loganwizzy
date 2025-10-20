@@ -22,7 +22,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "True").lower() in ("1", "true", "yes")
-BUY_USDT_AMOUNT = float(os.getenv("BUY_USDT_AMOUNT", "11.0"))
+BUY_USDT_AMOUNT = float(os.getenv("BUY_USDT_AMOUNT", "11.30"))
 LIMIT_PROFIT_PCT = float(os.getenv("LIMIT_PROFIT_PCT", "1.2"))
 BUY_BY_QUOTE = os.getenv("BUY_BY_QUOTE", "True").lower() in ("1", "true", "yes")
 BUY_BASE_QTY = float(os.getenv("BUY_BASE_QTY", "0.0"))
@@ -30,7 +30,7 @@ MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "5"))
 
 BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
-PRICE_MIN = float(os.getenv("PRICE_MIN", "0.5"))
+PRICE_MIN = float(os.getenv("PRICE_MIN", "0.6"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "5.0"))
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(800_000)))
 TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "24"))
