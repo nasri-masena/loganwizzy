@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: crypto-signal-bot
+    env: python
+    plan: free
+    instanceCount: 1
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python3 main.py"
+    healthCheckPath: "/"
+    autoDeploy: true
