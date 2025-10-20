@@ -22,7 +22,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "True").lower() in ("1", "true", "yes")
-BUY_USDT_AMOUNT = float(os.getenv("BUY_USDT_AMOUNT", "10.0"))
+BUY_USDT_AMOUNT = float(os.getenv("BUY_USDT_AMOUNT", "11.0"))
 LIMIT_PROFIT_PCT = float(os.getenv("LIMIT_PROFIT_PCT", "1.0"))
 BUY_BY_QUOTE = os.getenv("BUY_BY_QUOTE", "True").lower() in ("1", "true", "yes")
 BUY_BASE_QTY = float(os.getenv("BUY_BASE_QTY", "0.0"))
@@ -55,15 +55,6 @@ MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "60"))
 LIMIT_SELL_RETRIES = int(os.getenv("LIMIT_SELL_RETRIES", "3"))
 VOL_1M_THRESHOLD = float(os.getenv("VOL_1M_THRESHOLD", "0.005"))  # default 0.005
 
-# persistence control
-USE_SHELVE = os.getenv("USE_SHELVE", "True").lower() in ("1", "true", "yes")
-REMOVE_AFTER_CLOSE = os.getenv("REMOVE_AFTER_CLOSE", "True").lower() in ("1", "true", "yes")
-
-# backoff for insufficient balance
-INSUFFICIENT_BALANCE_COUNT = 0
-INSUFFICIENT_BALANCE_PAUSE = int(os.getenv("INSUFFICIENT_BALANCE_PAUSE", "60"))
-INSUFFICIENT_BALANCE_UNTIL = 0
-
 # ---------- caches/locks ----------
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
 RECENT_BUYS_LOCK = threading.Lock()
@@ -91,8 +82,6 @@ def cache_set(key, val):
         _cache[key] = (time.time(), val)
 
 def load_recent_buys():
-    if not USE_SHELVE:
-        return
     try:
         with shelve.open(RECENT_BUYS_DB) as db:
             data = db.get("data", {})
@@ -102,8 +91,6 @@ def load_recent_buys():
         pass
 
 def persist_recent_buys():
-    if not USE_SHELVE:
-        return
     try:
         with shelve.open(RECENT_BUYS_DB) as db:
             db["data"] = RECENT_BUYS
@@ -115,6 +102,7 @@ load_recent_buys()
 # ---------- telegram ----------
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram not configured. Message:")
         print(message)
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -365,24 +353,6 @@ def wait_for_order_fill(client, symbol, order_id, timeout=10, poll=1.0):
             pass
         time.sleep(poll)
     return None
-
-# ---------- finalize close helper ----------
-def finalize_close(symbol, update_fields=None):
-    """
-    When a position is closed we either remove or update the RECENT_BUYS entry
-    depending on REMOVE_AFTER_CLOSE. Persist is conditional on USE_SHELVE.
-    """
-    with RECENT_BUYS_LOCK:
-        if symbol not in RECENT_BUYS:
-            return
-        if REMOVE_AFTER_CLOSE:
-            RECENT_BUYS.pop(symbol, None)
-        else:
-            if update_fields:
-                RECENT_BUYS[symbol].update(update_fields)
-            RECENT_BUYS[symbol]["closed"] = True
-        if USE_SHELVE:
-            persist_recent_buys()
 
 # ---------- market buy helpers ----------
 def place_market_buy_by_quote(symbol, quote_qty):
@@ -756,7 +726,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
 
 # ---------- execute_trade (stores qty & ts immediately; processing flag) ----------
 def execute_trade(chosen):
-    global INSUFFICIENT_BALANCE_COUNT, INSUFFICIENT_BALANCE_UNTIL
     symbol = chosen["symbol"]
     now = time.time()
     with RECENT_BUYS_LOCK:
@@ -764,27 +733,14 @@ def execute_trade(chosen):
             send_telegram(f"⚠️ Max concurrent positions reached. Skipping {symbol}")
             return False
         RECENT_BUYS[symbol] = {"ts": now, "reserved": False, "closed": False, "processing": True}
-        if USE_SHELVE:
-            persist_recent_buys()
+        persist_recent_buys()
 
     client = init_binance_client()
     if not client:
         send_telegram(f"⚠️ Trading disabled or client missing. Skipping live trade for {symbol}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            if USE_SHELVE:
-                persist_recent_buys()
-        return False
-
-    # ensure free quote available before buy
-    free_quote = get_free_asset(QUOTE)
-    buffer = max(0.5, BUY_USDT_AMOUNT * 0.02)
-    if free_quote + 1e-12 < (BUY_USDT_AMOUNT + buffer):
-        send_telegram(f"⚠️ Skipping buy {symbol}: insufficient free {QUOTE} (need ~{BUY_USDT_AMOUNT+buffer:.4f}, free={free_quote:.6f})")
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-            if USE_SHELVE:
-                persist_recent_buys()
+            persist_recent_buys()
         return False
 
     try:
@@ -796,8 +752,7 @@ def execute_trade(chosen):
             send_telegram("⚠️ Buy amount not configured. Skipping trade.")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
-                if USE_SHELVE:
-                    persist_recent_buys()
+                persist_recent_buys()
             return False
 
         executed_qty, avg_price = parse_market_fill(order)
@@ -805,15 +760,13 @@ def execute_trade(chosen):
             send_telegram(f"⚠️ Buy executed but no fill qty for {symbol}. Raw: {order}")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
-                if USE_SHELVE:
-                    persist_recent_buys()
+                persist_recent_buys()
             return False
 
         # record qty & buy price immediately so monitor can act if needed
         with RECENT_BUYS_LOCK:
             RECENT_BUYS[symbol].update({"qty": executed_qty, "buy_price": avg_price, "ts": now, "processing": False})
-            if USE_SHELVE:
-                persist_recent_buys()
+            persist_recent_buys()
 
         send_telegram(f"✅ BUY EXECUTED: `{symbol}` Qty:`{executed_qty}` @ `{avg_price}` Spent:`{round(executed_qty*avg_price,6)}`")
 
@@ -828,8 +781,9 @@ def execute_trade(chosen):
             sell_order_id = None
             try:
                 if isinstance(sell_resp, dict):
-                    sell_order_id = sell_resp.get("orderId") or sell_resp.get("order_id") or sell_resp.get("clientOrderId")
+                    sell_order_id = sell_resp.get("orderId") or sell_resp.get("order_id") or sell_resp.get("clientOrderId") or sell_resp.get("orderId")
                 else:
+                    # python-binance may return object-like; attempt attribute access
                     sell_order_id = getattr(sell_resp, "orderId", None) or getattr(sell_resp, "order_id", None) or getattr(sell_resp, "clientOrderId", None)
             except Exception:
                 sell_order_id = None
@@ -843,8 +797,7 @@ def execute_trade(chosen):
                     "closed": False,
                     "processing": False,
                 })
-                if USE_SHELVE:
-                    persist_recent_buys()
+                persist_recent_buys()
 
             send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
 
@@ -875,15 +828,18 @@ def execute_trade(chosen):
                                 filled_qty = executed_qty
                                 avg_price_fill = sell_price
 
-                            # notify then finalize (remove/update entry)
+                            with RECENT_BUYS_LOCK:
+                                if symbol in RECENT_BUYS:
+                                    RECENT_BUYS[symbol].update({
+                                        "closed": True,
+                                        "closed_ts": time.time(),
+                                        "close_method": "limit_filled_immediate",
+                                        "close_resp": filled_order,
+                                        "sell_fill_qty": filled_qty,
+                                        "sell_fill_price": avg_price_fill,
+                                    })
+                                    persist_recent_buys()
                             notify(f"✅ POSITION CLOSED: `{symbol}` sold {filled_qty} @ {avg_price_fill} (limit immediate)")
-                            finalize_close(symbol, {
-                                "closed_ts": time.time(),
-                                "close_method": "limit_filled_immediate",
-                                "close_resp": filled_order,
-                                "sell_fill_qty": filled_qty,
-                                "sell_fill_price": avg_price_fill,
-                            })
             except Exception:
                 pass
 
@@ -891,42 +847,29 @@ def execute_trade(chosen):
         else:
             notify(f"⚠️ limit sell placement failed for {symbol}, attempting market sell fallback.")
             fallback = place_market_sell_fallback(symbol, executed_qty, None)
-            if fallback:
-                notify(f"✅ Market fallback sold {symbol}.")
-                finalize_close(symbol, {"closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
-            else:
-                # removal to avoid blocking buys if fallback also failed
-                with RECENT_BUYS_LOCK:
+            with RECENT_BUYS_LOCK:
+                # if fallback succeeded mark closed, else remove to avoid blocking
+                if fallback:
+                    RECENT_BUYS[symbol].update({"closed": True, "closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
+                else:
                     RECENT_BUYS.pop(symbol, None)
-                    if USE_SHELVE:
-                        persist_recent_buys()
+                persist_recent_buys()
             return False
     except BinanceAPIException as e:
-        err = str(e)
-        if '-2010' in err:
-            INSUFFICIENT_BALANCE_COUNT += 1
-            INSUFFICIENT_BALANCE_UNTIL = time.time() + INSUFFICIENT_BALANCE_PAUSE
-            send_telegram(f"‼️ Binance API insufficient balance during buy {symbol}. Pausing buys for {INSUFFICIENT_BALANCE_PAUSE}s.")
         send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            if USE_SHELVE:
-                persist_recent_buys()
+            persist_recent_buys()
         return False
     except Exception as e:
         send_telegram(f"‼️ Unexpected error during trade {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            if USE_SHELVE:
-                persist_recent_buys()
+            persist_recent_buys()
         return False
 
 # ---------- pick_coin (skip symbols with active open position) ----------
 def pick_coin():
-    # respect global insufficient-balance pause
-    if time.time() < INSUFFICIENT_BALANCE_UNTIL:
-        return None
-
     tickers = fetch_tickers()
     now = time.time()
     pre = []
@@ -995,15 +938,13 @@ def pick_coin():
             notify(f"⚠️ Max concurrent positions active ({MAX_CONCURRENT_POS}). Skipping new buy.")
             return None
         RECENT_BUYS[chosen["symbol"]] = {"ts": time.time(), "reserved": True, "closed": False, "processing": False}
-        if USE_SHELVE:
-            persist_recent_buys()
+        persist_recent_buys()
 
     sent = send_telegram(msg)
     if sent:
         with RECENT_BUYS_LOCK:
             RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
-            if USE_SHELVE:
-                persist_recent_buys()
+            persist_recent_buys()
         if ENABLE_TRADING:
             t = threading.Thread(target=execute_trade, args=(chosen,), daemon=True)
             t.start()
@@ -1011,8 +952,7 @@ def pick_coin():
     else:
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(chosen["symbol"], None)
-            if USE_SHELVE:
-                persist_recent_buys()
+            persist_recent_buys()
         return None
 
 # ---------- monitor_positions: auto market-sell positions older than threshold ----------
@@ -1033,30 +973,23 @@ def monitor_positions():
                         continue
                     if now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
                         RECENT_BUYS[sym]["processing"] = True
-                        if USE_SHELVE:
-                            persist_recent_buys()
+                        persist_recent_buys()
                         to_process.append((sym, pos))
             for sym, pos in to_process:
                 notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — executing market sell fallback to close position.")
                 try:
                     qty = pos.get("qty")
                     resp = place_market_sell_fallback(sym, qty, None)
-                    if resp:
-                        notify(f"ℹ️ Position {sym} force-sold by monitor.")
-                        finalize_close(sym, {"closed_ts": time.time(), "close_method": "market_fallback", "close_resp": resp})
-                    else:
-                        # if fallback failed unmark processing to allow future attempts
-                        with RECENT_BUYS_LOCK:
-                            if sym in RECENT_BUYS:
-                                RECENT_BUYS[sym].update({"processing": False})
-                                if USE_SHELVE:
-                                    persist_recent_buys()
+                    with RECENT_BUYS_LOCK:
+                        if sym in RECENT_BUYS:
+                            RECENT_BUYS[sym].update({"closed": True, "closed_ts": time.time(), "close_method": "market_fallback", "close_resp": resp, "processing": False})
+                            persist_recent_buys()
+                    notify(f"ℹ️ Position {sym} force-sold by monitor.")
                 except Exception as e:
                     with RECENT_BUYS_LOCK:
                         if sym in RECENT_BUYS:
                             RECENT_BUYS[sym].update({"processing": False})
-                            if USE_SHELVE:
-                                persist_recent_buys()
+                            persist_recent_buys()
                     notify(f"⚠️ Monitor failed to market-sell {sym}: {e}")
             time.sleep(MONITOR_INTERVAL)
         except Exception:
@@ -1106,15 +1039,24 @@ def watch_orders(poll_interval=12):
                             filled_qty = pos.get("qty") or 0.0
                             avg_price = pos.get("sell_price") or 0.0
 
+                        with RECENT_BUYS_LOCK:
+                            if sym in RECENT_BUYS and not RECENT_BUYS[sym].get("closed"):
+                                RECENT_BUYS[sym].update({
+                                    "closed": True,
+                                    "closed_ts": time.time(),
+                                    "close_method": "limit_filled",
+                                    "close_resp": o,
+                                    "sell_fill_qty": filled_qty,
+                                    "sell_fill_price": avg_price,
+                                })
+                                persist_recent_buys()
                         notify(f"✅ POSITION CLOSED: `{sym}` sold {filled_qty} @ {avg_price} (limit)")
-                        finalize_close(sym, {"closed_ts": time.time(), "close_method": "limit_filled", "close_resp": o, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price})
                     elif status in ("CANCELED", "REJECTED"):
-                        notify(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
                         with RECENT_BUYS_LOCK:
                             if sym in RECENT_BUYS:
                                 RECENT_BUYS[sym].update({"sell_status": status, "sell_resp": o})
-                                if USE_SHELVE:
-                                    persist_recent_buys()
+                                persist_recent_buys()
+                        notify(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
                 except Exception as e:
                     print("watch_orders error for", sym, e)
                 time.sleep(0.4)
