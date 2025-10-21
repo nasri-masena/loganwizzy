@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: coins-finder
+    name: coins_finder
     env: python
     plan: free
     instanceCount: 1
