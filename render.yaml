@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: crypto-signal-bot
+    name: coins-finder
     env: python
     plan: free
     instanceCount: 1
