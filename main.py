@@ -34,7 +34,7 @@ PRICE_MIN = float(os.getenv("PRICE_MIN", "0.6"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "5.0"))
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(800_000)))
 TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "12"))
-CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "5"))
+CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "4"))
 KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
 KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
 OB_DEPTH = int(os.getenv("OB_DEPTH", "3"))
@@ -60,7 +60,7 @@ USE_SHELVE = os.getenv("USE_SHELVE", "False").lower() in ("1", "true", "yes")
 REMOVE_AFTER_CLOSE = os.getenv("REMOVE_AFTER_CLOSE", "True").lower() in ("1", "true", "yes")
 
 # blacklist
-BLACKLIST_HOURS = float(os.getenv("BLACKLIST_HOURS", "4"))
+BLACKLIST_HOURS = float(os.getenv("BLACKLIST_HOURS", "5"))
 BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
 BLACKLIST = {}
 
