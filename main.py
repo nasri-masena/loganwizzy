@@ -22,18 +22,18 @@ CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "True").lower() in ("1", "true", "yes")
-BUY_USDT_AMOUNT = float(os.getenv("BUY_USDT_AMOUNT", "11.30"))
-LIMIT_PROFIT_PCT = float(os.getenv("LIMIT_PROFIT_PCT", "1.2"))
+BUY_USDT_AMOUNT = float(os.getenv("BUY_USDT_AMOUNT", "11.0"))
+LIMIT_PROFIT_PCT = float(os.getenv("LIMIT_PROFIT_PCT", "1.1"))  # change to 1.5 for larger profit target
 BUY_BY_QUOTE = os.getenv("BUY_BY_QUOTE", "True").lower() in ("1", "true", "yes")
 BUY_BASE_QTY = float(os.getenv("BUY_BASE_QTY", "0.0"))
 MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "5"))
 
-BINANCE_REST = os.getenv("BINANCE_REST", "https://api.binance.com")
+BINANCE_REST = "https://api.binance.com"
 QUOTE = os.getenv("QUOTE", "USDT")
 PRICE_MIN = float(os.getenv("PRICE_MIN", "0.6"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "5.0"))
-MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(800_000)))
-TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "24"))
+MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(1_000_000)))
+TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "12"))
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "3"))
 KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
 KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
@@ -50,21 +50,16 @@ RECENT_BUYS_DB = os.path.join(os.getcwd(), "recent_buys.db")
 
 # new settings
 SHORT_BUY_SELL_DELAY = float(os.getenv("SHORT_BUY_SELL_DELAY", "0.3"))
-HOLD_THRESHOLD_HOURS = float(os.getenv("HOLD_THRESHOLD_HOURS", "4.0"))
+HOLD_THRESHOLD_HOURS = float(os.getenv("HOLD_THRESHOLD_HOURS", "4.0"))  # auto market-sell after this if order still open
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "60"))
 LIMIT_SELL_RETRIES = int(os.getenv("LIMIT_SELL_RETRIES", "3"))
-VOL_1M_THRESHOLD = float(os.getenv("VOL_1M_THRESHOLD", "0.005"))  # default 0.005
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))  # percent drop to trigger market stop-loss
-
-# persistence control
-USE_SHELVE = os.getenv("USE_SHELVE", "False").lower() in ("1", "true", "yes")
+VOL_1M_THRESHOLD = float(os.getenv("VOL_1M_THRESHOLD", "0.005"))  # default 0.005 (set to 0.0005 if you want smaller)
+USE_SHELVE = os.getenv("USE_SHELVE", "True").lower() in ("1", "true", "yes")
 REMOVE_AFTER_CLOSE = os.getenv("REMOVE_AFTER_CLOSE", "True").lower() in ("1", "true", "yes")
+BLACKLIST_HOURS = float(os.getenv("BLACKLIST_HOURS", "6.0"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))  # percent drop from buy to trigger market sell
 
-# backoff for insufficient balance
-INSUFFICIENT_BALANCE_PAUSE = int(os.getenv("INSUFFICIENT_BALANCE_PAUSE", "60"))
-INSUFFICIENT_BALANCE_UNTIL = 0.0
-
-# ---------- caches/locks ----------
+# ---------- runtime structures ----------
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
 RECENT_BUYS_LOCK = threading.Lock()
 _cache = {}
@@ -72,6 +67,7 @@ _cache_lock = threading.Lock()
 OPEN_ORDERS_CACHE = {"data": None, "ts": 0}
 OPEN_ORDERS_LOCK = threading.Lock()
 TEMP_SKIP = {}
+BLACKLIST = {}  # symbol -> expiry_ts
 RATE_LIMIT_BACKOFF = None
 
 # ---------- cache/persist ----------
@@ -342,14 +338,6 @@ def get_free_asset(asset):
         pass
     return 0.0
 
-def has_stale_positions(threshold_hours=HOLD_THRESHOLD_HOURS):
-    now = time.time()
-    with RECENT_BUYS_LOCK:
-        for s, v in RECENT_BUYS.items():
-            if not v.get("closed") and (now - v.get("ts", 0)) >= (threshold_hours * 3600.0):
-                return True
-    return False
-
 # ---------- helpers for order monitoring ----------
 def wait_for_order_fill(client, symbol, order_id, timeout=10, poll=1.0):
     if not client or not order_id:
@@ -365,6 +353,18 @@ def wait_for_order_fill(client, symbol, order_id, timeout=10, poll=1.0):
             pass
         time.sleep(poll)
     return None
+
+def blacklist_add(symbol, hours=BLACKLIST_HOURS):
+    BLACKLIST[symbol] = time.time() + max(0.0, float(hours) * 3600.0)
+
+def blacklist_check(symbol):
+    exp = BLACKLIST.get(symbol)
+    if not exp:
+        return False
+    if time.time() > exp:
+        BLACKLIST.pop(symbol, None)
+        return False
+    return True
 
 # ---------- finalize close helper ----------
 def finalize_close(symbol, update_fields=None):
@@ -388,8 +388,7 @@ def place_market_buy_by_quote(symbol, quote_qty):
     try:
         order = client.order_market_buy(symbol=symbol, quoteOrderQty=str(quote_qty))
         return order
-    except BinanceAPIException as e:
-        # fallback compute qty
+    except BinanceAPIException:
         book = fetch_order_book(symbol, limit=5)
         if not book:
             raise
@@ -626,7 +625,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
                 err = str(e)
                 last_err = err
                 if '-2010' in err or 'insufficient balance' in err.lower():
-                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err}. Refreshing & retrying.")
+                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err}. Refreshing balance & retrying.")
                     time.sleep(min(1.0 * attempt, 3.0))
                     free = _get_free_asset(asset)
                     if free + 1e-12 < qty:
@@ -686,6 +685,8 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
 # ---------- evaluate_symbol (fast/tight filters) ----------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
+        if blacklist_check(sym):
+            return None
         if not (PRICE_MIN <= last_price <= PRICE_MAX):
             return None
         if qvol < MIN_VOLUME:
@@ -752,7 +753,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
 
 # ---------- execute_trade (stores qty & ts immediately; processing flag) ----------
 def execute_trade(chosen):
-    global INSUFFICIENT_BALANCE_UNTIL
     symbol = chosen["symbol"]
     now = time.time()
     with RECENT_BUYS_LOCK:
@@ -856,7 +856,6 @@ def execute_trade(chosen):
                                 filled_qty = executed_qty
                                 avg_price_fill = sell_price
 
-                            # remove entry so bot can immediately buy other coins
                             with RECENT_BUYS_LOCK:
                                 if symbol in RECENT_BUYS:
                                     RECENT_BUYS.pop(symbol, None)
@@ -885,12 +884,7 @@ def execute_trade(chosen):
                 send_telegram(f"❌ Both limit and market sell failed for {symbol}. Entry removed to avoid blocking.")
             return False
     except BinanceAPIException as e:
-        err = str(e)
         send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
-        # if insufficient balance, set short pause to avoid spamming buys
-        if "-2010" in err or "insufficient balance" in err.lower():
-            INSUFFICIENT_BALANCE_UNTIL = time.time() + INSUFFICIENT_BALANCE_PAUSE
-            notify(f"⚠️ Insufficient balance detected. Pausing buys until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(INSUFFICIENT_BALANCE_UNTIL))}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
             if USE_SHELVE:
@@ -906,16 +900,16 @@ def execute_trade(chosen):
 
 # ---------- pick_coin (skip symbols with active open position) ----------
 def pick_coin():
-    # respect insufficient-balance pause
-    if time.time() < INSUFFICIENT_BALANCE_UNTIL:
-        return None
-
+    tick = time.time()
+    # respect blacklist
     tickers = fetch_tickers()
     now = time.time()
     pre = []
     for t in tickers:
         sym = t.get("symbol")
         if not sym or not sym.endswith(QUOTE):
+            continue
+        if blacklist_check(sym):
             continue
         try:
             last = float(t.get("lastPrice") or 0.0)
@@ -931,7 +925,6 @@ def pick_coin():
             continue
         with RECENT_BUYS_LOCK:
             last_buy = RECENT_BUYS.get(sym)
-            # skip any symbol that has an active (not closed) position
             if last_buy and not last_buy.get("closed"):
                 continue
             if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
@@ -973,7 +966,6 @@ def pick_coin():
             return None
         if last_buy and time.time() < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
             return None
-        # enforce MAX_CONCURRENT_POS
         if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
             notify(f"⚠️ Max concurrent positions active ({MAX_CONCURRENT_POS}). Skipping new buy.")
             return None
@@ -998,76 +990,92 @@ def pick_coin():
                 persist_recent_buys()
         return None
 
-# ---------- monitor_positions: stop-loss + hold-time market close ----------
+# ---------- monitor_positions: auto market-sell positions older than threshold or stop-loss ----------
 def monitor_positions():
     while True:
         try:
             now = time.time()
             to_process = []
             with RECENT_BUYS_LOCK:
-                for sym, pos in list(RECENT_BUYS.items()):
-                    if pos.get("closed"):
-                        continue
-                    ts = pos.get("ts", 0)
-                    qty = pos.get("qty") or 0.0
-                    processing = pos.get("processing", False)
-                    buy_price = pos.get("buy_price")
-                    # skip if no qty known or already being processed
-                    if qty <= 0 or processing:
-                        continue
-                    # check stop-loss
-                    stop_trigger = False
-                    try:
-                        if buy_price:
-                            kl = fetch_klines(sym, "1m", 2)
-                            if kl and len(kl) >= 1:
-                                cur_price = float(kl[-1][4])
-                            else:
-                                # fallback to tickers
-                                tks = fetch_tickers()
-                                cur_price = None
-                                for t in tks:
-                                    if t.get("symbol") == sym:
-                                        cur_price = float(t.get("lastPrice") or 0.0)
-                                        break
-                            if cur_price is not None and buy_price > 0:
-                                if cur_price <= buy_price * (1.0 - (STOP_LOSS_PCT / 100.0)):
-                                    stop_trigger = True
-                    except Exception:
-                        stop_trigger = False
-
-                    if stop_trigger or (now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0)):
-                        RECENT_BUYS[sym]["processing"] = True
-                        if USE_SHELVE:
-                            persist_recent_buys()
-                        to_process.append((sym, pos, stop_trigger))
-            for sym, pos, is_stop in to_process:
-                try:
-                    if is_stop:
-                        notify(f"⚠️ STOP-LOSS triggered for {sym} ({STOP_LOSS_PCT}%). Executing market sell.")
-                    else:
-                        notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — executing market sell fallback to close position.")
-                    qty = pos.get("qty")
-                    resp = place_market_sell_fallback(sym, qty, None)
-                    if resp:
-                        # finalize removal
-                        finalize_close(sym, update_fields={"closed_ts": time.time(), "close_method": "market_fallback", "close_resp": resp})
-                        notify(f"ℹ️ Position {sym} closed by monitor (market).")
-                    else:
-                        # unmark processing to retry later
+                # clone to avoid long lock
+                items = list(RECENT_BUYS.items())
+            # build ticker map for quick price checks
+            tickers = fetch_tickers()
+            last_map = {t.get("symbol"): float(t.get("lastPrice") or 0.0) for t in tickers}
+            for sym, pos in items:
+                if pos.get("closed"):
+                    continue
+                qty = pos.get("qty") or 0.0
+                processing = pos.get("processing", False)
+                buy_price = pos.get("buy_price")
+                sell_ts = pos.get("sell_ts") or pos.get("ts")
+                sell_order_id = pos.get("sell_order_id")
+                if qty <= 0 or processing:
+                    continue
+                # stop-loss immediate check (market sell)
+                if buy_price:
+                    last_price = last_map.get(sym)
+                    if last_price and STOP_LOSS_PCT and last_price <= buy_price * (1.0 - STOP_LOSS_PCT / 100.0):
+                        # blacklist symbol for some hours to avoid re-buy
+                        blacklist_add(sym, BLACKLIST_HOURS)
                         with RECENT_BUYS_LOCK:
-                            if sym in RECENT_BUYS:
-                                RECENT_BUYS[sym].update({"processing": False})
-                                if USE_SHELVE:
-                                    persist_recent_buys()
-                        notify(f"⚠️ Monitor failed to market-sell {sym}. Will retry later.")
-                except Exception as e:
-                    with RECENT_BUYS_LOCK:
-                        if sym in RECENT_BUYS:
-                            RECENT_BUYS[sym].update({"processing": False})
+                            RECENT_BUYS[sym]["processing"] = True
                             if USE_SHELVE:
                                 persist_recent_buys()
-                    notify(f"⚠️ Monitor failed to market-sell {sym}: {e}")
+                        try:
+                            resp = place_market_sell_fallback(sym, qty, None)
+                            with RECENT_BUYS_LOCK:
+                                if sym in RECENT_BUYS:
+                                    RECENT_BUYS.pop(sym, None)
+                                    if USE_SHELVE:
+                                        persist_recent_buys()
+                            notify(f"⚠️ STOP-LOSS triggered and market-sold {sym} at ~{last_price}. Blacklisted {BLACKLIST_HOURS}h.")
+                        except Exception as e:
+                            with RECENT_BUYS_LOCK:
+                                if sym in RECENT_BUYS:
+                                    RECENT_BUYS[sym]["processing"] = False
+                                    if USE_SHELVE:
+                                        persist_recent_buys()
+                            notify(f"⚠️ STOP-LOSS failed for {sym}: {e}")
+                        continue
+
+                # if limit sell exists and older than HOLD_THRESHOLD_HOURS -> cancel + market sell
+                if sell_order_id:
+                    if now - sell_ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
+                        with RECENT_BUYS_LOCK:
+                            RECENT_BUYS[sym]["processing"] = True
+                            if USE_SHELVE:
+                                persist_recent_buys()
+                        try:
+                            # try cancel open order first
+                            c = init_binance_client()
+                            try:
+                                if c:
+                                    try:
+                                        c.cancel_order(symbol=sym, orderId=sell_order_id)
+                                    except Exception:
+                                        try:
+                                            c.cancel_order(symbol=sym, origClientOrderId=str(sell_order_id))
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                            # place market sell
+                            resp = place_market_sell_fallback(sym, qty, None)
+                            with RECENT_BUYS_LOCK:
+                                if sym in RECENT_BUYS:
+                                    RECENT_BUYS.pop(sym, None)
+                                    if USE_SHELVE:
+                                        persist_recent_buys()
+                            notify(f"⚠️ Limit sell stale >{HOLD_THRESHOLD_HOURS}h. Force-market-sold {sym}.")
+                        except Exception as e:
+                            with RECENT_BUYS_LOCK:
+                                if sym in RECENT_BUYS:
+                                    RECENT_BUYS[sym]["processing"] = False
+                                    if USE_SHELVE:
+                                        persist_recent_buys()
+                            notify(f"⚠️ Monitor failed to force-sell {sym}: {e}")
+                # otherwise nothing to do
             time.sleep(MONITOR_INTERVAL)
         except Exception:
             time.sleep(MONITOR_INTERVAL)
@@ -1092,7 +1100,8 @@ def watch_orders(poll_interval=12):
                             o = client.get_order(symbol=sym, orderId=order_id)
                     except Exception:
                         try:
-                            o = client.get_order(symbol=sym, origClientOrderId=str(order_id))
+                            if client:
+                                o = client.get_order(symbol=sym, origClientOrderId=str(order_id))
                         except Exception:
                             o = None
                     if not o:
@@ -1118,15 +1127,22 @@ def watch_orders(poll_interval=12):
                             avg_price = pos.get("sell_price") or 0.0
 
                         send_telegram(f"✅ POSITION CLOSED: `{sym}` sold {filled_qty} @ {avg_price} (limit)")
-                        # finalize removal so bot resumes buying
-                        finalize_close(sym, update_fields={"closed_ts": time.time(), "close_method": "limit"})
+                        with RECENT_BUYS_LOCK:
+                            if sym in RECENT_BUYS:
+                                RECENT_BUYS.pop(sym, None)
+                                if USE_SHELVE:
+                                    persist_recent_buys()
                     elif status in ("CANCELED", "REJECTED"):
                         send_telegram(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
                         # remove to avoid blocking
-                        finalize_close(sym, update_fields={"close_ts": time.time(), "close_method": f"sell_{status.lower()}", "order_raw": o})
+                        with RECENT_BUYS_LOCK:
+                            if sym in RECENT_BUYS:
+                                RECENT_BUYS.pop(sym, None)
+                                if USE_SHELVE:
+                                    persist_recent_buys()
                 except Exception as e:
                     print("watch_orders error for", sym, e)
-                time.sleep(0.4)
+                time.sleep(0.3)
             time.sleep(poll_interval)
         except Exception as e:
             print("watch_orders loop error", e)
