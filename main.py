@@ -56,7 +56,7 @@ LIMIT_SELL_RETRIES = int(os.getenv("LIMIT_SELL_RETRIES", "3"))
 VOL_1M_THRESHOLD = float(os.getenv("VOL_1M_THRESHOLD", "0.005"))
 
 # persistence control
-USE_SHELVE = os.getenv("USE_SHELVE", "Fals e").lower() in ("1", "true", "yes")
+USE_SHELVE = os.getenv("USE_SHELVE", "False").lower() in ("1", "true", "yes")
 REMOVE_AFTER_CLOSE = os.getenv("REMOVE_AFTER_CLOSE", "True").lower() in ("1", "true", "yes")
 
 # blacklist
