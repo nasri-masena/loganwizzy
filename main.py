@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import math
 import threading
@@ -17,7 +16,7 @@ except Exception:
     BinanceAPIException = Exception
 
 # -------------------------
-# Config
+# Config (tweak if needed)
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -34,12 +33,12 @@ BINANCE_REST = "https://api.binance.com"
 QUOTE = os.getenv("QUOTE", "USDT")
 
 # filters
-PRICE_MIN = float(os.getenv("PRICE_MIN", "0.6"))
+PRICE_MIN = float(os.getenv("PRICE_MIN", "0.8"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "6.0"))
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(800_000)))
-TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "48"))
+TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "24"))
 
-# concurrency & caching
+# performance knobs
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "3"))
 KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
 KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
@@ -47,13 +46,13 @@ OB_DEPTH = int(os.getenv("OB_DEPTH", "3"))
 MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.2"))
 MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
 
-CACHE_TTL = float(os.getenv("CACHE_TTL", "3.0"))            # longer cache to reduce weight
+CACHE_TTL = float(os.getenv("CACHE_TTL", "1.0"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
-PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "8"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "16"))
+PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "12"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 
-# strategy thresholds
-MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.9"))   # 1m >= 0.9%
+# strategy thresholds per your request
+MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.9"))   # user's requirement
 MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.6"))
 VOL_5M_MIN = float(os.getenv("VOL_5M_MIN", "0.0004"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
@@ -66,20 +65,23 @@ RECENT_BUYS = {}
 BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "900"))
 REMOVE_AFTER_CLOSE = os.getenv("REMOVE_AFTER_CLOSE", "True").lower() in ("1", "true", "yes")
 
+# monitor / sell configs
 SHORT_BUY_SELL_DELAY = float(os.getenv("SHORT_BUY_SELL_DELAY", "0.3"))
 HOLD_THRESHOLD_HOURS = float(os.getenv("HOLD_THRESHOLD_HOURS", "4.0"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "12"))
 LIMIT_SELL_RETRIES = int(os.getenv("LIMIT_SELL_RETRIES", "3"))
+VOL_1M_THRESHOLD = float(os.getenv("VOL_1M_THRESHOLD", "0.005"))
 
+# blacklist (in-memory only)
+BLACKLIST_HOURS = float(os.getenv("BLACKLIST_HOURS", "4.0"))
+BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
 BLACKLIST = {}
-BLACKLIST_SECONDS = int(float(os.getenv("BLACKLIST_HOURS", "4.0")) * 3600)
 
-SELL_DRAWDOWN_PCT = float(os.getenv("SELL_DRAWDOWN_PCT", "2.0"))
+# sell-on-drawdown threshold (percent)
+SELL_DRAWDOWN_PCT = float(os.getenv("SELL_DRAWDOWN_PCT", "2.0"))  # default 2%
 
+# one-active-trade mode
 SCAN_PAUSE_ON_OPEN = True
-
-# Open-orders check interval (seconds) to avoid calling get_open_orders too often
-OPEN_ORDERS_CHECK_INTERVAL = int(os.getenv("OPEN_ORDERS_CHECK_INTERVAL", "12"))
 
 # -------------------------
 # Concurrency / locks / cache
@@ -91,47 +93,12 @@ _cache_lock = threading.Lock()
 OPEN_ORDERS_CACHE = {"data": None, "ts": 0}
 OPEN_ORDERS_LOCK = threading.Lock()
 TEMP_SKIP = {}
-RATE_LIMIT_BACKOFF = None  # epoch seconds until which we should back off
-RATE_LIMIT_LOCK = threading.Lock()
+RATE_LIMIT_BACKOFF = None  # timestamp until which we backoff
 
 ACTIVE_TRADE = threading.Event()
 
 # -------------------------
-# helpers: rate-limit/backoff
-# -------------------------
-def set_rate_limit_backoff_from_error(err_text, default_seconds=60):
-    """
-    Try parse timestamp (ms or s) from error text. Otherwise set now+default_seconds.
-    """
-    global RATE_LIMIT_BACKOFF
-    try:
-        # look for long numeric timestamp (10+ digits)
-        m = re.search(r"(\d{10,})", str(err_text))
-        if m:
-            ts = int(m.group(1))
-            # if looks like ms (>= 1e12), convert to seconds
-            if ts > 1e12:
-                ts_s = ts / 1000.0
-            else:
-                ts_s = ts
-            with RATE_LIMIT_LOCK:
-                RATE_LIMIT_BACKOFF = ts_s
-            print("Rate-limit backoff until (parsed):", time.ctime(RATE_LIMIT_BACKOFF))
-            return
-    except Exception:
-        pass
-    with RATE_LIMIT_LOCK:
-        RATE_LIMIT_BACKOFF = time.time() + default_seconds
-    print("Rate-limit backoff set for", default_seconds, "s until", time.ctime(RATE_LIMIT_BACKOFF))
-
-def is_rate_limited():
-    with RATE_LIMIT_LOCK:
-        if RATE_LIMIT_BACKOFF and time.time() < RATE_LIMIT_BACKOFF:
-            return True
-        return False
-
-# -------------------------
-# cache helpers
+# Cache helpers
 # -------------------------
 def cache_get(key):
     with _cache_lock:
@@ -245,78 +212,84 @@ def orderbook_bullish(ob, depth=10, min_imbalance=1.5, max_spread_pct=0.4, min_q
         return False
 
 # -------------------------
-# Cached HTTP helpers
+# Safe requests wrapper (handles rate-limit backoff)
+# -------------------------
+def safe_get(path, params=None):
+    global RATE_LIMIT_BACKOFF
+    if RATE_LIMIT_BACKOFF and time.time() < RATE_LIMIT_BACKOFF:
+        # quick fail to avoid more bans
+        raise RuntimeError("rate_limited")
+    try:
+        with REQUESTS_SEMAPHORE:
+            resp = requests.get(BINANCE_REST + path, params=params, timeout=REQUEST_TIMEOUT)
+        if resp.status_code in (429, 418):
+            # set a conservative backoff
+            RATE_LIMIT_BACKOFF = time.time() + max(10, REQUEST_TIMEOUT)
+            raise RuntimeError("rate_limited")
+        resp.raise_for_status()
+        return resp
+    except requests.exceptions.RequestException as e:
+        # if underlying response code is 429 set backoff
+        try:
+            code = getattr(e.response, "status_code", None)
+            if code in (429, 418):
+                RATE_LIMIT_BACKOFF = time.time() + max(10, REQUEST_TIMEOUT)
+                raise RuntimeError("rate_limited")
+        except Exception:
+            pass
+        raise
+
+# -------------------------
+# Binance public calls (cached)
 # -------------------------
 def fetch_tickers():
-    if is_rate_limited():
-        # return cached tickers when we're rate-limited, otherwise empty list
-        cached = cache_get("tickers")
-        if cached:
-            return cached
-        return []
     key = "tickers"
     cached = cache_get(key)
     if cached:
         return cached
     try:
-        with REQUESTS_SEMAPHORE:
-            resp = requests.get(BINANCE_REST + "/api/v3/ticker/24hr", timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 418:
-            # treat as temporary block
-            set_rate_limit_backoff_from_error("418 teapot", default_seconds=60)
-            resp.raise_for_status()
-        resp.raise_for_status()
+        resp = safe_get("/api/v3/ticker/24hr")
         data = resp.json()
         cache_set(key, data)
         return data
-    except requests.HTTPError as he:
-        txt = getattr(he, "response", None)
-        print("fetch_tickers error HTTP:", he)
-        # if we see rate limit related messages, set backoff
-        set_rate_limit_backoff_from_error(str(he))
-        return cache_get(key) or []
+    except RuntimeError:
+        print("fetch_tickers: rate_limited")
+        return []
     except Exception as e:
         print("fetch_tickers error", e)
-        return cache_get(key) or []
+        return []
 
 def fetch_klines(symbol, interval, limit):
-    if is_rate_limited():
-        return cache_get(f"klines:{symbol}:{interval}:{limit}") or []
     key = f"klines:{symbol}:{interval}:{limit}"
     cached = cache_get(key)
     if cached:
         return cached
     try:
         params = {"symbol": symbol, "interval": interval, "limit": limit}
-        with REQUESTS_SEMAPHORE:
-            resp = requests.get(BINANCE_REST + "/api/v3/klines", params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
+        resp = safe_get("/api/v3/klines", params=params)
         data = resp.json()
         cache_set(key, data)
         return data
-    except Exception as e:
-        # if rate limit error, set backoff if possible
-        set_rate_limit_backoff_from_error(str(e))
-        return cache_get(key) or []
+    except RuntimeError:
+        return []
+    except Exception:
+        return []
 
 def fetch_order_book(symbol, limit=OB_DEPTH):
-    if is_rate_limited():
-        return cache_get(f"depth:{symbol}:{limit}") or {}
     key = f"depth:{symbol}:{limit}"
     cached = cache_get(key)
     if cached:
         return cached
     try:
         params = {"symbol": symbol, "limit": max(5, limit)}
-        with REQUESTS_SEMAPHORE:
-            resp = requests.get(BINANCE_REST + "/api/v3/depth", params=params, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
+        resp = safe_get("/api/v3/depth", params=params)
         data = resp.json()
         cache_set(key, data)
         return data
-    except Exception as e:
-        set_rate_limit_backoff_from_error(str(e))
-        return cache_get(key) or {}
+    except RuntimeError:
+        return {}
+    except Exception:
+        return {}
 
 def fetch_symbol_price(symbol):
     try:
@@ -335,7 +308,7 @@ def fetch_symbol_price(symbol):
     return None
 
 # -------------------------
-# Binance client helpers
+# Client / exchange info
 # -------------------------
 _binance_client = None
 _symbol_info_cache = {}
@@ -353,36 +326,37 @@ def init_binance_client():
     _binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
     return _binance_client
 
-def get_symbol_info(symbol):
-    if symbol in _symbol_info_cache:
-        return _symbol_info_cache[symbol]
-    ex = None
-    try:
-        ex = init_binance_client().get_exchange_info()
-    except Exception:
-        ex_resp = fetch_exchange_info_fallback()
-        ex = ex_resp
-    for s in (ex.get("symbols", []) if ex else []):
-        if s.get("symbol") == symbol:
-            _symbol_info_cache[symbol] = s
-            return s
-    return None
-
-def fetch_exchange_info_fallback():
-    # try HTTP exchangeInfo minimal fallback (cached)
+def fetch_exchange_info():
     key = "exchange_info"
     cached = cache_get(key)
     if cached:
         return cached
     try:
-        with REQUESTS_SEMAPHORE:
-            r = requests.get(BINANCE_REST + "/api/v3/exchangeInfo", timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
+        client = init_binance_client()
+        if not client:
+            resp = safe_get("/api/v3/exchangeInfo")
+            data = resp.json()
+            cache_set(key, data)
+            return data
+        data = client.get_exchange_info()
         cache_set(key, data)
         return data
-    except Exception:
+    except RuntimeError:
+        print("fetch_exchange_info: rate_limited")
         return {}
+    except Exception as e:
+        print("fetch_exchange_info error", e)
+        return {}
+
+def get_symbol_info(symbol):
+    if symbol in _symbol_info_cache:
+        return _symbol_info_cache[symbol]
+    ex = fetch_exchange_info()
+    for s in ex.get("symbols", []):
+        if s.get("symbol") == symbol:
+            _symbol_info_cache[symbol] = s
+            return s
+    return None
 
 def round_step(value, step):
     step = float(step)
@@ -428,6 +402,11 @@ def format_price(p, tick):
     prec = int(round(-math.log10(tick))) if tick < 1 else 0
     return ("{:0." + str(prec) + "f}").format(float(p))
 
+def ceil_step(v, step):
+    if not step or step == 0:
+        return v
+    return math.ceil(v / step) * step
+
 def get_free_asset(asset):
     client = init_binance_client()
     if not client:
@@ -448,63 +427,94 @@ def get_free_asset(asset):
     return 0.0
 
 # -------------------------
-# Open orders helpers (cached)
+# Sync open orders from exchange (so bot sees manual orders)
 # -------------------------
-def fetch_open_orders_cached(force=False):
+def sync_open_orders(force=False):
     """
-    Return list of open orders for account. Cached by OPEN_ORDERS_CHECK_INTERVAL.
+    Fetch open orders from exchange and update RECENT_BUYS and ACTIVE_TRADE accordingly.
+    Call with force=True on startup or when you want to re-sync immediately.
     """
-    if is_rate_limited():
-        return OPEN_ORDERS_CACHE.get("data") or []
-    now = time.time()
-    with OPEN_ORDERS_LOCK:
-        if not force and OPEN_ORDERS_CACHE["data"] is not None and (now - OPEN_ORDERS_CACHE["ts"] < OPEN_ORDERS_CHECK_INTERVAL):
-            return OPEN_ORDERS_CACHE["data"]
     client = init_binance_client()
     if not client:
-        return OPEN_ORDERS_CACHE.get("data") or []
-    try:
-        orders = client.get_open_orders()
-        with OPEN_ORDERS_LOCK:
-            OPEN_ORDERS_CACHE["data"] = orders
-            OPEN_ORDERS_CACHE["ts"] = time.time()
-        return orders
-    except Exception as e:
-        # if rate limited, set backoff
-        set_rate_limit_backoff_from_error(str(e))
-        return OPEN_ORDERS_CACHE.get("data") or []
+        return None
+    with OPEN_ORDERS_LOCK:
+        if not force and OPEN_ORDERS_CACHE.get('data') and time.time() - OPEN_ORDERS_CACHE.get('ts', 0) < max(1.0, CACHE_TTL):
+            orders = OPEN_ORDERS_CACHE['data']
+        else:
+            try:
+                orders = client.get_open_orders()
+            except Exception as e:
+                # don't spam on errors
+                print("sync_open_orders error", e)
+                return None
+            OPEN_ORDERS_CACHE['data'] = orders
+            OPEN_ORDERS_CACHE['ts'] = time.time()
 
-def any_open_orders_present():
-    """
-    True if there are any open orders on the account.
-    """
-    orders = fetch_open_orders_cached()
-    return bool(orders)
+    any_open = False
+    with RECENT_BUYS_LOCK:
+        # Update RECENT_BUYS entries for open orders
+        for o in (orders or []):
+            sym = o.get('symbol')
+            if not sym:
+                continue
+            any_open = True
+            side = (o.get('side') or "").upper()
+            # If we don't have an entry, create a minimal one so bot pauses scanning
+            if sym not in RECENT_BUYS or RECENT_BUYS.get(sym, {}).get("closed", True):
+                RECENT_BUYS[sym] = {"ts": time.time(), "reserved": False, "closed": False, "processing": False}
+            # store order details
+            try:
+                # standardize order id storage
+                order_id = o.get("orderId") or o.get("clientOrderId")
+                if side == "SELL":
+                    RECENT_BUYS[sym].update({"sell_order_id": order_id, "sell_resp": o})
+                else:
+                    RECENT_BUYS[sym].update({"open_buy_order": o})
+            except Exception:
+                pass
+
+        # If there are entries in RECENT_BUYS for which open orders are gone, we keep them as-is;
+        # finalize_close will handle them when filled/cancelled or monitor detects them.
+
+    # set ACTIVE_TRADE if any open orders exist
+    try:
+        if any_open:
+            ACTIVE_TRADE.set()
+        else:
+            # if no open orders on exchange, clear ACTIVE_TRADE only if no RECENT_BUYS non-closed exist
+            with RECENT_BUYS_LOCK:
+                if not any(not v.get("closed") for v in RECENT_BUYS.values()):
+                    ACTIVE_TRADE.clear()
+    except Exception:
+        pass
+
+    return orders
 
 # -------------------------
-# Finalize close
+# Finalize close (clears ACTIVE_TRADE only if no remaining open positions)
 # -------------------------
 def finalize_close(symbol, update_fields=None):
     with RECENT_BUYS_LOCK:
-        if symbol not in RECENT_BUYS:
-            try:
-                ACTIVE_TRADE.clear()
-            except Exception:
-                pass
-            return
-        if REMOVE_AFTER_CLOSE:
-            RECENT_BUYS.pop(symbol, None)
-        else:
-            if update_fields:
-                RECENT_BUYS[symbol].update(update_fields)
-            RECENT_BUYS[symbol]["closed"] = True
+        if symbol in RECENT_BUYS:
+            if REMOVE_AFTER_CLOSE:
+                RECENT_BUYS.pop(symbol, None)
+            else:
+                if update_fields:
+                    RECENT_BUYS[symbol].update(update_fields)
+                RECENT_BUYS[symbol]["closed"] = True
+        # if symbol not in RECENT_BUYS just ensure ACTIVE_TRADE cleared if nothing else active
+
+    # clear ACTIVE_TRADE only if there are no non-closed RECENT_BUYS
     try:
-        ACTIVE_TRADE.clear()
+        with RECENT_BUYS_LOCK:
+            still_active = any(not v.get("closed") for v in RECENT_BUYS.values())
+        if not still_active:
+            ACTIVE_TRADE.clear()
     except Exception:
         pass
 
 # -------------------------
-# Blacklist (in-memory)
+# Blacklist helpers (in-memory)
 # -------------------------
 def add_blacklist(symbol, seconds=BLACKLIST_SECONDS):
     if not symbol:
@@ -524,24 +534,33 @@ def is_blacklisted(symbol):
     return True
 
 # -------------------------
-# Market buy helpers with balance check
+# Market buy helpers
 # -------------------------
 def place_market_buy_by_quote(symbol, quote_qty):
     client = init_binance_client()
     if not client:
         raise RuntimeError("Binance client not available")
-    # quick pre-check: free balance
-    free_quote = get_free_asset(QUOTE)
-    # keep small buffer
-    buffer = 0.01
-    if free_quote + 1e-9 < (quote_qty + buffer):
-        raise RuntimeError(f"Insufficient free {QUOTE} balance: have {free_quote}, need {quote_qty}")
     try:
         order = client.order_market_buy(symbol=symbol, quoteOrderQty=str(quote_qty))
+        # refresh open orders cache
+        with OPEN_ORDERS_LOCK:
+            OPEN_ORDERS_CACHE['data'] = None
+            OPEN_ORDERS_CACHE['ts'] = 0
         return order
-    except BinanceAPIException as e:
-        # bubble up so caller can handle
-        raise
+    except BinanceAPIException:
+        book = fetch_order_book(symbol, limit=5)
+        if not book:
+            raise
+        top_ask = float(book["asks"][0][0])
+        raw_qty = quote_qty / top_ask
+        qty, _ = adjust_qty_price_for_filters(symbol, raw_qty, top_ask)
+        if qty <= 0:
+            raise RuntimeError("Computed qty below symbol min after filters")
+        order = client.order_market_buy(symbol=symbol, quantity=str(qty))
+        with OPEN_ORDERS_LOCK:
+            OPEN_ORDERS_CACHE['data'] = None
+            OPEN_ORDERS_CACHE['ts'] = 0
+        return order
 
 def parse_market_fill(order_resp):
     fills = order_resp.get("fills") or []
@@ -563,7 +582,7 @@ def parse_market_fill(order_resp):
     return total_qty, avg_price
 
 # -------------------------
-# Market sell fallback
+# Market sell fallback (used for drawdown)
 # -------------------------
 def place_market_sell_fallback(symbol, qty, f=None):
     try:
@@ -628,41 +647,204 @@ def place_market_sell_fallback(symbol, qty, f=None):
         return None
 
 # -------------------------
-# place_limit_sell_strict (unchanged core) - truncated for brevity
+# Limit sell strict
 # -------------------------
 def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
-    # For brevity in this response keep implementation as before (same logic)
-    # Copy the previous correct implementation here when deploying.
-    client = init_binance_client()
+    if retries is None:
+        retries = LIMIT_SELL_RETRIES
     try:
-        info = get_symbol_info(symbol)
-    except Exception:
-        info = None
-    # Minimal safe attempt: try limit sell; fallback to market via place_market_sell_fallback if errors
-    try:
-        if not client or not info:
+        client = init_binance_client()
+        if not client:
+            notify(f"⚠️ place_limit_sell_strict: binance client missing")
             return None
+
+        info = get_symbol_info(symbol)
+        if not info:
+            notify(f"⚠️ place_limit_sell_strict: missing symbol info for {symbol}")
+            return None
+
+        def _floor_to_step(v, step):
+            if not step or step == 0:
+                return float(v)
+            return math.floor(float(v) / step) * step
+
+        def _ceil_to_tick(v, tick):
+            if not tick or tick == 0:
+                return float(v)
+            return math.ceil(float(v) / tick) * tick
+
         filters = {f["filterType"]: f for f in info.get("filters", [])}
         step = float(filters.get("LOT_SIZE", {}).get("stepSize") or filters.get("MARKET_LOT_SIZE", {}).get("stepSize") or 0.0)
         tick = float(filters.get("PRICE_FILTER", {}).get("tickSize") or 0.0)
+        min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional") or 0.0)
+
+        asset = symbol[:-len(QUOTE)] if QUOTE and symbol.endswith(QUOTE) else None
+
+        def _get_free_asset(a):
+            try:
+                bal = client.get_asset_balance(asset=a)
+                if bal:
+                    return float(bal.get("free") or 0.0)
+            except Exception:
+                pass
+            try:
+                acc = client.get_account()
+                for b in acc.get("balances", []):
+                    if b.get("asset") == a:
+                        return float(b.get("free") or 0.0)
+            except Exception:
+                pass
+            return 0.0
+
+        def _free_reserved_qty():
+            reserved = 0.0
+            try:
+                open_orders = client.get_open_orders(symbol=symbol)
+                for o in open_orders or []:
+                    if (o.get('side') or "").upper() == 'SELL':
+                        orig = float(o.get('origQty') or 0.0)
+                        executed = float(o.get('executedQty') or 0.0)
+                        reserved += max(0.0, orig - executed)
+                return reserved, open_orders or []
+            except Exception:
+                return 0.0, []
+
         qty = float(qty)
         sell_price = float(sell_price)
+
         if step and step > 0:
-            qty = math.floor(qty / step) * step
+            qty = _floor_to_step(qty, step)
         if tick and tick > 0:
-            sell_price = math.ceil(sell_price / tick) * tick
+            sell_price = _ceil_to_tick(sell_price, tick)
+
         if qty <= 0:
             notify("❌ place_limit_sell_strict: qty zero after clipping")
             return None
+
+        def _meets_min_notional(q, p):
+            if not min_notional or min_notional == 0:
+                return True
+            return (q * p) >= (min_notional - 1e-12)
+
+        if not _meets_min_notional(qty, sell_price):
+            free = _get_free_asset(asset)
+            if free > qty:
+                needed = math.ceil((min_notional / sell_price) / (step or 1)) * (step or 1)
+                if needed <= free + 1e-12:
+                    qty = _floor_to_step(needed, step)
+                    notify(f"ℹ️ Increased qty to meet minNotional: qty={qty}")
+            attempts = 0
+            while not _meets_min_notional(qty, sell_price) and attempts < 40:
+                sell_price = _ceil_to_tick(sell_price + max(1e-8, sell_price * 0.001), tick)
+                attempts += 1
+            if not _meets_min_notional(qty, sell_price):
+                notify(f"⚠️ Cannot meet minNotional for {symbol} (qty*price={qty*sell_price:.8f} < {min_notional}). Will attempt but may fail.")
+
+        qty = _floor_to_step(qty, step)
+        sell_price = _ceil_to_tick(sell_price, tick)
         qty_str = format_qty(qty, step)
         price_str = format_price(sell_price, tick)
+
+        free = _get_free_asset(asset)
+        if free + 1e-12 < qty:
+            reserved, open_orders = _free_reserved_qty()
+            if reserved > 0:
+                try:
+                    sells = []
+                    for o in open_orders:
+                        if (o.get("side") or "").upper() == "SELL":
+                            reserved_qty = max(0.0, float(o.get("origQty") or 0.0) - float(o.get("executedQty") or 0.0))
+                            sells.append((reserved_qty, o))
+                    sells.sort(key=lambda x: x[0])
+                    for rqty, o in sells:
+                        try:
+                            client.cancel_order(symbol=symbol, orderId=o.get("orderId"))
+                            notify(f"ℹ️ Cancelled open SELL order {o.get('orderId')} to free {rqty:.8f} {asset}")
+                            time.sleep(0.05)
+                        except Exception:
+                            pass
+                    free = _get_free_asset(asset)
+                except Exception:
+                    free = _get_free_asset(asset)
+            if free + 1e-12 < qty:
+                new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
+                if new_qty <= 0:
+                    notify(f"❌ place_limit_sell_strict: insufficient free {asset} (free={free:.8f}, req={qty:.8f})")
+                    return None
+                notify(f"ℹ️ Adjusting qty down from {qty:.8f} to available {new_qty:.8f}")
+                qty = new_qty
+                qty_str = format_qty(qty, step)
+
+        attempt = 0
+        last_err = None
+        while attempt < retries:
+            attempt += 1
+            try:
+                order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str, timeInForce='GTC')
+                notify(f"✅ LIMIT SELL placed: {symbol} qty={qty_str} @ {price_str}")
+                try:
+                    with OPEN_ORDERS_LOCK:
+                        OPEN_ORDERS_CACHE['data'] = None
+                except Exception:
+                    pass
+                return order
+            except BinanceAPIException as e:
+                err = str(e)
+                last_err = err
+                if '-2010' in err or 'insufficient balance' in err.lower():
+                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err}. Refreshing balance & retrying.")
+                    time.sleep(min(1.0 * attempt, 3.0))
+                    free = _get_free_asset(asset)
+                    if free + 1e-12 < qty:
+                        new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
+                        if new_qty <= 0:
+                            notify("❌ After refresh, no available qty to place limit sell.")
+                            return None
+                        qty = new_qty
+                        qty_str = format_qty(qty, step)
+                        notify(f"ℹ️ Reduced qty to {qty_str} and retrying.")
+                        continue
+                    continue
+                if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err or 'Filter failure' in err:
+                    notify(f"⚠️ Limit sell attempt {attempt} hit minNotional/filter error: {err}. Trying to adjust.")
+                    free = _get_free_asset(asset)
+                    needed = math.ceil((min_notional / float(sell_price)) / (step or 1)) * (step or 1) if min_notional else qty
+                    if min_notional and needed <= free + 1e-12 and needed > qty:
+                        qty = _floor_to_step(needed, step)
+                        qty_str = format_qty(qty, step)
+                        notify(f"ℹ️ Increased qty to {qty_str} to meet minNotional; retrying.")
+                        time.sleep(0.2)
+                        continue
+                    bump_attempts = 0
+                    while not _meets_min_notional(qty, sell_price) and bump_attempts < 40:
+                        sell_price = _ceil_to_tick(sell_price + max(1e-8, sell_price * 0.001), tick)
+                        price_str = format_price(sell_price, tick)
+                        bump_attempts += 1
+                    time.sleep(0.2)
+                    continue
+                if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
+                    notify("❗ Rate-limit detected placing limit sell — backing off and skipping symbol for a bit.")
+                    TEMP_SKIP[symbol] = time.time() + 60
+                    return None
+                notify(f"⚠️ Limit sell attempt {attempt} failed: {err}. Retrying (delay {delay*attempt}s).")
+                time.sleep(delay * attempt)
+            except Exception as e:
+                last_err = str(e)
+                notify(f"⚠️ Unexpected error placing limit sell (attempt {attempt}): {e}")
+                time.sleep(delay * attempt)
+
         try:
-            order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str, timeInForce='GTC')
-            notify(f"✅ LIMIT SELL placed: {symbol} qty={qty_str} @ {price_str}")
-            return order
+            notify("⚠️ All limit attempts failed — trying LIMIT_MAKER as last attempt.")
+            lm = client.create_order(symbol=symbol, side='SELL', type='LIMIT_MAKER', quantity=qty_str, price=price_str)
+            notify(f"✅ LIMIT_MAKER placed: {symbol} qty={qty_str} @ {price_str}")
+            return lm
         except Exception as e:
-            set_rate_limit_backoff_from_error(str(e))
-            return None
+            notify(f"❌ Final LIMIT_MAKER attempt failed: {e}")
+
+        notify(f"❌ place_limit_sell_strict: all attempts failed for {symbol}. last_err={last_err}")
+        TEMP_SKIP[symbol] = time.time() + 60
+        return None
+
     except Exception as e:
         notify(f"⚠️ place_limit_sell_strict unexpected error for {symbol}: {e}")
         return None
@@ -758,36 +940,17 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         return None
 
 # -------------------------
-# Picker (pauses if any open orders present)
+# Picker
 # -------------------------
 def pick_coin():
-    # if rate-limited, skip heavy scanning
-    if is_rate_limited():
-        print("Rate-limited — skipping pick_coin cycle.")
-        return None
+    # sync open orders first so bot sees manual orders
+    try:
+        sync_open_orders()
+    except Exception:
+        pass
 
-    # check external open orders (manual or previous) — cached
-    if SCAN_PAUSE_ON_OPEN and any_open_orders_present():
-        # set ACTIVE_TRADE so cycles that check that skip scanning too
-        try:
-            ACTIVE_TRADE.set()
-        except Exception:
-            pass
-        print("Open orders present on account — pausing scanning until cleared.")
+    if SCAN_PAUSE_ON_OPEN and ACTIVE_TRADE.is_set():
         return None
-    else:
-        # clear active trade pause if there are no open orders and no in-progress position
-        try:
-            if not any_open_orders_present():
-                # don't clear ACTIVE_TRADE if we actually have a RECENT_BUY open
-                with RECENT_BUYS_LOCK:
-                    if not any(not v.get("closed") for v in RECENT_BUYS.values()):
-                        try:
-                            ACTIVE_TRADE.clear()
-                        except Exception:
-                            pass
-        except Exception:
-            pass
 
     tickers = fetch_tickers()
     now = time.time()
@@ -837,7 +1000,7 @@ def pick_coin():
     chosen_pool = strongs if strongs else results
     chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
 
-    # last-second recheck to avoid race and ensure blacklist still clear
+    # last-second recheck
     if is_blacklisted(chosen["symbol"]):
         return None
 
@@ -876,30 +1039,16 @@ def pick_coin():
         return None
 
 # -------------------------
-# Execute trade (with balance checks and error handling)
+# Execute trade
 # -------------------------
 def execute_trade(chosen):
     symbol = chosen["symbol"]
     now = time.time()
-
-    # if there are external open orders, abort and mark reserved->False
-    if any_open_orders_present():
-        notify(f"⚠️ Open orders exist on account — aborting trade for {symbol}.")
-        with RECENT_BUYS_LOCK:
-            if symbol in RECENT_BUYS:
-                RECENT_BUYS.pop(symbol, None)
-        try:
-            ACTIVE_TRADE.clear()
-        except Exception:
-            pass
-        return False
-
     with RECENT_BUYS_LOCK:
         if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
             send_telegram(f"⚠️ Max concurrent positions reached. Skipping {symbol}")
             return False
         RECENT_BUYS[symbol] = {"ts": now, "reserved": False, "closed": False, "processing": True}
-
     client = init_binance_client()
     if not client:
         send_telegram(f"⚠️ Trading disabled or client missing. Skipping live trade for {symbol}")
@@ -910,18 +1059,6 @@ def execute_trade(chosen):
         return False
 
     try:
-        # ensure free QUOTE balance sufficient
-        if BUY_BY_QUOTE and BUY_USDT_AMOUNT > 0:
-            free_quote = get_free_asset(QUOTE)
-            if free_quote + 1e-8 < BUY_USDT_AMOUNT:
-                send_telegram(f"‼️ Insufficient {QUOTE} balance to buy {symbol}: have {free_quote}, need {BUY_USDT_AMOUNT}. Aborting buy.")
-                with RECENT_BUYS_LOCK:
-                    RECENT_BUYS.pop(symbol, None)
-                try: ACTIVE_TRADE.clear()
-                except Exception: pass
-                return False
-
-        # perform buy
         if BUY_BY_QUOTE and BUY_USDT_AMOUNT > 0:
             order = place_market_buy_by_quote(symbol, BUY_USDT_AMOUNT)
         elif not BUY_BY_QUOTE and BUY_BASE_QTY > 0:
@@ -977,8 +1114,14 @@ def execute_trade(chosen):
                     "processing": False,
                 })
 
+            # refresh open orders cache
+            with OPEN_ORDERS_LOCK:
+                OPEN_ORDERS_CACHE['data'] = None
+                OPEN_ORDERS_CACHE['ts'] = 0
+
             send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
 
+            # short poll for immediate fills
             try:
                 if sell_order_id:
                     filled_order = wait_for_order_fill(client, symbol, sell_order_id, timeout=8, poll=1.0)
@@ -1031,23 +1174,8 @@ def execute_trade(chosen):
             else:
                 send_telegram(f"❌ Both limit and market sell failed for {symbol}. Entry removed to avoid blocking.")
             return False
-
     except BinanceAPIException as e:
-        # catch insufficient balance and similar
-        msg = str(e)
-        send_telegram(f"‼️ Binance API error during buy {symbol}: {msg}")
-        # if insufficient balance, clean up reservation and continue
-        if "-2010" in msg or "insufficient balance" in msg.lower():
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(symbol, None)
-            try:
-                ACTIVE_TRADE.clear()
-            except Exception:
-                pass
-            return False
-        # if rate-limit, set backoff
-        if "-1003" in msg or "Way too much request weight" in msg:
-            set_rate_limit_backoff_from_error(msg, default_seconds=60)
+        send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
         try: ACTIVE_TRADE.clear()
@@ -1084,8 +1212,8 @@ def wait_for_order_fill(client, symbol, order_id, timeout=10, poll=1.0):
                 return o
             if status in ("CANCELED", "REJECTED"):
                 return o
-        except Exception as e:
-            set_rate_limit_backoff_from_error(str(e))
+        except Exception:
+            pass
         time.sleep(poll)
     return None
 
@@ -1175,8 +1303,11 @@ def watch_orders(poll_interval=12):
         try:
             if client is None:
                 client = init_binance_client()
-            # refresh cached open orders
-            _ = fetch_open_orders_cached()
+            # resync open orders periodically to catch manual cancels/fills
+            try:
+                sync_open_orders()
+            except Exception:
+                pass
             with RECENT_BUYS_LOCK:
                 candidates = [(sym, dict(pos)) for sym, pos in RECENT_BUYS.items() if not pos.get("closed") and pos.get("sell_order_id")]
             for sym, pos in candidates:
@@ -1193,6 +1324,11 @@ def watch_orders(poll_interval=12):
                         except Exception:
                             o = None
                     if not o:
+                        # maybe order id changed or was removed - resync open orders to be sure
+                        try:
+                            sync_open_orders(force=True)
+                        except Exception:
+                            pass
                         continue
                     status = (o.get("status") or "").upper()
                     if status == "FILLED":
@@ -1220,10 +1356,6 @@ def watch_orders(poll_interval=12):
                     elif status in ("CANCELED", "REJECTED"):
                         send_telegram(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
                         finalize_close(sym, {"closed_ts": time.time(), "close_method": f"sell_{status.lower()}", "close_resp": o})
-                except BinanceAPIException as e:
-                    msg = str(e)
-                    if "-1003" in msg or "Way too much request weight" in msg:
-                        set_rate_limit_backoff_from_error(msg, default_seconds=60)
                 except Exception as e:
                     print("watch_orders error for", sym, e)
                 time.sleep(0.4)
@@ -1239,7 +1371,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Signal bot running (pause-if-open-orders, stateless)"
+    return "Signal bot running (stateless)"
 
 def trade_cycle():
     while True:
@@ -1248,42 +1380,30 @@ def trade_cycle():
             if res:
                 print(f"[{time.strftime('%H:%M:%S')}] Signal -> {res['symbol']} score={res['score']:.2f}")
             else:
-                if SCAN_PAUSE_ON_OPEN and any_open_orders_present():
-                    print(f"[{time.strftime('%H:%M:%S')}] Scanning paused: account has open orders.")
-                elif is_rate_limited():
-                    print(f"[{time.strftime('%H:%M:%S')}] Rate-limited; skipping cycle.")
+                if SCAN_PAUSE_ON_OPEN and ACTIVE_TRADE.is_set():
+                    print(f"[{time.strftime('%H:%M:%S')}] Scanning paused. Active trade in progress or open orders present.")
                 else:
                     print(f"[{time.strftime('%H:%M:%S')}] No signal")
         except Exception as e:
             print("cycle error", e)
+        # obey rate-limit backoff: if set, sleep until it expires
+        if RATE_LIMIT_BACKOFF:
+            wait = max(0.0, RATE_LIMIT_BACKOFF - time.time())
+            if wait > 0:
+                print(f"[{time.strftime('%H:%M:%S')}] Rate limit backoff active: sleeping {wait:.1f}s")
+                time.sleep(wait)
+                continue
         time.sleep(CYCLE_SECONDS)
 
-# -------------------------
-# Startup helper - check open orders at boot
-# -------------------------
-def startup_check_open_orders_and_pause():
-    try:
-        orders = fetch_open_orders_cached(force=True)
-        if orders:
-            notify(f"⚠️ Startup: found {len(orders)} open orders on account — pausing scans until cleared.")
-            try:
-                ACTIVE_TRADE.set()
-            except Exception:
-                pass
-        else:
-            try:
-                ACTIVE_TRADE.clear()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
 if __name__ == "__main__":
-    # initial startup check (in case manual orders exist)
-    startup_check_open_orders_and_pause()
+    # on startup try to sync any manual open orders so bot doesn't resume scanning while you have orders
+    try:
+        sync_open_orders(force=True)
+    except Exception as e:
+        print("initial sync_open_orders failed:", e)
+
     # background threads
     tmon = threading.Thread(target=monitor_positions, daemon=True); tmon.start()
     twatch = threading.Thread(target=watch_orders, daemon=True); twatch.start()
     t = threading.Thread(target=trade_cycle, daemon=True); t.start()
-    # start web
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), threaded=True)
