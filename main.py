@@ -46,7 +46,7 @@ OB_DEPTH = int(os.getenv("OB_DEPTH", "3"))
 MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.2"))
 MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
 
-CACHE_TTL = float(os.getenv("CACHE_TTL", "2.0"))
+CACHE_TTL = float(os.getenv("CACHE_TTL", "1.0"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "12"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
