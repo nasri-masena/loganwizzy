@@ -36,7 +36,7 @@ QUOTE = os.getenv("QUOTE", "USDT")
 PRICE_MIN = float(os.getenv("PRICE_MIN", "0.8"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "6.0"))
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(800_000)))
-TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "48"))
+TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "24"))
 
 # performance knobs
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "3"))
@@ -49,7 +49,7 @@ MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
 CACHE_TTL = float(os.getenv("CACHE_TTL", "2.0"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "12"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "24"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 
 # strategy thresholds per your request
 MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.9"))   # user's requirement
