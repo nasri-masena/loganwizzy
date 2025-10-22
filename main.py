@@ -4,7 +4,6 @@ import math
 import threading
 import requests
 import statistics
-import shelve
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask
 
@@ -17,7 +16,7 @@ except Exception:
     BinanceAPIException = Exception
 
 # -------------------------
-# Config (tweak for speed)
+# Config (tweak if needed)
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -33,13 +32,13 @@ MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "5"))
 BINANCE_REST = "https://api.binance.com"
 QUOTE = os.getenv("QUOTE", "USDT")
 
-# thresholds & filters
-PRICE_MIN = float(os.getenv("PRICE_MIN", "0.6"))
+# filters
+PRICE_MIN = float(os.getenv("PRICE_MIN", "0.8"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "6.0"))
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(800_000)))
 TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "48"))
 
-# performance knobs (increased concurrency + cache)
+# performance knobs
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "3"))
 KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
 KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
@@ -47,39 +46,41 @@ OB_DEPTH = int(os.getenv("OB_DEPTH", "3"))
 MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.2"))
 MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
 
-CACHE_TTL = float(os.getenv("CACHE_TTL", "2.0"))            # seconds - slightly longer cache
+CACHE_TTL = float(os.getenv("CACHE_TTL", "2.0"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
 PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "12"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "24"))
 
-# strategy thresholds
-MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.8"))   # 0.8%
+# strategy thresholds per your request
+MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.9"))   # user's requirement
 MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.6"))
 VOL_5M_MIN = float(os.getenv("VOL_5M_MIN", "0.0004"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 EMA_SHORT = int(os.getenv("EMA_SHORT", "3"))
 EMA_LONG = int(os.getenv("EMA_LONG", "10"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "30"))
 
 # other
 RECENT_BUYS = {}
 BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "900"))
-RECENT_BUYS_DB = os.path.join(os.getcwd(), "recent_buys.db")
-USE_SHELVE = os.getenv("USE_SHELVE", "True").lower() in ("1", "true", "yes")
 REMOVE_AFTER_CLOSE = os.getenv("REMOVE_AFTER_CLOSE", "True").lower() in ("1", "true", "yes")
 
 # monitor / sell configs
 SHORT_BUY_SELL_DELAY = float(os.getenv("SHORT_BUY_SELL_DELAY", "0.3"))
 HOLD_THRESHOLD_HOURS = float(os.getenv("HOLD_THRESHOLD_HOURS", "4.0"))
-MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "60"))
+MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "12"))
 LIMIT_SELL_RETRIES = int(os.getenv("LIMIT_SELL_RETRIES", "3"))
 VOL_1M_THRESHOLD = float(os.getenv("VOL_1M_THRESHOLD", "0.005"))
 
-# blacklist
+# blacklist (in-memory only)
 BLACKLIST_HOURS = float(os.getenv("BLACKLIST_HOURS", "4.0"))
 BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
 BLACKLIST = {}
 
-# one-active-trade mode: scan pauses when a trade is active
+# sell-on-drawdown threshold (percent)
+SELL_DRAWDOWN_PCT = float(os.getenv("SELL_DRAWDOWN_PCT", "2.0"))  # default 2%
+
+# one-active-trade mode
 SCAN_PAUSE_ON_OPEN = True
 
 # -------------------------
@@ -94,7 +95,6 @@ OPEN_ORDERS_LOCK = threading.Lock()
 TEMP_SKIP = {}
 RATE_LIMIT_BACKOFF = None
 
-# global: one-active-trade event
 ACTIVE_TRADE = threading.Event()
 
 # -------------------------
@@ -114,35 +114,6 @@ def cache_get(key):
 def cache_set(key, val):
     with _cache_lock:
         _cache[key] = (time.time(), val)
-
-# -------------------------
-# Persist recent buys (shelve)
-# -------------------------
-def load_recent_buys():
-    if not USE_SHELVE:
-        return
-    try:
-        with shelve.open(RECENT_BUYS_DB) as db:
-            data = db.get("data", {})
-            bl = db.get("blacklist", {})
-            if isinstance(data, dict):
-                RECENT_BUYS.update(data)
-            if isinstance(bl, dict):
-                BLACKLIST.update(bl)
-    except Exception:
-        pass
-
-def persist_recent_buys():
-    if not USE_SHELVE:
-        return
-    try:
-        with shelve.open(RECENT_BUYS_DB) as db:
-            db["data"] = RECENT_BUYS
-            db["blacklist"] = BLACKLIST
-    except Exception:
-        pass
-
-load_recent_buys()
 
 # -------------------------
 # Telegram helper
@@ -241,7 +212,7 @@ def orderbook_bullish(ob, depth=10, min_imbalance=1.5, max_spread_pct=0.4, min_q
         return False
 
 # -------------------------
-# Binance public calls (cached + semaphore)
+# Binance public calls (cached)
 # -------------------------
 def fetch_tickers():
     key = "tickers"
@@ -290,6 +261,22 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
         return data
     except Exception:
         return {}
+
+def fetch_symbol_price(symbol):
+    try:
+        tickers = fetch_tickers()
+        for t in tickers:
+            if t.get("symbol") == symbol:
+                return float(t.get("lastPrice") or 0.0)
+    except Exception:
+        pass
+    try:
+        kl = fetch_klines(symbol, "1m", 1)
+        if kl:
+            return float(kl[-1][4])
+    except Exception:
+        pass
+    return None
 
 # -------------------------
 # Client / exchange info
@@ -426,22 +413,18 @@ def finalize_close(symbol, update_fields=None):
             if update_fields:
                 RECENT_BUYS[symbol].update(update_fields)
             RECENT_BUYS[symbol]["closed"] = True
-        if USE_SHELVE:
-            persist_recent_buys()
     try:
         ACTIVE_TRADE.clear()
     except Exception:
         pass
 
 # -------------------------
-# Blacklist helpers
+# Blacklist helpers (in-memory)
 # -------------------------
 def add_blacklist(symbol, seconds=BLACKLIST_SECONDS):
     if not symbol:
         return
     BLACKLIST[symbol] = time.time() + int(seconds)
-    if USE_SHELVE:
-        persist_recent_buys()
 
 def is_blacklisted(symbol):
     exp = BLACKLIST.get(symbol)
@@ -450,8 +433,6 @@ def is_blacklisted(symbol):
     if time.time() >= exp:
         try:
             BLACKLIST.pop(symbol, None)
-            if USE_SHELVE:
-                persist_recent_buys()
         except Exception:
             pass
         return False
@@ -499,7 +480,7 @@ def parse_market_fill(order_resp):
     return total_qty, avg_price
 
 # -------------------------
-# Market sell fallback
+# Market sell fallback (used for drawdown)
 # -------------------------
 def place_market_sell_fallback(symbol, qty, f=None):
     try:
@@ -766,7 +747,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
         return None
 
 # -------------------------
-# Evaluate symbol (fast filters, concurrent fetches)
+# Evaluate symbol
 # -------------------------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
@@ -777,7 +758,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         if change_24h < 0.5 or change_24h > 20.0:
             return None
 
-        # concurrent fetches to reduce wall-time
         with ThreadPoolExecutor(max_workers=3) as ex:
             fut_kl5 = ex.submit(fetch_klines, sym, "5m", KLINES_5M_LIMIT)
             fut_kl1 = ex.submit(fetch_klines, sym, "1m", KLINES_1M_LIMIT)
@@ -801,7 +781,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         vol_5m = compute_recent_volatility(closes_5m)
         vol_1m = compute_recent_volatility(closes_1m, lookback=3)
 
-        # EMA computed but not required as hard filter
         short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
         long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
         ema_uplift = 0.0
@@ -825,7 +804,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         if ob_bull:
             score += 25.0
 
-        # hard filters
+        # hard filters per your list
         if pct_1m < MIN_1M_PCT:
             return None
         if vol_5m is None or vol_5m < VOL_5M_MIN:
@@ -834,7 +813,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
             return None
         if rsi_val is not None and rsi_val > 70:
             return None
-        if score < 30:
+        if score < MIN_SCORE:
             return None
 
         strong_candidate = (pct_5m >= MIN_5M_PCT and pct_1m >= MIN_1M_PCT and ob_bull)
@@ -858,7 +837,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         return None
 
 # -------------------------
-# Main picker (pauses when ACTIVE_TRADE set)
+# Picker
 # -------------------------
 def pick_coin():
     if SCAN_PAUSE_ON_OPEN and ACTIVE_TRADE.is_set():
@@ -912,6 +891,10 @@ def pick_coin():
     chosen_pool = strongs if strongs else results
     chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
 
+    # last-second recheck
+    if is_blacklisted(chosen["symbol"]):
+        return None
+
     msg = (
         f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
         f"Price:`{chosen['last_price']}`\n"
@@ -932,15 +915,11 @@ def pick_coin():
             notify(f"⚠️ Max concurrent positions active ({MAX_CONCURRENT_POS}). Skipping new buy.")
             return None
         RECENT_BUYS[chosen["symbol"]] = {"ts": time.time(), "reserved": True, "closed": False, "processing": False}
-        if USE_SHELVE:
-            persist_recent_buys()
 
     sent = send_telegram(msg)
     if sent:
         with RECENT_BUYS_LOCK:
             RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
-            if USE_SHELVE:
-                persist_recent_buys()
         if ENABLE_TRADING:
             t = threading.Thread(target=execute_trade, args=(chosen,), daemon=True)
             t.start()
@@ -948,12 +927,10 @@ def pick_coin():
     else:
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(chosen["symbol"], None)
-            if USE_SHELVE:
-                persist_recent_buys()
         return None
 
 # -------------------------
-# Execute trade (sets ACTIVE_TRADE)
+# Execute trade
 # -------------------------
 def execute_trade(chosen):
     symbol = chosen["symbol"]
@@ -963,16 +940,11 @@ def execute_trade(chosen):
             send_telegram(f"⚠️ Max concurrent positions reached. Skipping {symbol}")
             return False
         RECENT_BUYS[symbol] = {"ts": now, "reserved": False, "closed": False, "processing": True}
-        if USE_SHELVE:
-            persist_recent_buys()
-
     client = init_binance_client()
     if not client:
         send_telegram(f"⚠️ Trading disabled or client missing. Skipping live trade for {symbol}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            if USE_SHELVE:
-                persist_recent_buys()
         try: ACTIVE_TRADE.clear()
         except Exception: pass
         return False
@@ -986,8 +958,6 @@ def execute_trade(chosen):
             send_telegram("⚠️ Buy amount not configured. Skipping trade.")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
-                if USE_SHELVE:
-                    persist_recent_buys()
             try: ACTIVE_TRADE.clear()
             except Exception: pass
             return False
@@ -997,18 +967,13 @@ def execute_trade(chosen):
             send_telegram(f"⚠️ Buy executed but no fill qty for {symbol}. Raw: {order}")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
-                if USE_SHELVE:
-                    persist_recent_buys()
             try: ACTIVE_TRADE.clear()
             except Exception: pass
             return False
 
         with RECENT_BUYS_LOCK:
             RECENT_BUYS[symbol].update({"qty": executed_qty, "buy_price": avg_price, "ts": now, "processing": False})
-            if USE_SHELVE:
-                persist_recent_buys()
 
-        # set pause for scanning
         try:
             ACTIVE_TRADE.set()
         except Exception:
@@ -1039,12 +1004,10 @@ def execute_trade(chosen):
                     "closed": False,
                     "processing": False,
                 })
-                if USE_SHELVE:
-                    persist_recent_buys()
 
             send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
 
-            # short blocking poll to catch immediate fills
+            # short poll for immediate fills
             try:
                 if sell_order_id:
                     filled_order = wait_for_order_fill(client, symbol, sell_order_id, timeout=8, poll=1.0)
@@ -1077,7 +1040,6 @@ def execute_trade(chosen):
             except Exception:
                 pass
 
-            # not immediately filled -> keep RECENT_BUYS and let watch_orders / monitor handle final close
             return True
         else:
             notify(f"⚠️ limit sell placement failed for {symbol}, attempting market sell fallback.")
@@ -1087,11 +1049,8 @@ def execute_trade(chosen):
                     add_blacklist(symbol)
                     finalize_close(symbol, {"closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
                 else:
-                    # remove to avoid blocking and clear active flag
                     if symbol in RECENT_BUYS:
                         RECENT_BUYS.pop(symbol, None)
-                        if USE_SHELVE:
-                            persist_recent_buys()
                     try:
                         ACTIVE_TRADE.clear()
                     except Exception:
@@ -1105,8 +1064,6 @@ def execute_trade(chosen):
         send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            if USE_SHELVE:
-                persist_recent_buys()
         try: ACTIVE_TRADE.clear()
         except Exception: pass
         return False
@@ -1114,14 +1071,40 @@ def execute_trade(chosen):
         send_telegram(f"‼️ Unexpected error during trade {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-            if USE_SHELVE:
-                persist_recent_buys()
         try: ACTIVE_TRADE.clear()
         except Exception: pass
         return False
 
 # -------------------------
-# Monitor positions (force market sell if stale)
+# wait_for_order_fill
+# -------------------------
+def wait_for_order_fill(client, symbol, order_id, timeout=10, poll=1.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            o = None
+            try:
+                o = client.get_order(symbol=symbol, orderId=order_id)
+            except Exception:
+                try:
+                    o = client.get_order(symbol=symbol, origClientOrderId=str(order_id))
+                except Exception:
+                    o = None
+            if not o:
+                time.sleep(poll)
+                continue
+            status = (o.get("status") or "").upper()
+            if status == "FILLED":
+                return o
+            if status in ("CANCELED", "REJECTED"):
+                return o
+        except Exception:
+            pass
+        time.sleep(poll)
+    return None
+
+# -------------------------
+# Monitor positions (stale + drawdown -> market sell)
 # -------------------------
 def monitor_positions():
     while True:
@@ -1135,39 +1118,67 @@ def monitor_positions():
                     ts = pos.get("ts", 0)
                     qty = pos.get("qty") or 0.0
                     processing = pos.get("processing", False)
+                    buy_price = pos.get("buy_price") or 0.0
                     if qty <= 0 or processing:
                         continue
                     if now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
                         RECENT_BUYS[sym]["processing"] = True
-                        if USE_SHELVE:
-                            persist_recent_buys()
-                        to_process.append((sym, pos))
-            for sym, pos in to_process:
-                notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — executing market sell fallback to close position.")
+                        to_process.append((sym, pos, "stale"))
+                        continue
+                    try:
+                        last = fetch_symbol_price(sym)
+                        if last is not None and buy_price > 0:
+                            pct = (last - buy_price) / buy_price * 100.0
+                            if pct <= -abs(SELL_DRAWDOWN_PCT):
+                                RECENT_BUYS[sym]["processing"] = True
+                                to_process.append((sym, pos, "drawdown", last, pct))
+                    except Exception:
+                        pass
+
+            for item in to_process:
                 try:
-                    qty = pos.get("qty")
-                    resp = place_market_sell_fallback(sym, qty, None)
-                    if resp:
-                        add_blacklist(sym)
-                        notify(f"ℹ️ Position {sym} force-sold by monitor.")
-                        finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_market_fallback", "close_resp": resp})
-                    else:
+                    if item[2] == "stale":
+                        sym, pos = item[0], item[1]
+                        notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — executing market sell fallback to close position.")
+                        qty = pos.get("qty")
+                        resp = place_market_sell_fallback(sym, qty, None)
+                        if resp:
+                            add_blacklist(sym)
+                            notify(f"ℹ️ Position {sym} force-sold by monitor.")
+                            finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_market_fallback", "close_resp": resp})
+                        else:
+                            with RECENT_BUYS_LOCK:
+                                if sym in RECENT_BUYS:
+                                    RECENT_BUYS[sym].update({"processing": False})
+                            notify(f"⚠️ Monitor failed to market-sell {sym}. Will retry later.")
+                    elif item[2] == "drawdown":
+                        sym, pos, _, last, pct = item[0], item[1], item[2], item[3], item[4]
+                        notify(f"⚠️ Position {sym} drawdown detected {pct:.2f}% (last={last}, buy={pos.get('buy_price')}). Selling to limit loss.")
+                        qty = pos.get("qty")
+                        resp = place_market_sell_fallback(sym, qty, None)
+                        if resp:
+                            add_blacklist(sym)
+                            notify(f"ℹ️ Position {sym} sold due to drawdown ({pct:.2f}%).")
+                            finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_drawdown_market", "close_resp": resp})
+                        else:
+                            with RECENT_BUYS_LOCK:
+                                if sym in RECENT_BUYS:
+                                    RECENT_BUYS[sym].update({"processing": False})
+                            notify(f"⚠️ Monitor failed to market-sell {sym} for drawdown. Will retry later.")
+                except Exception as e:
+                    try:
+                        sym = item[0]
                         with RECENT_BUYS_LOCK:
                             if sym in RECENT_BUYS:
                                 RECENT_BUYS[sym].update({"processing": False})
-                                if USE_SHELVE:
-                                    persist_recent_buys()
-                        notify(f"⚠️ Monitor failed to market-sell {sym}. Will retry later.")
-                except Exception as e:
-                    with RECENT_BUYS_LOCK:
-                        if sym in RECENT_BUYS:
-                            RECENT_BUYS[sym].update({"processing": False})
-                            if USE_SHELVE:
-                                persist_recent_buys()
-                    notify(f"⚠️ Monitor failed to market-sell {sym}: {e}")
+                    except Exception:
+                        pass
+                    notify(f"⚠️ Monitor processing failed for {item}: {e}")
+
             time.sleep(MONITOR_INTERVAL)
-        except Exception:
-            time.sleep(MONITOR_INTERVAL)
+        except Exception as e:
+            print("monitor_positions loop error", e)
+            time.sleep(max(5, MONITOR_INTERVAL))
 
 # -------------------------
 # Watch orders (poll for fills)
@@ -1236,7 +1247,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Signal bot running"
+    return "Signal bot running (stateless)"
 
 def trade_cycle():
     while True:
@@ -1258,5 +1269,4 @@ if __name__ == "__main__":
     tmon = threading.Thread(target=monitor_positions, daemon=True); tmon.start()
     twatch = threading.Thread(target=watch_orders, daemon=True); twatch.start()
     t = threading.Thread(target=trade_cycle, daemon=True); t.start()
-    # start web
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), threaded=True)
