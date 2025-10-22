@@ -1,3 +1,5 @@
 flask
 requests
 python-binance
+pytz
+concurrent-log-handler
