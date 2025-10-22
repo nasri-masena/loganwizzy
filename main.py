@@ -7,8 +7,6 @@ import statistics
 import shelve
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # try import python-binance
 try:
@@ -18,67 +16,75 @@ except Exception:
     Client = None
     BinanceAPIException = Exception
 
-# ---------- config ----------
+# -------------------------
+# Config (tweak for speed)
+# -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "True").lower() in ("1", "true", "yes")
 BUY_USDT_AMOUNT = float(os.getenv("BUY_USDT_AMOUNT", "11.50"))
-LIMIT_PROFIT_PCT = float(os.getenv("LIMIT_PROFIT_PCT", "1.1"))
+LIMIT_PROFIT_PCT = float(os.getenv("LIMIT_PROFIT_PCT", "1.1"))  # percent
 BUY_BY_QUOTE = os.getenv("BUY_BY_QUOTE", "True").lower() in ("1", "true", "yes")
 BUY_BASE_QTY = float(os.getenv("BUY_BASE_QTY", "0.0"))
 MAX_CONCURRENT_POS = int(os.getenv("MAX_CONCURRENT_POS", "5"))
 
-BINANCE_REST = os.getenv("BINANCE_REST", "https://api.binance.com")
+BINANCE_REST = "https://api.binance.com"
 QUOTE = os.getenv("QUOTE", "USDT")
+
+# thresholds & filters
 PRICE_MIN = float(os.getenv("PRICE_MIN", "0.6"))
 PRICE_MAX = float(os.getenv("PRICE_MAX", "6.0"))
 MIN_VOLUME = int(os.getenv("MIN_VOLUME", str(800_000)))
 TOP_BY_24H_VOLUME = int(os.getenv("TOP_BY_24H_VOLUME", "48"))
+
+# performance knobs (increased concurrency + cache)
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "3"))
 KLINES_5M_LIMIT = int(os.getenv("KLINES_5M_LIMIT", "6"))
 KLINES_1M_LIMIT = int(os.getenv("KLINES_1M_LIMIT", "6"))
 OB_DEPTH = int(os.getenv("OB_DEPTH", "3"))
 MIN_OB_IMBALANCE = float(os.getenv("MIN_OB_IMBALANCE", "1.2"))
 MAX_OB_SPREAD_PCT = float(os.getenv("MAX_OB_SPREAD_PCT", "1.0"))
-CACHE_TTL = float(os.getenv("CACHE_TTL", "2.0"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "24"))
-RECENT_BUYS = {}
-BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "900"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
-PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "12"))  # lowered to reduce rate pressure
-RECENT_BUYS_DB = os.path.join(os.getcwd(), "recent_buys.db")
 
-# indicators / thresholds
-KLINES_5M_LIMIT = max(2, KLINES_5M_LIMIT)
-KLINES_1M_LIMIT = max(2, KLINES_1M_LIMIT)
+CACHE_TTL = float(os.getenv("CACHE_TTL", "2.0"))            # seconds - slightly longer cache
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8"))
+PUBLIC_CONCURRENCY = int(os.getenv("PUBLIC_CONCURRENCY", "12"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "24"))
+
+# strategy thresholds
+MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.8"))   # 0.8%
+MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.6"))
+VOL_5M_MIN = float(os.getenv("VOL_5M_MIN", "0.0004"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 EMA_SHORT = int(os.getenv("EMA_SHORT", "3"))
 EMA_LONG = int(os.getenv("EMA_LONG", "10"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-MIN_5M_PCT = float(os.getenv("MIN_5M_PCT", "0.6"))
-MIN_1M_PCT = float(os.getenv("MIN_1M_PCT", "0.8"))  # user requested 0.80% (1m)
-VOL_5M_MIN = float(os.getenv("VOL_5M_MIN", "0.0004"))
-OB_DEPTH = OB_DEPTH
-MIN_OB_IMBALANCE = MIN_OB_IMBALANCE
-MAX_OB_SPREAD_PCT = MAX_OB_SPREAD_PCT
-CACHE_TTL = CACHE_TTL
 
-# persistence / misc
+# other
+RECENT_BUYS = {}
+BUY_LOCK_SECONDS = int(os.getenv("BUY_LOCK_SECONDS", "900"))
+RECENT_BUYS_DB = os.path.join(os.getcwd(), "recent_buys.db")
 USE_SHELVE = os.getenv("USE_SHELVE", "True").lower() in ("1", "true", "yes")
 REMOVE_AFTER_CLOSE = os.getenv("REMOVE_AFTER_CLOSE", "True").lower() in ("1", "true", "yes")
 
-# network / proxy
-HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-HTTPS_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-
-# runtime controls
+# monitor / sell configs
 SHORT_BUY_SELL_DELAY = float(os.getenv("SHORT_BUY_SELL_DELAY", "0.3"))
 HOLD_THRESHOLD_HOURS = float(os.getenv("HOLD_THRESHOLD_HOURS", "4.0"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "60"))
 LIMIT_SELL_RETRIES = int(os.getenv("LIMIT_SELL_RETRIES", "3"))
+VOL_1M_THRESHOLD = float(os.getenv("VOL_1M_THRESHOLD", "0.005"))
 
-# ---------- concurrency / locks / cache ----------
+# blacklist
+BLACKLIST_HOURS = float(os.getenv("BLACKLIST_HOURS", "4.0"))
+BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
+BLACKLIST = {}
+
+# one-active-trade mode: scan pauses when a trade is active
+SCAN_PAUSE_ON_OPEN = True
+
+# -------------------------
+# Concurrency / locks / cache
+# -------------------------
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
 RECENT_BUYS_LOCK = threading.Lock()
 _cache = {}
@@ -86,27 +92,14 @@ _cache_lock = threading.Lock()
 OPEN_ORDERS_CACHE = {"data": None, "ts": 0}
 OPEN_ORDERS_LOCK = threading.Lock()
 TEMP_SKIP = {}
-RATE_LIMIT_BACKOFF_UNTIL = 0.0  # timestamp when public calls may resume after 418
+RATE_LIMIT_BACKOFF = None
 
-# ---------- requests session with retries ----------
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-})
-if HTTP_PROXY or HTTPS_PROXY:
-    SESSION.proxies.update({"http": HTTP_PROXY or "", "https": HTTPS_PROXY or ""})
+# global: one-active-trade event
+ACTIVE_TRADE = threading.Event()
 
-_retry = Retry(
-    total=3,
-    backoff_factor=0.7,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(['GET', 'POST'])
-)
-SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
-SESSION.mount("http://", HTTPAdapter(max_retries=_retry))
-
-# ---------- cache/persist helpers ----------
+# -------------------------
+# Cache helpers
+# -------------------------
 def cache_get(key):
     with _cache_lock:
         v = _cache.get(key)
@@ -122,6 +115,9 @@ def cache_set(key, val):
     with _cache_lock:
         _cache[key] = (time.time(), val)
 
+# -------------------------
+# Persist recent buys (shelve)
+# -------------------------
 def load_recent_buys():
     if not USE_SHELVE:
         return
@@ -132,9 +128,7 @@ def load_recent_buys():
             if isinstance(data, dict):
                 RECENT_BUYS.update(data)
             if isinstance(bl, dict):
-                # keep compatibility with earlier schema if present
-                for k, v in bl.items():
-                    TEMP_SKIP[k] = v
+                BLACKLIST.update(bl)
     except Exception:
         pass
 
@@ -144,14 +138,15 @@ def persist_recent_buys():
     try:
         with shelve.open(RECENT_BUYS_DB) as db:
             db["data"] = RECENT_BUYS
-            # persist TEMP_SKIP as blacklist legacy
-            db["blacklist"] = {k: v for k, v in TEMP_SKIP.items()}
+            db["blacklist"] = BLACKLIST
     except Exception:
         pass
 
 load_recent_buys()
 
-# ---------- telegram ----------
+# -------------------------
+# Telegram helper
+# -------------------------
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
         print(message)
@@ -159,7 +154,7 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        r = SESSION.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         return r.status_code == 200
     except Exception as e:
         print("Telegram error", e)
@@ -167,7 +162,9 @@ def send_telegram(message):
 
 notify = send_telegram
 
-# ---------- math / indicators ----------
+# -------------------------
+# Math / indicators
+# -------------------------
 def pct_change(open_p, close_p):
     try:
         if float(open_p) == 0:
@@ -243,43 +240,23 @@ def orderbook_bullish(ob, depth=10, min_imbalance=1.5, max_spread_pct=0.4, min_q
     except Exception:
         return False
 
-# ---------- public REST helpers (with 418 handling) ----------
-def _set_rate_limit_backoff(seconds=600):
-    global RATE_LIMIT_BACKOFF_UNTIL
-    RATE_LIMIT_BACKOFF_UNTIL = time.time() + seconds
-    print(f"Rate-limit backoff set for {seconds} seconds (until {RATE_LIMIT_BACKOFF_UNTIL})")
-
+# -------------------------
+# Binance public calls (cached + semaphore)
+# -------------------------
 def fetch_tickers():
     key = "tickers"
     cached = cache_get(key)
     if cached:
         return cached
-    # if we are in backoff due to 418, return cached or empty quickly
-    if time.time() < RATE_LIMIT_BACKOFF_UNTIL:
-        print("fetch_tickers: in backoff due to previous 418. returning empty.")
-        return cached or []
-    url = BINANCE_REST + "/api/v3/ticker/24hr"
     try:
         with REQUESTS_SEMAPHORE:
-            resp = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 418:
-            # server returned teapot; record backoff and log body
-            body = resp.text[:800]
-            print("fetch_tickers 418 response snippet:", body)
-            # escalate backoff (longer) because 418 likely IP block
-            _set_rate_limit_backoff(seconds=900)
-            return []
+            resp = requests.get(BINANCE_REST + "/api/v3/ticker/24hr", timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         cache_set(key, data)
         return data
-    except requests.exceptions.RequestException as e:
-        print("fetch_tickers error", e)
-        # if suspiciously many errors set a short backoff
-        _set_rate_limit_backoff(seconds=60)
-        return []
     except Exception as e:
-        print("fetch_tickers unexpected", e)
+        print("fetch_tickers error", e)
         return []
 
 def fetch_klines(symbol, interval, limit):
@@ -287,14 +264,10 @@ def fetch_klines(symbol, interval, limit):
     cached = cache_get(key)
     if cached:
         return cached
-    if time.time() < RATE_LIMIT_BACKOFF_UNTIL:
-        return cached or []
     try:
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         with REQUESTS_SEMAPHORE:
-            resp = SESSION.get(BINANCE_REST + "/api/v3/klines", params=params, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 418:
-            _set_rate_limit_backoff(seconds=900); return []
+            resp = requests.get(BINANCE_REST + "/api/v3/klines", params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         cache_set(key, data)
@@ -307,14 +280,10 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
     cached = cache_get(key)
     if cached:
         return cached
-    if time.time() < RATE_LIMIT_BACKOFF_UNTIL:
-        return cached or {}
     try:
         params = {"symbol": symbol, "limit": max(5, limit)}
         with REQUESTS_SEMAPHORE:
-            resp = SESSION.get(BINANCE_REST + "/api/v3/depth", params=params, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 418:
-            _set_rate_limit_backoff(seconds=900); return {}
+            resp = requests.get(BINANCE_REST + "/api/v3/depth", params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         cache_set(key, data)
@@ -322,40 +291,44 @@ def fetch_order_book(symbol, limit=OB_DEPTH):
     except Exception:
         return {}
 
-# ---------- exchange client helpers ----------
+# -------------------------
+# Client / exchange info
+# -------------------------
 _binance_client = None
 _symbol_info_cache = {}
 
 def init_binance_client():
     global _binance_client
     if not Client:
+        print("python-binance not installed")
         return None
     if _binance_client:
         return _binance_client
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
+        print("Binance API keys not set")
         return None
-    try:
-        _binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-        return _binance_client
-    except Exception:
-        return None
+    _binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    return _binance_client
 
 def fetch_exchange_info():
     key = "exchange_info"
     cached = cache_get(key)
     if cached:
         return cached
-    client = init_binance_client()
     try:
-        if client:
-            data = client.get_exchange_info()
-            cache_set(key, data); return data
-        # fallback to REST
-        resp = SESSION.get(BINANCE_REST + "/api/v3/exchangeInfo", timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        cache_set(key, data); return data
-    except Exception:
+        client = init_binance_client()
+        if not client:
+            with REQUESTS_SEMAPHORE:
+                r = requests.get(BINANCE_REST + "/api/v3/exchangeInfo", timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            cache_set(key, data)
+            return data
+        data = client.get_exchange_info()
+        cache_set(key, data)
+        return data
+    except Exception as e:
+        print("fetch_exchange_info error", e)
         return {}
 
 def get_symbol_info(symbol):
@@ -412,21 +385,71 @@ def format_price(p, tick):
     prec = int(round(-math.log10(tick))) if tick < 1 else 0
     return ("{:0." + str(prec) + "f}").format(float(p))
 
-# ---------- simple persist helpers (blacklist) ----------
-def add_blacklist(symbol, seconds=3600*24):
+def ceil_step(v, step):
+    if not step or step == 0:
+        return v
+    return math.ceil(v / step) * step
+
+def get_free_asset(asset):
+    client = init_binance_client()
+    if not client:
+        return 0.0
+    try:
+        b = client.get_asset_balance(asset=asset)
+        if b:
+            return float(b.get("free") or 0.0)
+    except Exception:
+        pass
+    try:
+        acc = client.get_account()
+        for bal in acc.get("balances", []):
+            if bal.get("asset") == asset:
+                return float(bal.get("free") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+# -------------------------
+# Finalize close (clears ACTIVE_TRADE)
+# -------------------------
+def finalize_close(symbol, update_fields=None):
+    with RECENT_BUYS_LOCK:
+        if symbol not in RECENT_BUYS:
+            try:
+                ACTIVE_TRADE.clear()
+            except Exception:
+                pass
+            return
+        if REMOVE_AFTER_CLOSE:
+            RECENT_BUYS.pop(symbol, None)
+        else:
+            if update_fields:
+                RECENT_BUYS[symbol].update(update_fields)
+            RECENT_BUYS[symbol]["closed"] = True
+        if USE_SHELVE:
+            persist_recent_buys()
+    try:
+        ACTIVE_TRADE.clear()
+    except Exception:
+        pass
+
+# -------------------------
+# Blacklist helpers
+# -------------------------
+def add_blacklist(symbol, seconds=BLACKLIST_SECONDS):
     if not symbol:
         return
-    TEMP_SKIP[symbol] = time.time() + int(seconds)
+    BLACKLIST[symbol] = time.time() + int(seconds)
     if USE_SHELVE:
         persist_recent_buys()
 
 def is_blacklisted(symbol):
-    exp = TEMP_SKIP.get(symbol)
+    exp = BLACKLIST.get(symbol)
     if not exp:
         return False
     if time.time() >= exp:
         try:
-            TEMP_SKIP.pop(symbol, None)
+            BLACKLIST.pop(symbol, None)
             if USE_SHELVE:
                 persist_recent_buys()
         except Exception:
@@ -434,7 +457,28 @@ def is_blacklisted(symbol):
         return False
     return True
 
-# ---------- order helpers (unchanged, shortened for brevity) ----------
+# -------------------------
+# Market buy helpers
+# -------------------------
+def place_market_buy_by_quote(symbol, quote_qty):
+    client = init_binance_client()
+    if not client:
+        raise RuntimeError("Binance client not available")
+    try:
+        order = client.order_market_buy(symbol=symbol, quoteOrderQty=str(quote_qty))
+        return order
+    except BinanceAPIException:
+        book = fetch_order_book(symbol, limit=5)
+        if not book:
+            raise
+        top_ask = float(book["asks"][0][0])
+        raw_qty = quote_qty / top_ask
+        qty, _ = adjust_qty_price_for_filters(symbol, raw_qty, top_ask)
+        if qty <= 0:
+            raise RuntimeError("Computed qty below symbol min after filters")
+        order = client.order_market_buy(symbol=symbol, quantity=str(qty))
+        return order
+
 def parse_market_fill(order_resp):
     fills = order_resp.get("fills") or []
     if not fills:
@@ -454,7 +498,276 @@ def parse_market_fill(order_resp):
     avg_price = (total_quote / total_qty) if total_qty else 0.0
     return total_qty, avg_price
 
-# ---------- evaluate_symbol (user filters: 1m >= 0.8%, vol5m >= 0.0004, ob_bull True, score>=30, RSI<=70) ----------
+# -------------------------
+# Market sell fallback
+# -------------------------
+def place_market_sell_fallback(symbol, qty, f=None):
+    try:
+        if not f:
+            info = get_symbol_info(symbol)
+            f = None
+            if info:
+                for fil in info.get("filters", []):
+                    if fil.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                        f = fil
+                        break
+            f = f or {}
+    except Exception:
+        f = f or {}
+    try:
+        try:
+            qty_str = format_qty(qty, float(f.get('stepSize', 0.0)))
+        except Exception:
+            qty_str = str(qty)
+        notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
+        c = init_binance_client()
+        if not c:
+            notify(f"❌ Market sell fallback failed for {symbol}: Binance client unavailable")
+            return None
+        try:
+            resp = c.order_market_sell(symbol=symbol, quantity=qty_str)
+            notify(f"✅ Market sell fallback executed for {symbol}")
+            try:
+                with OPEN_ORDERS_LOCK:
+                    OPEN_ORDERS_CACHE['data'] = None
+                    OPEN_ORDERS_CACHE['ts'] = 0
+            except Exception:
+                pass
+            return resp
+        except Exception as e:
+            if 'NOTIONAL' in str(e) or '-1013' in str(e):
+                notify(f"🚫 Market sell for {symbol} failed: position below minNotional. Suppressing future attempts for 24 hours.")
+                TEMP_SKIP[symbol] = time.time() + 24*60*60
+                return None
+            try:
+                resp = c.create_order(symbol=symbol, side='SELL', type='MARKET', quantity=qty_str)
+                notify(f"✅ Market sell fallback executed for {symbol} (via create_order)")
+                try:
+                    with OPEN_ORDERS_LOCK:
+                        OPEN_ORDERS_CACHE['data'] = None
+                        OPEN_ORDERS_CACHE['ts'] = 0
+                except Exception:
+                    pass
+                return resp
+            except Exception as e2:
+                if 'NOTIONAL' in str(e2) or '-1013' in str(e2):
+                    notify(f"🚫 Market sell for {symbol} failed: position below minNotional. Suppressing future attempts for 24 hours.")
+                    TEMP_SKIP[symbol] = time.time() + 24*60*60
+                    return None
+                notify(f"❌ Market sell fallback failed for {symbol}: {e2}")
+                return None
+    except Exception as e:
+        if 'NOTIONAL' in str(e) or '-1013' in str(e):
+            notify(f"🚫 Market sell for {symbol} failed: position below minNotional. Suppressing future attempts for 24 hours.")
+            TEMP_SKIP[symbol] = time.time() + 24*60*60
+        notify(f"❌ Market sell fallback failed for {symbol}: {e}")
+        return None
+
+# -------------------------
+# Limit sell strict
+# -------------------------
+def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
+    if retries is None:
+        retries = LIMIT_SELL_RETRIES
+    try:
+        client = init_binance_client()
+        if not client:
+            notify(f"⚠️ place_limit_sell_strict: binance client missing")
+            return None
+
+        info = get_symbol_info(symbol)
+        if not info:
+            notify(f"⚠️ place_limit_sell_strict: missing symbol info for {symbol}")
+            return None
+
+        def _floor_to_step(v, step):
+            if not step or step == 0:
+                return float(v)
+            return math.floor(float(v) / step) * step
+
+        def _ceil_to_tick(v, tick):
+            if not tick or tick == 0:
+                return float(v)
+            return math.ceil(float(v) / tick) * tick
+
+        filters = {f["filterType"]: f for f in info.get("filters", [])}
+        step = float(filters.get("LOT_SIZE", {}).get("stepSize") or filters.get("MARKET_LOT_SIZE", {}).get("stepSize") or 0.0)
+        tick = float(filters.get("PRICE_FILTER", {}).get("tickSize") or 0.0)
+        min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional") or 0.0)
+
+        asset = symbol[:-len(QUOTE)] if QUOTE and symbol.endswith(QUOTE) else None
+
+        def _get_free_asset(a):
+            try:
+                bal = client.get_asset_balance(asset=a)
+                if bal:
+                    return float(bal.get("free") or 0.0)
+            except Exception:
+                pass
+            try:
+                acc = client.get_account()
+                for b in acc.get("balances", []):
+                    if b.get("asset") == a:
+                        return float(b.get("free") or 0.0)
+            except Exception:
+                pass
+            return 0.0
+
+        def _free_reserved_qty():
+            reserved = 0.0
+            try:
+                open_orders = client.get_open_orders(symbol=symbol)
+                for o in open_orders or []:
+                    if (o.get('side') or "").upper() == 'SELL':
+                        orig = float(o.get('origQty') or 0.0)
+                        executed = float(o.get('executedQty') or 0.0)
+                        reserved += max(0.0, orig - executed)
+                return reserved, open_orders or []
+            except Exception:
+                return 0.0, []
+
+        qty = float(qty)
+        sell_price = float(sell_price)
+
+        if step and step > 0:
+            qty = _floor_to_step(qty, step)
+        if tick and tick > 0:
+            sell_price = _ceil_to_tick(sell_price, tick)
+
+        if qty <= 0:
+            notify("❌ place_limit_sell_strict: qty zero after clipping")
+            return None
+
+        def _meets_min_notional(q, p):
+            if not min_notional or min_notional == 0:
+                return True
+            return (q * p) >= (min_notional - 1e-12)
+
+        if not _meets_min_notional(qty, sell_price):
+            free = _get_free_asset(asset)
+            if free > qty:
+                needed = math.ceil((min_notional / sell_price) / (step or 1)) * (step or 1)
+                if needed <= free + 1e-12:
+                    qty = _floor_to_step(needed, step)
+                    notify(f"ℹ️ Increased qty to meet minNotional: qty={qty}")
+            attempts = 0
+            while not _meets_min_notional(qty, sell_price) and attempts < 40:
+                sell_price = _ceil_to_tick(sell_price + max(1e-8, sell_price * 0.001), tick)
+                attempts += 1
+            if not _meets_min_notional(qty, sell_price):
+                notify(f"⚠️ Cannot meet minNotional for {symbol} (qty*price={qty*sell_price:.8f} < {min_notional}). Will attempt but may fail.")
+
+        qty = _floor_to_step(qty, step)
+        sell_price = _ceil_to_tick(sell_price, tick)
+        qty_str = format_qty(qty, step)
+        price_str = format_price(sell_price, tick)
+
+        free = _get_free_asset(asset)
+        if free + 1e-12 < qty:
+            reserved, open_orders = _free_reserved_qty()
+            if reserved > 0:
+                try:
+                    sells = []
+                    for o in open_orders:
+                        if (o.get("side") or "").upper() == "SELL":
+                            reserved_qty = max(0.0, float(o.get("origQty") or 0.0) - float(o.get("executedQty") or 0.0))
+                            sells.append((reserved_qty, o))
+                    sells.sort(key=lambda x: x[0])
+                    for rqty, o in sells:
+                        try:
+                            client.cancel_order(symbol=symbol, orderId=o.get("orderId"))
+                            notify(f"ℹ️ Cancelled open SELL order {o.get('orderId')} to free {rqty:.8f} {asset}")
+                            time.sleep(0.05)
+                        except Exception:
+                            pass
+                    free = _get_free_asset(asset)
+                except Exception:
+                    free = _get_free_asset(asset)
+            if free + 1e-12 < qty:
+                new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
+                if new_qty <= 0:
+                    notify(f"❌ place_limit_sell_strict: insufficient free {asset} (free={free:.8f}, req={qty:.8f})")
+                    return None
+                notify(f"ℹ️ Adjusting qty down from {qty:.8f} to available {new_qty:.8f}")
+                qty = new_qty
+                qty_str = format_qty(qty, step)
+
+        attempt = 0
+        last_err = None
+        while attempt < retries:
+            attempt += 1
+            try:
+                order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str, timeInForce='GTC')
+                notify(f"✅ LIMIT SELL placed: {symbol} qty={qty_str} @ {price_str}")
+                try:
+                    OPEN_ORDERS_CACHE['data'] = None
+                except Exception:
+                    pass
+                return order
+            except BinanceAPIException as e:
+                err = str(e)
+                last_err = err
+                if '-2010' in err or 'insufficient balance' in err.lower():
+                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err}. Refreshing balance & retrying.")
+                    time.sleep(min(1.0 * attempt, 3.0))
+                    free = _get_free_asset(asset)
+                    if free + 1e-12 < qty:
+                        new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
+                        if new_qty <= 0:
+                            notify("❌ After refresh, no available qty to place limit sell.")
+                            return None
+                        qty = new_qty
+                        qty_str = format_qty(qty, step)
+                        notify(f"ℹ️ Reduced qty to {qty_str} and retrying.")
+                        continue
+                    continue
+                if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err or 'Filter failure' in err:
+                    notify(f"⚠️ Limit sell attempt {attempt} hit minNotional/filter error: {err}. Trying to adjust.")
+                    free = _get_free_asset(asset)
+                    needed = math.ceil((min_notional / float(sell_price)) / (step or 1)) * (step or 1) if min_notional else qty
+                    if min_notional and needed <= free + 1e-12 and needed > qty:
+                        qty = _floor_to_step(needed, step)
+                        qty_str = format_qty(qty, step)
+                        notify(f"ℹ️ Increased qty to {qty_str} to meet minNotional; retrying.")
+                        time.sleep(0.2)
+                        continue
+                    bump_attempts = 0
+                    while not _meets_min_notional(qty, sell_price) and bump_attempts < 40:
+                        sell_price = _ceil_to_tick(sell_price + max(1e-8, sell_price * 0.001), tick)
+                        price_str = format_price(sell_price, tick)
+                        bump_attempts += 1
+                    time.sleep(0.2)
+                    continue
+                if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
+                    notify("❗ Rate-limit detected placing limit sell — backing off and skipping symbol for a bit.")
+                    TEMP_SKIP[symbol] = time.time() + 60
+                    return None
+                notify(f"⚠️ Limit sell attempt {attempt} failed: {err}. Retrying (delay {delay*attempt}s).")
+                time.sleep(delay * attempt)
+            except Exception as e:
+                last_err = str(e)
+                notify(f"⚠️ Unexpected error placing limit sell (attempt {attempt}): {e}")
+                time.sleep(delay * attempt)
+
+        try:
+            notify("⚠️ All limit attempts failed — trying LIMIT_MAKER as last attempt.")
+            lm = client.create_order(symbol=symbol, side='SELL', type='LIMIT_MAKER', quantity=qty_str, price=price_str)
+            notify(f"✅ LIMIT_MAKER placed: {symbol} qty={qty_str} @ {price_str}")
+            return lm
+        except Exception as e:
+            notify(f"❌ Final LIMIT_MAKER attempt failed: {e}")
+
+        notify(f"❌ place_limit_sell_strict: all attempts failed for {symbol}. last_err={last_err}")
+        TEMP_SKIP[symbol] = time.time() + 60
+        return None
+
+    except Exception as e:
+        notify(f"⚠️ place_limit_sell_strict unexpected error for {symbol}: {e}")
+        return None
+
+# -------------------------
+# Evaluate symbol (fast filters, concurrent fetches)
+# -------------------------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
         if not (PRICE_MIN <= last_price <= PRICE_MAX):
@@ -464,7 +777,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         if change_24h < 0.5 or change_24h > 20.0:
             return None
 
-        # fetch klines + orderbook concurrently to reduce wall time
+        # concurrent fetches to reduce wall-time
         with ThreadPoolExecutor(max_workers=3) as ex:
             fut_kl5 = ex.submit(fetch_klines, sym, "5m", KLINES_5M_LIMIT)
             fut_kl1 = ex.submit(fetch_klines, sym, "1m", KLINES_1M_LIMIT)
@@ -543,318 +856,105 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         }
     except Exception:
         return None
-        
-# ---------- execute_trade / place_market_buy_by_quote / place_limit_sell_strict ----------
-def place_market_sell_fallback(symbol, qty, f=None):
-    """
-    Try to perform a market sell fallback when limit sell fails.
-    Returns the exchange response on success or None on failure.
-    """
-    try:
-        # prepare filters info if not provided
-        if not f:
-            try:
-                info = get_symbol_info(symbol)
-                f = None
-                if info:
-                    for fil in info.get("filters", []):
-                        if fil.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
-                            f = fil
-                            break
-            except Exception:
-                f = f or {}
-        f = f or {}
 
-        # format qty respecting step
+# -------------------------
+# Main picker (pauses when ACTIVE_TRADE set)
+# -------------------------
+def pick_coin():
+    if SCAN_PAUSE_ON_OPEN and ACTIVE_TRADE.is_set():
+        return None
+
+    tickers = fetch_tickers()
+    now = time.time()
+    pre = []
+    for t in tickers:
+        sym = t.get("symbol")
+        if not sym or not sym.endswith(QUOTE):
+            continue
         try:
-            qty_str = format_qty(qty, float(f.get('stepSize', 0.0)))
+            last = float(t.get("lastPrice") or 0.0)
+            qvol = float(t.get("quoteVolume") or 0.0)
+            ch = float(t.get("priceChangePercent") or 0.0)
         except Exception:
-            qty_str = str(qty)
-
-        notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
-        c = init_binance_client()
-        if not c:
-            notify(f"❌ Market sell fallback failed for {symbol}: Binance client unavailable")
-            return None
-
-        # try normal market sell by quantity
-        try:
-            resp = c.order_market_sell(symbol=symbol, quantity=qty_str)
-            notify(f"✅ Market sell fallback executed for {symbol} (by qty)")
+            continue
+        if not (PRICE_MIN <= last <= PRICE_MAX):
+            continue
+        if qvol < MIN_VOLUME:
+            continue
+        if ch < 0.5 or ch > 20.0:
+            continue
+        with RECENT_BUYS_LOCK:
+            last_buy = RECENT_BUYS.get(sym)
+            if last_buy and not last_buy.get("closed"):
+                continue
+            if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
+                continue
+        if is_blacklisted(sym):
+            continue
+        pre.append((sym, last, qvol, ch))
+    if not pre:
+        return None
+    pre.sort(key=lambda x: x[2], reverse=True)
+    candidates = pre[:TOP_BY_24H_VOLUME]
+    results = []
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
+        futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
+        for fut in as_completed(futures):
             try:
-                with OPEN_ORDERS_LOCK:
-                    OPEN_ORDERS_CACHE['data'] = None
-                    OPEN_ORDERS_CACHE['ts'] = 0
+                res = fut.result()
             except Exception:
-                pass
-            return resp
-        except Exception as e:
-            # handle notional/quote-order issues by trying alternative flows
-            err = str(e)
-            # if the SDK raised min notional error, suppress further attempts for this symbol for 24h
-            if 'NOTIONAL' in err or '-1013' in err:
-                notify(f"🚫 Market sell for {symbol} failed: position below minNotional. Suppressing future attempts for 24 hours.")
-                TEMP_SKIP[symbol] = time.time() + 24*60*60
-                return None
+                res = None
+            if res:
+                results.append(res)
+    if not results:
+        return None
+    strongs = [r for r in results if r.get("strong_candidate")]
+    chosen_pool = strongs if strongs else results
+    chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
 
-            # fallback: compute qty from book and try create_order / alternative signatures
-            try:
-                book = fetch_order_book(symbol, limit=5)
-                if not book or not book.get("asks"):
-                    raise RuntimeError("order book empty")
-                top_bid = float(book["bids"][0][0])
-                top_ask = float(book["asks"][0][0])
-                # try market sell by quote not supported in some SDKs; try create_order, then order_market_sell
-                raw_qty = qty
-                # format again
-                try:
-                    qty_str = format_qty(raw_qty, float(f.get('stepSize', 0.0)))
-                except Exception:
-                    qty_str = str(raw_qty)
-                try:
-                    resp = c.create_order(symbol=symbol, side='SELL', type='MARKET', quantity=qty_str)
-                    notify(f"✅ Market sell fallback executed for {symbol} (via create_order)")
-                    try:
-                        with OPEN_ORDERS_LOCK:
-                            OPEN_ORDERS_CACHE['data'] = None
-                            OPEN_ORDERS_CACHE['ts'] = 0
-                    except Exception:
-                        pass
-                    return resp
-                except Exception as e2:
-                    err2 = str(e2)
-                    if 'NOTIONAL' in err2 or '-1013' in err2:
-                        notify(f"🚫 Market sell for {symbol} failed: position below minNotional. Suppressing future attempts for 24 hours.")
-                        TEMP_SKIP[symbol] = time.time() + 24*60*60
-                        return None
-                    notify(f"❌ Market sell fallback failed for {symbol}: {e2}")
-                    return None
-            except Exception as e3:
-                notify(f"❌ Market sell fallback final failure for {symbol}: {e3}")
-                return None
+    msg = (
+        f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
+        f"Price:`{chosen['last_price']}`\n"
+        f"24h:`{chosen['24h_change']}`%\n"
+        f"1m:`{chosen['pct_1m']:.2f}`%\n"
+        f"Vol1m:`{chosen['vol_1m']}`\n"
+        f"Orderbook Bullish:`{chosen['ob_bull']}`\n"
+        f"Score:`{chosen['score']:.2f}`"
+    )
 
-    except Exception as e:
-        err = str(e)
-        if 'NOTIONAL' in err or '-1013' in err:
-            notify(f"🚫 Market sell for {symbol} failed: position below minNotional. Suppressing future attempts for 24 hours.")
-            TEMP_SKIP[symbol] = time.time() + 24*60*60
-        notify(f"❌ Market sell fallback failed for {symbol}: {e}")
+    with RECENT_BUYS_LOCK:
+        last_buy = RECENT_BUYS.get(chosen["symbol"])
+        if last_buy and not last_buy.get("closed"):
+            return None
+        if last_buy and time.time() < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
+            return None
+        if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
+            notify(f"⚠️ Max concurrent positions active ({MAX_CONCURRENT_POS}). Skipping new buy.")
+            return None
+        RECENT_BUYS[chosen["symbol"]] = {"ts": time.time(), "reserved": True, "closed": False, "processing": False}
+        if USE_SHELVE:
+            persist_recent_buys()
+
+    sent = send_telegram(msg)
+    if sent:
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
+            if USE_SHELVE:
+                persist_recent_buys()
+        if ENABLE_TRADING:
+            t = threading.Thread(target=execute_trade, args=(chosen,), daemon=True)
+            t.start()
+        return chosen
+    else:
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS.pop(chosen["symbol"], None)
+            if USE_SHELVE:
+                persist_recent_buys()
         return None
 
-
-def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
-    """
-    Place a limit sell with robust retries and filter adjustments.
-    Returns order response or None.
-    """
-    try:
-        client = init_binance_client()
-        if not client:
-            notify(f"⚠️ place_limit_sell_strict: binance client missing")
-            return None
-
-        info = get_symbol_info(symbol)
-        if not info:
-            notify(f"⚠️ place_limit_sell_strict: missing symbol info for {symbol}")
-            return None
-
-        # helpers
-        def _floor_to_step(v, step):
-            if not step or step == 0:
-                return float(v)
-            return math.floor(float(v) / step) * step
-
-        def _ceil_to_tick(v, tick):
-            if not tick or tick == 0:
-                return float(v)
-            return math.ceil(float(v) / tick) * tick
-
-        filters = {f["filterType"]: f for f in info.get("filters", [])}
-        step = float(filters.get("LOT_SIZE", {}).get("stepSize") or filters.get("MARKET_LOT_SIZE", {}).get("stepSize") or 0.0)
-        tick = float(filters.get("PRICE_FILTER", {}).get("tickSize") or 0.0)
-        min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional") or 0.0)
-
-        asset = symbol[:-len(QUOTE)] if QUOTE and symbol.endswith(QUOTE) else None
-
-        def _get_free_asset(a):
-            try:
-                bal = client.get_asset_balance(asset=a)
-                if bal:
-                    return float(bal.get("free") or 0.0)
-            except Exception:
-                pass
-            try:
-                acc = client.get_account()
-                for b in acc.get("balances", []):
-                    if b.get("asset") == a:
-                        return float(b.get("free") or 0.0)
-            except Exception:
-                pass
-            return 0.0
-
-        def _free_reserved_qty():
-            reserved = 0.0
-            try:
-                open_orders = client.get_open_orders(symbol=symbol)
-                for o in open_orders or []:
-                    if (o.get('side') or "").upper() == 'SELL':
-                        orig = float(o.get('origQty') or 0.0)
-                        executed = float(o.get('executedQty') or 0.0)
-                        reserved += max(0.0, orig - executed)
-                return reserved, open_orders or []
-            except Exception:
-                return 0.0, []
-
-        qty = float(qty)
-        sell_price = float(sell_price)
-
-        # clip to step and tick
-        if step and step > 0:
-            qty = _floor_to_step(qty, step)
-        if tick and tick > 0:
-            sell_price = _ceil_to_tick(sell_price, tick)
-
-        if qty <= 0:
-            notify("❌ place_limit_sell_strict: qty zero after clipping")
-            return None
-
-        def _meets_min_notional(q, p):
-            if not min_notional or min_notional == 0:
-                return True
-            return (q * p) >= (min_notional - 1e-12)
-
-        # try to meet min notional by increasing qty or price
-        if not _meets_min_notional(qty, sell_price):
-            free = _get_free_asset(asset) if asset else 0.0
-            if free > qty:
-                needed = math.ceil((min_notional / sell_price) / (step or 1)) * (step or 1)
-                if needed <= free + 1e-12:
-                    qty = _floor_to_step(needed, step)
-                    notify(f"ℹ️ Increased qty to meet minNotional: qty={qty}")
-            attempts = 0
-            while not _meets_min_notional(qty, sell_price) and attempts < 40:
-                sell_price = _ceil_to_tick(sell_price + max(1e-8, sell_price * 0.001), tick)
-                attempts += 1
-            if not _meets_min_notional(qty, sell_price):
-                notify(f"⚠️ Cannot meet minNotional for {symbol} (qty*price={qty*sell_price:.8f} < {min_notional}). Will attempt but may fail.")
-
-        qty = _floor_to_step(qty, step)
-        sell_price = _ceil_to_tick(sell_price, tick)
-        qty_str = format_qty(qty, step)
-        price_str = format_price(sell_price, tick)
-
-        # ensure we have free asset or free up reserved from existing sell orders
-        free = _get_free_asset(asset) if asset else 0.0
-        if free + 1e-12 < qty:
-            reserved, open_orders = _free_reserved_qty()
-            if reserved > 0:
-                try:
-                    sells = []
-                    for o in open_orders:
-                        if (o.get("side") or "").upper() == "SELL":
-                            reserved_qty = max(0.0, float(o.get("origQty") or 0.0) - float(o.get("executedQty") or 0.0))
-                            sells.append((reserved_qty, o))
-                    sells.sort(key=lambda x: x[0])
-                    for rqty, o in sells:
-                        try:
-                            client.cancel_order(symbol=symbol, orderId=o.get("orderId"))
-                            notify(f"ℹ️ Cancelled open SELL order {o.get('orderId')} to free {rqty:.8f} {asset}")
-                            time.sleep(0.05)
-                        except Exception:
-                            pass
-                    free = _get_free_asset(asset)
-                except Exception:
-                    free = _get_free_asset(asset)
-            if free + 1e-12 < qty:
-                new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
-                if new_qty <= 0:
-                    notify(f"❌ place_limit_sell_strict: insufficient free {asset} (free={free:.8f}, req={qty:.8f})")
-                    return None
-                notify(f"ℹ️ Adjusting qty down from {qty:.8f} to available {new_qty:.8f}")
-                qty = new_qty
-                qty_str = format_qty(qty, step)
-
-        attempt = 0
-        last_err = None
-        if retries is None:
-            retries = LIMIT_SELL_RETRIES
-        while attempt < retries:
-            attempt += 1
-            try:
-                order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str, timeInForce='GTC')
-                notify(f"✅ LIMIT SELL placed: {symbol} qty={qty_str} @ {price_str}")
-                try:
-                    with OPEN_ORDERS_LOCK:
-                        OPEN_ORDERS_CACHE['data'] = None
-                except Exception:
-                    pass
-                return order
-            except BinanceAPIException as e:
-                err = str(e)
-                last_err = err
-                # insufficient balance
-                if '-2010' in err or 'insufficient balance' in err.lower():
-                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err}. Refreshing balance & retrying.")
-                    time.sleep(min(1.0 * attempt, 3.0))
-                    free = _get_free_asset(asset)
-                    if free + 1e-12 < qty:
-                        new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
-                        if new_qty <= 0:
-                            notify("❌ After refresh, no available qty to place limit sell.")
-                            return None
-                        qty = new_qty
-                        qty_str = format_qty(qty, step)
-                        notify(f"ℹ️ Reduced qty to {qty_str} and retrying.")
-                        continue
-                    continue
-                # minNotional / filter errors
-                if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err or 'Filter failure' in err:
-                    notify(f"⚠️ Limit sell attempt {attempt} hit minNotional/filter error: {err}. Trying to adjust.")
-                    free = _get_free_asset(asset)
-                    needed = math.ceil((min_notional / float(sell_price)) / (step or 1)) * (step or 1) if min_notional else qty
-                    if min_notional and needed <= free + 1e-12 and needed > qty:
-                        qty = _floor_to_step(needed, step)
-                        qty_str = format_qty(qty, step)
-                        notify(f"ℹ️ Increased qty to {qty_str} to meet minNotional; retrying.")
-                        time.sleep(0.2)
-                        continue
-                    bump_attempts = 0
-                    while not _meets_min_notional(qty, sell_price) and bump_attempts < 40:
-                        sell_price = _ceil_to_tick(sell_price + max(1e-8, sell_price * 0.001), tick)
-                        price_str = format_price(sell_price, tick)
-                        bump_attempts += 1
-                    time.sleep(0.2)
-                    continue
-                # rate limit / too many requests
-                if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
-                    notify("❗ Rate-limit detected placing limit sell — backing off and skipping symbol for a bit.")
-                    TEMP_SKIP[symbol] = time.time() + 60
-                    return None
-                notify(f"⚠️ Limit sell attempt {attempt} failed: {err}. Retrying (delay {delay*attempt}s).")
-                time.sleep(delay * attempt)
-            except Exception as e:
-                last_err = str(e)
-                notify(f"⚠️ Unexpected error placing limit sell (attempt {attempt}): {e}")
-                time.sleep(delay * attempt)
-
-        # final attempt as LIMIT_MAKER
-        try:
-            notify("⚠️ All limit attempts failed — trying LIMIT_MAKER as last attempt.")
-            lm = client.create_order(symbol=symbol, side='SELL', type='LIMIT_MAKER', quantity=qty_str, price=price_str)
-            notify(f"✅ LIMIT_MAKER placed: {symbol} qty={qty_str} @ {price_str}")
-            return lm
-        except Exception as e:
-            notify(f"❌ Final LIMIT_MAKER attempt failed: {e}")
-
-        notify(f"❌ place_limit_sell_strict: all attempts failed for {symbol}. last_err={last_err}")
-        TEMP_SKIP[symbol] = time.time() + 60
-        return None
-
-    except Exception as e:
-        notify(f"⚠️ place_limit_sell_strict unexpected error for {symbol}: {e}")
-        return None
-        
-# ---------- execute_trade (kept compact) ----------
+# -------------------------
+# Execute trade (sets ACTIVE_TRADE)
+# -------------------------
 def execute_trade(chosen):
     symbol = chosen["symbol"]
     now = time.time()
@@ -873,6 +973,8 @@ def execute_trade(chosen):
             RECENT_BUYS.pop(symbol, None)
             if USE_SHELVE:
                 persist_recent_buys()
+        try: ACTIVE_TRADE.clear()
+        except Exception: pass
         return False
 
     try:
@@ -886,6 +988,8 @@ def execute_trade(chosen):
                 RECENT_BUYS.pop(symbol, None)
                 if USE_SHELVE:
                     persist_recent_buys()
+            try: ACTIVE_TRADE.clear()
+            except Exception: pass
             return False
 
         executed_qty, avg_price = parse_market_fill(order)
@@ -895,6 +999,8 @@ def execute_trade(chosen):
                 RECENT_BUYS.pop(symbol, None)
                 if USE_SHELVE:
                     persist_recent_buys()
+            try: ACTIVE_TRADE.clear()
+            except Exception: pass
             return False
 
         with RECENT_BUYS_LOCK:
@@ -902,35 +1008,98 @@ def execute_trade(chosen):
             if USE_SHELVE:
                 persist_recent_buys()
 
+        # set pause for scanning
+        try:
+            ACTIVE_TRADE.set()
+        except Exception:
+            pass
+
         send_telegram(f"✅ BUY EXECUTED: `{symbol}` Qty:`{executed_qty}` @ `{avg_price}` Spent:`{round(executed_qty*avg_price,6)}`")
+
         time.sleep(SHORT_BUY_SELL_DELAY)
 
         sell_price = avg_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
         sell_resp = place_limit_sell_strict(symbol, executed_qty, sell_price)
         if sell_resp:
-            send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
+            sell_order_id = None
+            try:
+                if isinstance(sell_resp, dict):
+                    sell_order_id = sell_resp.get("orderId") or sell_resp.get("order_id") or sell_resp.get("clientOrderId")
+                else:
+                    sell_order_id = getattr(sell_resp, "orderId", None) or getattr(sell_resp, "order_id", None) or getattr(sell_resp, "clientOrderId", None)
+            except Exception:
+                sell_order_id = None
+
             with RECENT_BUYS_LOCK:
-                RECENT_BUYS[symbol].update({"sell_price": sell_price, "sell_resp": sell_resp, "sell_ts": time.time(), "processing": False})
+                RECENT_BUYS[symbol].update({
+                    "sell_price": sell_price,
+                    "sell_resp": sell_resp,
+                    "sell_order_id": sell_order_id,
+                    "sell_ts": time.time(),
+                    "closed": False,
+                    "processing": False,
+                })
                 if USE_SHELVE:
                     persist_recent_buys()
+
+            send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
+
+            # short blocking poll to catch immediate fills
+            try:
+                if sell_order_id:
+                    filled_order = wait_for_order_fill(client, symbol, sell_order_id, timeout=8, poll=1.0)
+                    if filled_order:
+                        st = (filled_order.get("status") or "").upper()
+                        if st == "FILLED":
+                            filled_qty = 0.0
+                            avg_price_fill = 0.0
+                            try:
+                                fills = filled_order.get("fills") or []
+                                if fills:
+                                    tq = 0.0; tq_quote = 0.0
+                                    for f in fills:
+                                        q = float(f.get("qty", 0)); p = float(f.get("price", 0))
+                                        tq += q; tq_quote += q * p
+                                    filled_qty = tq
+                                    avg_price_fill = (tq_quote / tq) if tq else 0.0
+                                else:
+                                    filled_qty = float(filled_order.get("executedQty") or 0.0)
+                                    cquote = float(filled_order.get("cummulativeQuoteQty") or 0.0)
+                                    avg_price_fill = (cquote / filled_qty) if filled_qty else 0.0
+                            except Exception:
+                                filled_qty = executed_qty
+                                avg_price_fill = sell_price
+
+                            add_blacklist(symbol)
+                            finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
+                            send_telegram(f"✅ POSITION CLOSED: `{symbol}` sold {filled_qty} @ {avg_price_fill} (limit immediate)")
+                            return True
+            except Exception:
+                pass
+
+            # not immediately filled -> keep RECENT_BUYS and let watch_orders / monitor handle final close
             return True
         else:
             notify(f"⚠️ limit sell placement failed for {symbol}, attempting market sell fallback.")
-            # fallback logic simplified here; assume place_market_sell_fallback implemented elsewhere
-            try:
-                from math import isfinite
-                resp = None
-            except Exception:
-                resp = None
+            fallback = place_market_sell_fallback(symbol, executed_qty, None)
             with RECENT_BUYS_LOCK:
-                if resp:
+                if fallback:
                     add_blacklist(symbol)
-                    RECENT_BUYS.pop(symbol, None)
+                    finalize_close(symbol, {"closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
                 else:
-                    RECENT_BUYS.pop(symbol, None)
-                if USE_SHELVE:
-                    persist_recent_buys()
-            send_telegram(f"❌ Both limit and market sell failed for {symbol}. Entry removed.")
+                    # remove to avoid blocking and clear active flag
+                    if symbol in RECENT_BUYS:
+                        RECENT_BUYS.pop(symbol, None)
+                        if USE_SHELVE:
+                            persist_recent_buys()
+                    try:
+                        ACTIVE_TRADE.clear()
+                    except Exception:
+                        pass
+            if fallback:
+                send_telegram(f"ℹ️ Market fallback sold {symbol}.")
+            else:
+                send_telegram(f"❌ Both limit and market sell failed for {symbol}. Entry removed to avoid blocking.")
             return False
     except BinanceAPIException as e:
         send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
@@ -938,6 +1107,8 @@ def execute_trade(chosen):
             RECENT_BUYS.pop(symbol, None)
             if USE_SHELVE:
                 persist_recent_buys()
+        try: ACTIVE_TRADE.clear()
+        except Exception: pass
         return False
     except Exception as e:
         send_telegram(f"‼️ Unexpected error during trade {symbol}: {e}")
@@ -945,102 +1116,13 @@ def execute_trade(chosen):
             RECENT_BUYS.pop(symbol, None)
             if USE_SHELVE:
                 persist_recent_buys()
+        try: ACTIVE_TRADE.clear()
+        except Exception: pass
         return False
 
-# ---------- pick_coin (atomic + persistence) ----------
-def pick_coin():
-    tickers = fetch_tickers()
-    now = time.time()
-    pre = []
-    for t in tickers:
-        sym = t.get("symbol")
-        if not sym or not sym.endswith(QUOTE):
-            continue
-        try:
-            last = float(t.get("lastPrice") or 0.0)
-            qvol = float(t.get("quoteVolume") or 0.0)
-            ch = float(t.get("priceChangePercent") or 0.0)
-        except Exception:
-            continue
-        # prefilters to reduce work
-        if not (PRICE_MIN <= last <= PRICE_MAX):
-            continue
-        if qvol < MIN_VOLUME:
-            continue
-        if ch < 0.5 or ch > 20.0:
-            continue
-        with RECENT_BUYS_LOCK:
-            last_buy = RECENT_BUYS.get(sym)
-            if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
-                continue
-        if is_blacklisted(sym):
-            continue
-        pre.append((sym, last, qvol, ch))
-
-    if not pre:
-        return None
-
-    # sort by quote volume then take top N
-    pre.sort(key=lambda x: x[2], reverse=True)
-    candidates = pre[:TOP_BY_24H_VOLUME]
-
-    results = []
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
-        futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): (sym, last) for (sym, last, qvol, ch) in candidates}
-        for fut in as_completed(futures):
-            try:
-                res = fut.result()
-            except Exception:
-                res = None
-            if res:
-                results.append(res)
-
-    if not results:
-        return None
-
-    strongs = [r for r in results if r.get("strong_candidate")]
-    chosen_pool = strongs if strongs else results
-    chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
-
-    msg = (
-        f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
-        f"Price: `{chosen['last_price']}`\n"
-        f"24h Change: `{chosen['24h_change']}`%\n"
-        f"5m Change: `{chosen['pct_5m']:.2f}`%\n"
-        f"1m Change: `{chosen['pct_1m']:.2f}`%\n"
-        f"Volatility 5m: `{chosen['vol_5m']}`\n"
-        f"EMA Uplift: `{chosen.get('ema_uplift', 0.0):.4f}`\n"
-        f"RSI: `{chosen['rsi']}`\n"
-        f"Orderbook Bullish: `{chosen['ob_bull']}`\n"
-        f"Score: `{chosen['score']:.2f}`"
-    )
-
-    now_send = time.time()
-    with RECENT_BUYS_LOCK:
-        last_buy = RECENT_BUYS.get(chosen["symbol"])
-        if last_buy and now_send < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
-            return None
-        RECENT_BUYS[chosen["symbol"]] = {"ts": now_send, "reserved": True}
-        if USE_SHELVE:
-            persist_recent_buys()
-
-    sent = send_telegram(msg)
-    if sent:
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS[chosen["symbol"]].update({"ts": time.time(), "reserved": False})
-            if USE_SHELVE:
-                persist_recent_buys()
-        print(f"[{time.strftime('%H:%M:%S')}] Signal -> {chosen['symbol']} score={chosen['score']:.2f}")
-        return chosen
-    else:
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(chosen["symbol"], None)
-            if USE_SHELVE:
-                persist_recent_buys()
-        print(f"[{time.strftime('%H:%M:%S')}] Telegram send failed for {chosen['symbol']}")
-        return None
-        
-# ---------- background monitors (monitor_positions and watch_orders) ----------
+# -------------------------
+# Monitor positions (force market sell if stale)
+# -------------------------
 def monitor_positions():
     while True:
         try:
@@ -1061,20 +1143,21 @@ def monitor_positions():
                             persist_recent_buys()
                         to_process.append((sym, pos))
             for sym, pos in to_process:
-                notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — monitor attempting forced close.")
-                # simplified fallback handling
+                notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — executing market sell fallback to close position.")
                 try:
                     qty = pos.get("qty")
-                    # place_market_sell_fallback should be implemented if you need forced sells
-                    # resp = place_market_sell_fallback(sym, qty, None)
-                    resp = None
+                    resp = place_market_sell_fallback(sym, qty, None)
                     if resp:
                         add_blacklist(sym)
+                        notify(f"ℹ️ Position {sym} force-sold by monitor.")
+                        finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_market_fallback", "close_resp": resp})
+                    else:
                         with RECENT_BUYS_LOCK:
                             if sym in RECENT_BUYS:
-                                RECENT_BUYS.pop(sym, None)
+                                RECENT_BUYS[sym].update({"processing": False})
                                 if USE_SHELVE:
                                     persist_recent_buys()
+                        notify(f"⚠️ Monitor failed to market-sell {sym}. Will retry later.")
                 except Exception as e:
                     with RECENT_BUYS_LOCK:
                         if sym in RECENT_BUYS:
@@ -1086,6 +1169,9 @@ def monitor_positions():
         except Exception:
             time.sleep(MONITOR_INTERVAL)
 
+# -------------------------
+# Watch orders (poll for fills)
+# -------------------------
 def watch_orders(poll_interval=12):
     client = None
     while True:
@@ -1111,20 +1197,30 @@ def watch_orders(poll_interval=12):
                         continue
                     status = (o.get("status") or "").upper()
                     if status == "FILLED":
-                        send_telegram(f"✅ POSITION CLOSED: `{sym}` sold (limit)")
+                        filled_qty = 0.0; avg_price = 0.0
+                        try:
+                            fills = o.get("fills") or []
+                            if fills:
+                                tq = 0.0; tq_quote = 0.0
+                                for f in fills:
+                                    q = float(f.get("qty", 0)); p = float(f.get("price", 0))
+                                    tq += q; tq_quote += q * p
+                                filled_qty = tq
+                                avg_price = (tq_quote / tq) if tq else 0.0
+                            else:
+                                filled_qty = float(o.get("executedQty") or 0.0)
+                                cquote = float(o.get("cummulativeQuoteQty") or 0.0)
+                                avg_price = (cquote / filled_qty) if filled_qty else 0.0
+                        except Exception:
+                            filled_qty = pos.get("qty") or 0.0
+                            avg_price = pos.get("sell_price") or 0.0
+
+                        send_telegram(f"✅ POSITION CLOSED: `{sym}` sold {filled_qty} @ {avg_price} (limit)")
                         add_blacklist(sym)
-                        with RECENT_BUYS_LOCK:
-                            if sym in RECENT_BUYS:
-                                RECENT_BUYS.pop(sym, None)
-                                if USE_SHELVE:
-                                    persist_recent_buys()
+                        finalize_close(sym, {"closed_ts": time.time(), "close_method": "limit_filled_watch", "close_resp": o, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price})
                     elif status in ("CANCELED", "REJECTED"):
                         send_telegram(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
-                        with RECENT_BUYS_LOCK:
-                            if sym in RECENT_BUYS:
-                                RECENT_BUYS.pop(sym, None)
-                                if USE_SHELVE:
-                                    persist_recent_buys()
+                        finalize_close(sym, {"closed_ts": time.time(), "close_method": f"sell_{status.lower()}", "close_resp": o})
                 except Exception as e:
                     print("watch_orders error for", sym, e)
                 time.sleep(0.4)
@@ -1133,7 +1229,9 @@ def watch_orders(poll_interval=12):
             print("watch_orders loop error", e)
             time.sleep(max(5, poll_interval))
 
-# ---------- main loop / web ----------
+# -------------------------
+# Web / main loop
+# -------------------------
 app = Flask(__name__)
 
 @app.route("/")
@@ -1141,24 +1239,24 @@ def home():
     return "Signal bot running"
 
 def trade_cycle():
-    # small jitter to avoid exact-period thundering
     while True:
         try:
             res = pick_coin()
             if res:
                 print(f"[{time.strftime('%H:%M:%S')}] Signal -> {res['symbol']} score={res['score']:.2f}")
-                if ENABLE_TRADING:
-                    t = threading.Thread(target=execute_trade, args=(res,), daemon=True)
-                    t.start()
             else:
-                print(f"[{time.strftime('%H:%M:%S')}] No signal")
+                if SCAN_PAUSE_ON_OPEN and ACTIVE_TRADE.is_set():
+                    print(f"[{time.strftime('%H:%M:%S')}] Scanning paused. Active trade in progress.")
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] No signal")
         except Exception as e:
             print("cycle error", e)
-        time.sleep(CYCLE_SECONDS + (0.2 * (os.getpid() % 3)))
+        time.sleep(CYCLE_SECONDS)
 
 if __name__ == "__main__":
-    # start background workers
+    # background threads
     tmon = threading.Thread(target=monitor_positions, daemon=True); tmon.start()
     twatch = threading.Thread(target=watch_orders, daemon=True); twatch.start()
     t = threading.Thread(target=trade_cycle, daemon=True); t.start()
+    # start web
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), threaded=True)
