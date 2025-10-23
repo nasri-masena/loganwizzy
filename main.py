@@ -36,19 +36,19 @@ QUOTE = "USDT"
 PRICE_MIN = 0.8
 PRICE_MAX = 6.0
 MIN_VOLUME = 800000
-TOP_BY_24H_VOLUME = 24
+TOP_BY_24H_VOLUME = 48
 
-CYCLE_SECONDS = 3
+CYCLE_SECONDS = 1
 KLINES_5M_LIMIT = 6
 KLINES_1M_LIMIT = 6
 OB_DEPTH = 3
 MIN_OB_IMBALANCE = 1.2
 MAX_OB_SPREAD_PCT = 1.0
 
-CACHE_TTL = 2.0
+CACHE_TTL = 0.8
 REQUEST_TIMEOUT = 6.0
-PUBLIC_CONCURRENCY = 6
-MAX_WORKERS = 12
+PUBLIC_CONCURRENCY = 10
+MAX_WORKERS = 16
 
 MIN_1M_PCT = 0.9
 MIN_5M_PCT = 0.6
@@ -149,7 +149,7 @@ def sync_open_orders(force=False):
         pass
 
     return orders
-    
+
 # -------------------------
 # Telegram helper
 # -------------------------
@@ -337,7 +337,7 @@ def safe_get(path, params=None):
         except Exception:
             pass
         raise
-    
+
 # -------------------------
 # Client / exchange info
 # -------------------------
@@ -1018,7 +1018,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
     # if persistent failure, set a short TEMP_SKIP to avoid hot-loop retries
     TEMP_SKIP[symbol] = time.time() + 60
     return None
-    
+
 # -------------------------
 # Evaluate symbol
 # -------------------------
@@ -1120,7 +1120,7 @@ def pick_coin():
 
     if SCAN_PAUSE_ON_OPEN and ACTIVE_TRADE.is_set():
         return None
-        
+
     tickers = fetch_tickers()
     now = time.time()
     pre = []
