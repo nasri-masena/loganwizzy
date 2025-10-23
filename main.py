@@ -34,7 +34,7 @@ BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
 
 PRICE_MIN = 0.4
-PRICE_MAX = 8.0
+PRICE_MAX = 9.0
 MIN_VOLUME = 800000
 TOP_BY_24H_VOLUME = 48
 
@@ -52,7 +52,7 @@ MAX_WORKERS = 14
 
 MIN_1M_PCT = 0.9
 MIN_5M_PCT = 0.6
-VOL_5M_MIN = 0.0004
+VOL_5M_MIN = 0.0005
 RSI_PERIOD = 14
 EMA_SHORT = 3
 EMA_LONG = 10
@@ -63,18 +63,16 @@ BUY_LOCK_SECONDS = 900
 REMOVE_AFTER_CLOSE = True
 
 SHORT_BUY_SELL_DELAY = 0.3
-HOLD_THRESHOLD_HOURS = 4.0
+HOLD_THRESHOLD_HOURS = 5.0
 MONITOR_INTERVAL = 15.0
 LIMIT_SELL_RETRIES = 3
 VOL_1M_THRESHOLD = 0.005
 
-BLACKLIST_HOURS = 168.0
+BLACKLIST_HOURS = 12.0
 BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
-SHORT_BLACKLIST_HOURS = 4.0
-SHORT_BLACKLIST_SECONDS = int(SHORT_BLACKLIST_HOURS * 3600)
 BLACKLIST = {}
 
-SELL_DRAWDOWN_PCT = 1.5
+SELL_DRAWDOWN_PCT = 3.0
 SCAN_PAUSE_ON_OPEN = True
 
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
@@ -470,29 +468,6 @@ def finalize_close(symbol, update_fields=None):
                 if update_fields:
                     RECENT_BUYS[symbol].update(update_fields)
                 RECENT_BUYS[symbol]["closed"] = True
-
-    # decide blacklist behaviour based on close method
-    try:
-        cm = ""
-        if update_fields:
-            cm = (update_fields.get("close_method") or "").lower()
-
-        # successful limit fills -> short blacklist (4h)
-        if cm and "limit_filled" in cm:
-            try:
-                add_blacklist(symbol, seconds=SHORT_BLACKLIST_SECONDS)
-            except Exception:
-                pass
-        # market fallback / drawdown / monitor forced sells -> long blacklist (7d)
-        elif cm and any(k in cm for k in ("market", "fallback", "drawdown", "monitor")):
-            try:
-                add_blacklist(symbol, seconds=BLACKLIST_SECONDS)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # clear ACTIVE_TRADE only if there are no non-closed RECENT_BUYS
     try:
         with RECENT_BUYS_LOCK:
             still_active = any(not v.get("closed") for v in RECENT_BUYS.values())
@@ -500,7 +475,7 @@ def finalize_close(symbol, update_fields=None):
             ACTIVE_TRADE.clear()
     except Exception:
         pass
-
+    
 # -------------------------
 # Blacklist helpers (in-memory)
 # -------------------------
@@ -1568,23 +1543,11 @@ def trade_cycle():
         time.sleep(CYCLE_SECONDS)
 
 if __name__ == "__main__":
-    fun_coins = ["DEGOUSDT", "ACMUSDT", "JUVUSDT", "PSGUSDT", "ATMUSDT",
-                 "SANTOSUSDT", "OGUSDT", "ASRUSDT", "CITYUSDT", "BARUSDT",
-                 "ALPINEUSDT", "LAZIOUSDT"]
-
     try:
         sync_open_orders(force=True)
     except Exception as e:
         print("initial sync_open_orders failed:", e)
-        # Add all fun coins to blacklist for 7 days
-        for coin in fun_coins:
-            add_blacklist(coin, seconds=7*24*3600)
-
-    # Start monitoring threads
-    tmon = threading.Thread(target=monitor_positions, daemon=True)
-    tmon.start()
-    twatch = threading.Thread(target=watch_orders, daemon=True)
-    twatch.start()
-    t = threading.Thread(target=trade_cycle, daemon=True)
-    t.start()
+    tmon = threading.Thread(target=monitor_positions, daemon=True); tmon.start()
+    twatch = threading.Thread(target=watch_orders, daemon=True); twatch.start()
+    t = threading.Thread(target=trade_cycle, daemon=True); t.start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), threaded=True)
