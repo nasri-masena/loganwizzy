@@ -25,7 +25,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
 BUY_USDT_AMOUNT = 10.0
-LIMIT_PROFIT_PCT = 1.1
+LIMIT_PROFIT_PCT = 1.5
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 3
@@ -36,7 +36,7 @@ QUOTE = "USDT"
 PRICE_MIN = 0.4
 PRICE_MAX = 9.0
 MIN_VOLUME = 800000
-TOP_BY_24H_VOLUME = 35
+TOP_BY_24H_VOLUME = 40
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
@@ -63,7 +63,7 @@ BUY_LOCK_SECONDS = 900
 REMOVE_AFTER_CLOSE = True
 
 SHORT_BUY_SELL_DELAY = 0.3
-HOLD_THRESHOLD_HOURS = 3.5
+HOLD_THRESHOLD_HOURS = 4.0
 MONITOR_INTERVAL = 15.0
 LIMIT_SELL_RETRIES = 3
 VOL_1M_THRESHOLD = 0.004
@@ -153,19 +153,35 @@ def sync_open_orders(force=False):
 # -------------------------
 # Telegram helper
 # -------------------------
-def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        print(message)
+def send_telegram(msg, category=None):
+    allow = False
+    try:
+        if category == 'daily':
+            allow = True
+        elif isinstance(msg, str) and msg.strip():
+            if msg.startswith(("✅ Nimenunua", "⭕ Nimeuza", "💰 Nimeweka", "🟢 Trade")):
+                allow = True
+            elif msg.startswith(("⚠️", "🚫", "❌")):
+                allow = True
+    except Exception:
+        allow = False
+
+    if not allow:
         return False
+
+    if not BOT_TOKEN or not CHAT_ID:
+        print(msg)
+        return False
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    payload = {"chat_id": CHAT_ID, "text": msg}   # NO parse_mode
     try:
         r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         return r.status_code == 200
     except Exception as e:
         print("Telegram error", e)
         return False
-
+        
 notify = send_telegram
 
 # -------------------------
@@ -966,7 +982,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
                     OPEN_ORDERS_CACHE['ts'] = 0
             except Exception:
                 pass
-            notify(f"✅ Market sell executed for {symbol}")
+            notify(f"⭕ Nimeuza {symbol} kwa hasara")
             return resp
         except Exception as e:
             last_err = str(e)
@@ -1276,7 +1292,7 @@ def execute_trade(chosen):
         except Exception:
             pass
 
-        send_telegram(f"✅ BUY EXECUTED: `{symbol}` Qty:`{executed_qty}` @ `{avg_price}` Spent:`{round(executed_qty*avg_price,6)}`")
+        send_telegram(f"✅ Nimenunua `{symbol}` — kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
 
         time.sleep(SHORT_BUY_SELL_DELAY)
 
@@ -1302,7 +1318,7 @@ def execute_trade(chosen):
                     "processing": False,
                 })
 
-            send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
+            send_telegram(f"💰 Nimeweka order ya kuuza `{symbol}` — kwa `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
 
             # short poll for immediate fills
             try:
@@ -1332,7 +1348,7 @@ def execute_trade(chosen):
 
                             add_blacklist(symbol)
                             finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
-                            send_telegram(f"✅ POSITION CLOSED: `{symbol}` sold {filled_qty} @ {avg_price_fill} (limit immediate)")
+                            send_telegram(f"🟢 Trade ya `{symbol}` imefungwa — {filled_qty} @ {avg_price} (limit)")
                             return True
             except Exception:
                 pass
@@ -1523,7 +1539,7 @@ def watch_orders(poll_interval=12):
                             filled_qty = pos.get("qty") or 0.0
                             avg_price = pos.get("sell_price") or 0.0
 
-                        send_telegram(f"✅ POSITION CLOSED: `{sym}` sold {filled_qty} @ {avg_price} (limit)")
+                        send_telegram(f"🟢 Trade ya `{sym}` imefungwa — {filled_qty} @ {avg_price} (limit)")
                         add_blacklist(sym)
                         finalize_close(sym, {"closed_ts": time.time(), "close_method": "limit_filled_watch", "close_resp": o, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price})
                     elif status in ("CANCELED", "REJECTED"):
