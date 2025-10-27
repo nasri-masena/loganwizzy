@@ -24,8 +24,8 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
-BUY_USDT_AMOUNT = 10.3
-LIMIT_PROFIT_PCT = 1.2
+BUY_USDT_AMOUNT = 10.0
+LIMIT_PROFIT_PCT = 1.1
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 3
@@ -36,7 +36,7 @@ QUOTE = "USDT"
 PRICE_MIN = 0.4
 PRICE_MAX = 9.0
 MIN_VOLUME = 800000
-TOP_BY_24H_VOLUME = 40
+TOP_BY_24H_VOLUME = 60
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
@@ -45,7 +45,7 @@ OB_DEPTH = 3
 MIN_OB_IMBALANCE = 1.2
 MAX_OB_SPREAD_PCT = 1.0
 
-CACHE_TTL = 1.0
+CACHE_TTL = 3.0
 REQUEST_TIMEOUT = 6.0
 PUBLIC_CONCURRENCY = 8
 MAX_WORKERS = 14
@@ -559,7 +559,7 @@ def place_market_sell_fallback(symbol, qty, f=None):
             qty_str = format_qty(qty, float(f.get('stepSize', 0.0)))
         except Exception:
             qty_str = str(qty)
-        notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
+        # notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
         c = init_binance_client()
         if not c:
             notify(f"❌ Market sell fallback failed for {symbol}: Binance client unavailable")
@@ -738,7 +738,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
             attempt += 1
             try:
                 order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str, timeInForce='GTC')
-                notify(f"✅ LIMIT SELL placed: {symbol} qty={qty_str} @ {price_str}")
+                # notify(f"✅ LIMIT SELL placed: {symbol} qty={qty_str} @ {price_str}")
                 try:
                     OPEN_ORDERS_CACHE['data'] = None
                 except Exception:
@@ -792,7 +792,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
         try:
             notify("⚠️ All limit attempts failed — trying LIMIT_MAKER as last attempt.")
             lm = client.create_order(symbol=symbol, side='SELL', type='LIMIT_MAKER', quantity=qty_str, price=price_str)
-            notify(f"✅ LIMIT_MAKER placed: {symbol} qty={qty_str} @ {price_str}")
+            # notify(f"✅ LIMIT_MAKER placed: {symbol} qty={qty_str} @ {price_str}")
             return lm
         except Exception as e:
             notify(f"❌ Final LIMIT_MAKER attempt failed: {e}")
@@ -930,7 +930,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
     try:
         ccount, cancelled = cancel_open_sell_orders(symbol, client=client)
         if ccount:
-            notify(f"ℹ️ Cancelled {ccount} existing SELL order(s) for {symbol} before market-sell.")
+            # notify(f"ℹ️ Cancelled {ccount} existing SELL order(s) for {symbol} before market-sell.")
     except Exception as e:
         notify(f"⚠️ cancel_then_market_sell: cancel step failed for {symbol}: {e}")
 
@@ -1194,7 +1194,7 @@ def pick_coin():
         return None
 
     msg = (
-        f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
+        f"🔥 *COIN SIGNAL*: `{chosen['symbol']}`\n"
         f"Price:`{chosen['last_price']}`\n"
         f"24h:`{chosen['24h_change']}`%\n"
         f"1m:`{chosen['pct_1m']:.2f}`%\n"
@@ -1277,7 +1277,7 @@ def execute_trade(chosen):
         except Exception:
             pass
 
-        send_telegram(f"✅ Nimenunua `{symbol}` — kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
+        send_telegram(f"💸 Imenunuliwa `{symbol}` kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
 
         time.sleep(SHORT_BUY_SELL_DELAY)
 
@@ -1303,7 +1303,7 @@ def execute_trade(chosen):
                     "processing": False,
                 })
 
-            send_telegram(f"💰 Nimeweka order ya kuuza `{symbol}` — kwa `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
+            send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
 
             # short poll for immediate fills
             try:
@@ -1333,7 +1333,7 @@ def execute_trade(chosen):
 
                             add_blacklist(symbol)
                             finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
-                            send_telegram(f"🟢 Trade ya `{symbol}` imefungwa — {filled_qty} @ {avg_price} (limit)")
+                            send_telegram(f"🟢 Coin ya `{symbol}` imeuzwa — {filled_qty} @ {avg_price} (limit)")
                             return True
             except Exception:
                 pass
@@ -1451,12 +1451,12 @@ def monitor_positions():
                             notify(f"⚠️ Monitor failed to market-sell {sym}. Will retry later.")
                     elif item[2] == "drawdown":
                         sym, pos, _, last, pct = item[0], item[1], item[2], item[3], item[4]
-                        notify(f"⚠️ Position {sym} drawdown detected {pct:.2f}% (last={last}, buy={pos.get('buy_price')}). Selling to limit loss.")
+                        # notify(f"⚠️ Position {sym} drawdown detected {pct:.2f}% (last={last}, buy={pos.get('buy_price')}). Selling to limit loss.")
                         qty = pos.get("qty")
                         resp = cancel_then_market_sell(sym, qty)
                         if resp:
                             add_blacklist(sym)
-                            notify(f"ℹ️ Position {sym} sold due to drawdown ({pct:.2f}%).")
+                            # notify(f"ℹ️ Position {sym} sold due to drawdown ({pct:.2f}%).")
                             finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_drawdown_market", "close_resp": resp})
                         else:
                             with RECENT_BUYS_LOCK:
