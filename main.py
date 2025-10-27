@@ -36,7 +36,7 @@ QUOTE = "USDT"
 PRICE_MIN = 0.4
 PRICE_MAX = 9.0
 MIN_VOLUME = 800000
-TOP_BY_24H_VOLUME = 70
+TOP_BY_24H_VOLUME = 60
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
@@ -930,7 +930,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
     try:
         ccount, cancelled = cancel_open_sell_orders(symbol, client=client)
         if ccount:
-            # notify(f"ℹ️ Cancelled {ccount} existing SELL order(s) for {symbol} before market-sell.")
+    # notify(f"ℹ️ Cancelled {ccount} existing SELL order(s) for {symbol} before market-sell.")
     except Exception as e:
         notify(f"⚠️ cancel_then_market_sell: cancel step failed for {symbol}: {e}")
 
