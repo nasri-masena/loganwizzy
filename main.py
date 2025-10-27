@@ -24,8 +24,8 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
-BUY_USDT_AMOUNT = 10.0
-LIMIT_PROFIT_PCT = 1.5
+BUY_USDT_AMOUNT = 10.3
+LIMIT_PROFIT_PCT = 1.2
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 3
@@ -36,7 +36,7 @@ QUOTE = "USDT"
 PRICE_MIN = 0.4
 PRICE_MAX = 9.0
 MIN_VOLUME = 800000
-TOP_BY_24H_VOLUME = 35
+TOP_BY_24H_VOLUME = 40
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
@@ -153,36 +153,21 @@ def sync_open_orders(force=False):
 # -------------------------
 # Telegram helper
 # -------------------------
-def send_telegram(msg, category=None):
-    allow = False
-    try:
-        if category == 'daily':
-            allow = True
-        elif isinstance(msg, str) and msg.strip():
-            if msg.startswith(("✅ Nimenunua", "⭕ Nimeuza", "💰 Nimeweka", "🟢 Trade")):
-                allow = True
-            elif msg.startswith(("⚠️", "🚫", "❌")):
-                allow = True
-    except Exception:
-        allow = False
-
-    if not allow:
-        return False
-
+def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
-        print(msg)
+        print(message)
         return False
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": msg}   # NO parse_mode
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         return r.status_code == 200
     except Exception as e:
         print("Telegram error", e)
         return False
-        
+
 notify = send_telegram
+
 
 # -------------------------
 # Math / indicators
