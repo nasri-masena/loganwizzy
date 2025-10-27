@@ -930,6 +930,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
     try:
         ccount, cancelled = cancel_open_sell_orders(symbol, client=client)
         if ccount:
+            pass
     # notify(f"ℹ️ Cancelled {ccount} existing SELL order(s) for {symbol} before market-sell.")
     except Exception as e:
         notify(f"⚠️ cancel_then_market_sell: cancel step failed for {symbol}: {e}")
