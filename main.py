@@ -24,8 +24,8 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
-BUY_USDT_AMOUNT = 10.4
-LIMIT_PROFIT_PCT = 1.0
+BUY_USDT_AMOUNT = 10.5
+LIMIT_PROFIT_PCT = 1.1
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 3
@@ -36,7 +36,7 @@ QUOTE = "USDT"
 PRICE_MIN = 0.4
 PRICE_MAX = 9.0
 MIN_VOLUME = 800000
-TOP_BY_24H_VOLUME = 30
+TOP_BY_24H_VOLUME = 35
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
@@ -1332,7 +1332,7 @@ def execute_trade(chosen):
                                 filled_qty = executed_qty
                                 avg_price_fill = sell_price
 
-                            add_blacklist(symbol)
+      Trade                 add_blacklist(symbol)
                             finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
                             send_telegram(f"✔️ Coin ya `{symbol}` imeuzwa — {filled_qty} @ {avg_price} (limit)")
                             return True
@@ -1525,7 +1525,7 @@ def watch_orders(poll_interval=12):
                             filled_qty = pos.get("qty") or 0.0
                             avg_price = pos.get("sell_price") or 0.0
 
-                        send_telegram(f"🟢 Trade ya `{sym}` imefungwa — {filled_qty} @ {avg_price} (limit)")
+                        send_telegram(f"✅ Trade ya `{sym}` imefungwa — {filled_qty} @ {avg_price} (limit)")
                         add_blacklist(sym)
                         finalize_close(sym, {"closed_ts": time.time(), "close_method": "limit_filled_watch", "close_resp": o, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price})
                     elif status in ("CANCELED", "REJECTED"):
