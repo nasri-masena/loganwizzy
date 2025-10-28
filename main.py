@@ -24,7 +24,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
-BUY_USDT_AMOUNT = 10.5
+BUY_USDT_AMOUNT = 10.0
 LIMIT_PROFIT_PCT = 1.1
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
@@ -728,7 +728,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
                 if new_qty <= 0:
                     notify(f"❌ place_limit_sell_strict: insufficient free {asset} (free={free:.8f}, req={qty:.8f})")
                     return None
-                notify(f"ℹ️ Adjusting qty down from {qty:.8f} to available {new_qty:.8f}")
+                # notify(f"ℹ️ Adjusting qty down from {qty:.8f} to available {new_qty:.8f}")
                 qty = new_qty
                 qty_str = format_qty(qty, step)
 
@@ -959,7 +959,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
     while attempt < max_retries:
         attempt += 1
         try:
-            notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str} (attempt {attempt})")
+            # notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str} (attempt {attempt})")
             resp = client.order_market_sell(symbol=symbol, quantity=qty_str)
             # clear open orders cache
             try:
@@ -968,7 +968,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
                     OPEN_ORDERS_CACHE['ts'] = 0
             except Exception:
                 pass
-            notify(f"⭕ Nimeuza {symbol} kwa hasara")
+            notify(f"⭕ Coin ya {symbol} imeuzwa kwa hasara")
             return resp
         except Exception as e:
             last_err = str(e)
@@ -1332,7 +1332,7 @@ def execute_trade(chosen):
                                 filled_qty = executed_qty
                                 avg_price_fill = sell_price
 
-      Trade                 add_blacklist(symbol)
+                            add_blacklist(symbol)
                             finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
                             send_telegram(f"✔️ Coin ya `{symbol}` imeuzwa — {filled_qty} @ {avg_price} (limit)")
                             return True
