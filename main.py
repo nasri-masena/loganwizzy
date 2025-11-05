@@ -24,7 +24,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
-BUY_USDT_AMOUNT = 8.5
+BUY_USDT_AMOUNT = 9.0
 LIMIT_PROFIT_PCT = 1.1
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
@@ -33,10 +33,10 @@ MAX_CONCURRENT_POS = 3
 BINANCE_REST = "https://api.binance.com"
 QUOTE = "USDT"
 
-PRICE_MIN = 0.4
-PRICE_MAX = 9.0
+PRICE_MIN = 0.8
+PRICE_MAX = 6.0
 MIN_VOLUME = 800000
-TOP_BY_24H_VOLUME = 32
+TOP_BY_24H_VOLUME = 45
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
@@ -45,14 +45,14 @@ OB_DEPTH = 3
 MIN_OB_IMBALANCE = 1.2
 MAX_OB_SPREAD_PCT = 1.0
 
-CACHE_TTL = 1.0
+CACHE_TTL = 2.0
 REQUEST_TIMEOUT = 6.0
-PUBLIC_CONCURRENCY = 8
-MAX_WORKERS = 14
+PUBLIC_CONCURRENCY = 6
+MAX_WORKERS = 12
 
 MIN_1M_PCT = 0.9
 MIN_5M_PCT = 0.6
-VOL_5M_MIN = 0.0005
+VOL_5M_MIN = 0.0004
 RSI_PERIOD = 14
 EMA_SHORT = 3
 EMA_LONG = 10
@@ -63,10 +63,10 @@ BUY_LOCK_SECONDS = 900
 REMOVE_AFTER_CLOSE = True
 
 SHORT_BUY_SELL_DELAY = 0.3
-HOLD_THRESHOLD_HOURS = 4.0
+HOLD_THRESHOLD_HOURS = 2.0
 MONITOR_INTERVAL = 15.0
 LIMIT_SELL_RETRIES = 3
-VOL_1M_THRESHOLD = 0.004
+VOL_1M_THRESHOLD = 0.005
 
 BLACKLIST_HOURS = 3.0
 BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
@@ -167,7 +167,6 @@ def send_telegram(message):
         return False
 
 notify = send_telegram
-
 
 # -------------------------
 # Math / indicators
@@ -476,7 +475,7 @@ def finalize_close(symbol, update_fields=None):
             ACTIVE_TRADE.clear()
     except Exception:
         pass
-    
+
 # -------------------------
 # Blacklist helpers (in-memory)
 # -------------------------
@@ -559,7 +558,7 @@ def place_market_sell_fallback(symbol, qty, f=None):
             qty_str = format_qty(qty, float(f.get('stepSize', 0.0)))
         except Exception:
             qty_str = str(qty)
-        # notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
+        notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str}")
         c = init_binance_client()
         if not c:
             notify(f"❌ Market sell fallback failed for {symbol}: Binance client unavailable")
@@ -728,7 +727,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
                 if new_qty <= 0:
                     notify(f"❌ place_limit_sell_strict: insufficient free {asset} (free={free:.8f}, req={qty:.8f})")
                     return None
-                # notify(f"ℹ️ Adjusting qty down from {qty:.8f} to available {new_qty:.8f}")
+                notify(f"ℹ️ Adjusting qty down from {qty:.8f} to available {new_qty:.8f}")
                 qty = new_qty
                 qty_str = format_qty(qty, step)
 
@@ -738,7 +737,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
             attempt += 1
             try:
                 order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str, timeInForce='GTC')
-                # notify(f"✅ LIMIT SELL placed: {symbol} qty={qty_str} @ {price_str}")
+                notify(f"✅ LIMIT SELL placed: {symbol} qty={qty_str} @ {price_str}")
                 try:
                     OPEN_ORDERS_CACHE['data'] = None
                 except Exception:
@@ -792,7 +791,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
         try:
             notify("⚠️ All limit attempts failed — trying LIMIT_MAKER as last attempt.")
             lm = client.create_order(symbol=symbol, side='SELL', type='LIMIT_MAKER', quantity=qty_str, price=price_str)
-            # notify(f"✅ LIMIT_MAKER placed: {symbol} qty={qty_str} @ {price_str}")
+            notify(f"✅ LIMIT_MAKER placed: {symbol} qty={qty_str} @ {price_str}")
             return lm
         except Exception as e:
             notify(f"❌ Final LIMIT_MAKER attempt failed: {e}")
@@ -917,10 +916,6 @@ def compute_market_sell_qty(symbol, desired_qty, client=None):
 # Cancel sells then market sell helper (robust)
 # -------------------------
 def cancel_then_market_sell(symbol, qty, max_retries=2):
-    """
-    Cancel open SELL orders for symbol, then attempt market sell for `qty`.
-    Returns response on success, None on failure.
-    """
     client = init_binance_client()
     if not client:
         notify(f"❌ cancel_then_market_sell: Binance client unavailable for {symbol}")
@@ -930,8 +925,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
     try:
         ccount, cancelled = cancel_open_sell_orders(symbol, client=client)
         if ccount:
-            pass
-    # notify(f"ℹ️ Cancelled {ccount} existing SELL order(s) for {symbol} before market-sell.")
+            notify(f"ℹ️ Cancelled {ccount} existing SELL order(s) for {symbol} before market-sell.")
     except Exception as e:
         notify(f"⚠️ cancel_then_market_sell: cancel step failed for {symbol}: {e}")
 
@@ -959,7 +953,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
     while attempt < max_retries:
         attempt += 1
         try:
-            # notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str} (attempt {attempt})")
+            notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str} (attempt {attempt})")
             resp = client.order_market_sell(symbol=symbol, quantity=qty_str)
             # clear open orders cache
             try:
@@ -968,7 +962,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
                     OPEN_ORDERS_CACHE['ts'] = 0
             except Exception:
                 pass
-            notify(f"⭕ Coin ya {symbol} imeuzwa kwa hasara")
+            notify(f"✅ Market sell executed for {symbol}")
             return resp
         except Exception as e:
             last_err = str(e)
@@ -1026,7 +1020,6 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
 # -------------------------
 def evaluate_symbol(sym, last_price, qvol, change_24h):
     try:
-        # basic filters
         if not (PRICE_MIN <= last_price <= PRICE_MAX):
             return None
         if qvol < MIN_VOLUME:
@@ -1034,7 +1027,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         if change_24h < 0.5 or change_24h > 20.0:
             return None
 
-        # fetch klines + orderbook in parallel
         with ThreadPoolExecutor(max_workers=3) as ex:
             fut_kl5 = ex.submit(fetch_klines, sym, "5m", KLINES_5M_LIMIT)
             fut_kl1 = ex.submit(fetch_klines, sym, "1m", KLINES_1M_LIMIT)
@@ -1058,11 +1050,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         vol_5m = compute_recent_volatility(closes_5m)
         vol_1m = compute_recent_volatility(closes_1m, lookback=3)
 
-        # require 1m volatility threshold (this is the important change)
-        if vol_1m is None or vol_1m < VOL_1M_THRESHOLD:
-            return None
-
-        # EMAs / RSI
         short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
         long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
         ema_uplift = 0.0
@@ -1073,7 +1060,7 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
 
         ob_bull = orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT)
 
-        # scoring (added a small weight for vol_1m to prefer higher 1m activity)
+        # scoring
         score = 0.0
         score += max(0.0, pct_5m) * 4.0
         score += max(0.0, pct_1m) * 2.0
@@ -1081,14 +1068,12 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         score += max(0.0, change_24h) * 0.5
         if vol_5m is not None:
             score += max(0.0, (vol_5m - VOL_5M_MIN)) * 100.0
-        # <-- key: use vol_1m directly (scaled) to prefer coins passing the threshold
-        score += max(0.0, (vol_1m - VOL_1M_THRESHOLD)) * 100.0
         if rsi_val is not None:
             score += max(0.0, (70.0 - min(rsi_val, 70.0))) * 0.5
         if ob_bull:
             score += 25.0
 
-        # hard filters
+        # hard filters per your list
         if pct_1m < MIN_1M_PCT:
             return None
         if vol_5m is None or vol_5m < VOL_5M_MIN:
@@ -1120,7 +1105,9 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
     except Exception:
         return None
 
-
+# -------------------------
+# Picker
+# -------------------------
 def pick_coin():
     try:
         sync_open_orders()
@@ -1149,30 +1136,20 @@ def pick_coin():
             continue
         if ch < 0.5 or ch > 20.0:
             continue
-
-        # recent buys / locks
         with RECENT_BUYS_LOCK:
             last_buy = RECENT_BUYS.get(sym)
             if last_buy and not last_buy.get("closed"):
                 continue
             if last_buy and now < last_buy.get("ts", 0) + BUY_LOCK_SECONDS:
                 continue
-
         if is_blacklisted(sym):
             continue
-
-        # candidate for deeper evaluation
         pre.append((sym, last, qvol, ch))
-
     if not pre:
         return None
-
-    # sort by quote volume to prioritize liquid names
     pre.sort(key=lambda x: x[2], reverse=True)
     candidates = pre[:TOP_BY_24H_VOLUME]
     results = []
-
-    # evaluate candidates in parallel (evaluate_symbol now enforces vol_1m threshold)
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates) or 1)) as ex:
         futures = {ex.submit(evaluate_symbol, sym, last, qvol, ch): sym for (sym, last, qvol, ch) in candidates}
         for fut in as_completed(futures):
@@ -1182,20 +1159,18 @@ def pick_coin():
                 res = None
             if res:
                 results.append(res)
-
     if not results:
         return None
-
     strongs = [r for r in results if r.get("strong_candidate")]
     chosen_pool = strongs if strongs else results
     chosen = sorted(chosen_pool, key=lambda x: x["score"], reverse=True)[0]
 
-    # final blacklist check
+    # last-second recheck
     if is_blacklisted(chosen["symbol"]):
         return None
 
     msg = (
-        f"🔥 *COIN SIGNAL*: `{chosen['symbol']}`\n"
+        f"🚀 *COIN SIGNAL*: `{chosen['symbol']}`\n"
         f"Price:`{chosen['last_price']}`\n"
         f"24h:`{chosen['24h_change']}`%\n"
         f"1m:`{chosen['pct_1m']:.2f}`%\n"
@@ -1227,7 +1202,7 @@ def pick_coin():
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(chosen["symbol"], None)
         return None
-        
+
 # -------------------------
 # Execute trade
 # -------------------------
@@ -1278,7 +1253,7 @@ def execute_trade(chosen):
         except Exception:
             pass
 
-        send_telegram(f"💸 Imenunuliwa `{symbol}` kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
+        send_telegram(f"✅ BUY EXECUTED: `{symbol}` Qty:`{executed_qty}` @ `{avg_price}` Spent:`{round(executed_qty*avg_price,6)}`")
 
         time.sleep(SHORT_BUY_SELL_DELAY)
 
@@ -1304,7 +1279,7 @@ def execute_trade(chosen):
                     "processing": False,
                 })
 
-            send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
+            send_telegram(f"💰 LIMIT SELL initiated: `{symbol}` Qty `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
 
             # short poll for immediate fills
             try:
@@ -1334,7 +1309,7 @@ def execute_trade(chosen):
 
                             add_blacklist(symbol)
                             finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
-                            send_telegram(f"✔️ Coin ya `{symbol}` imeuzwa — {filled_qty} @ {avg_price} (limit)")
+                            send_telegram(f"✅ POSITION CLOSED: `{symbol}` sold {filled_qty} @ {avg_price_fill} (limit immediate)")
                             return True
             except Exception:
                 pass
@@ -1452,12 +1427,12 @@ def monitor_positions():
                             notify(f"⚠️ Monitor failed to market-sell {sym}. Will retry later.")
                     elif item[2] == "drawdown":
                         sym, pos, _, last, pct = item[0], item[1], item[2], item[3], item[4]
-                        # notify(f"⚠️ Position {sym} drawdown detected {pct:.2f}% (last={last}, buy={pos.get('buy_price')}). Selling to limit loss.")
+                        notify(f"⚠️ Position {sym} drawdown detected {pct:.2f}% (last={last}, buy={pos.get('buy_price')}). Selling to limit loss.")
                         qty = pos.get("qty")
                         resp = cancel_then_market_sell(sym, qty)
                         if resp:
                             add_blacklist(sym)
-                            # notify(f"ℹ️ Position {sym} sold due to drawdown ({pct:.2f}%).")
+                            notify(f"ℹ️ Position {sym} sold due to drawdown ({pct:.2f}%).")
                             finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_drawdown_market", "close_resp": resp})
                         else:
                             with RECENT_BUYS_LOCK:
@@ -1525,7 +1500,7 @@ def watch_orders(poll_interval=12):
                             filled_qty = pos.get("qty") or 0.0
                             avg_price = pos.get("sell_price") or 0.0
 
-                        send_telegram(f"✅ Trade ya `{sym}` imefungwa — {filled_qty} @ {avg_price} (limit)")
+                        send_telegram(f"✅ POSITION CLOSED: `{sym}` sold {filled_qty} @ {avg_price} (limit)")
                         add_blacklist(sym)
                         finalize_close(sym, {"closed_ts": time.time(), "close_method": "limit_filled_watch", "close_resp": o, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price})
                     elif status in ("CANCELED", "REJECTED"):
