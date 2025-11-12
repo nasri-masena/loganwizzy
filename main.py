@@ -1302,40 +1302,139 @@ def pick_coin():
 # -------------------------
 # Execute trade
 # -------------------------
-def execute_trade(chosen):
-    symbol = chosen["symbol"]
-    now = time.time()
+def execute_trade(symbol, is_sell=False, force_qty=None, original_buy_price=None, profit_factor=None):
+    if not ENABLE_TRADING:
+        send_telegram(f"⚠️ Trading DISABLED: Skipped {symbol} {'SELL' if is_sell else 'BUY'}")
+        return True
+
+    side = Client.SIDE_SELL if is_sell else Client.SIDE_BUY
+
     with RECENT_BUYS_LOCK:
-        if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
-            send_telegram(f"⚠️ Max concurrent positions reached. Skipping {symbol}")
-            return False
-        RECENT_BUYS[symbol] = {"ts": now, "reserved": False, "closed": False, "processing": True, "high_price": 0.0, "prev_price": 0.0, "buy_price": 0.0, "qty": 0.0, "sell_price": 0.0, "original_sell_price": 0.0, "sell_order_id": None}
-    client = init_binance_client()
+        if side == Client.SIDE_BUY:
+            if symbol in RECENT_BUYS and RECENT_BUYS[symbol].get("processing"):
+                print(f"[{time.strftime('%H:%M:%S')}] Already processing a buy for {symbol}. Skipping.")
+                return False
+            RECENT_BUYS[symbol] = {"processing": True}
+
+    client = get_client()
     if not client:
-        send_telegram(f"⚠️ Trading disabled or client missing. Skipping live trade for {symbol}")
+        print("Binance client not initialized. Cannot execute trade.")
+        return False
+
+    if side == Client.SIDE_BUY:
+        if BUY_BY_QUOTE:
+            buy_qty = BUY_USDT_AMOUNT
+        else:
+            buy_qty = BUY_BASE_QTY
+    else:
+        with RECENT_BUYS_LOCK:
+            if symbol not in RECENT_BUYS:
+                print(f"Cannot sell {symbol}: Not in RECENT_BUYS.")
+                return False
+            sell_qty = RECENT_BUYS[symbol]["qty"]
+        
+        if force_qty:
+            sell_qty = force_qty
+
+    filters = get_exchange_info(symbol)
+    if not filters: return False
+
+    price = get_ticker(symbol)
+    if not price: return False
+
+    if side == Client.SIDE_BUY:
+        base_qty = buy_qty / price
+        step_size = float(filters.get("LOT_SIZE", {}).get("stepSize", "1"))
+        base_qty = math.floor(base_qty / step_size) * step_size
+        
+        min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional", "10.0"))
+        if base_qty * price < min_notional:
+            send_telegram(f"⚠️ Buy {symbol} failed: Notional ({base_qty * price:.2f}) too small.")
+            with RECENT_BUYS_LOCK:
+                RECENT_BUYS.pop(symbol, None)
+            return False
+
+        if base_qty <= 0:
+            send_telegram(f"⚠️ Buy {symbol} failed: Calculated base quantity is zero.")
+            with RECENT_BUYS_LOCK:
+                RECENT_BUYS.pop(symbol, None)
+            return False
+
+        print(f"[{time.strftime('%H:%M:%S')}] Placed BUY order for {symbol} @ {base_qty:.4f}")
+        params = {
+            'symbol': symbol,
+            'side': side,
+            'type': Client.ORDER_TYPE_MARKET,
+            'quantity': base_qty
+        }
+    
+    else:
+        if sell_qty <= 0:
+            send_telegram(f"⚠️ Sell {symbol} failed: Quantity is zero.")
+            with RECENT_BUYS_LOCK:
+                RECENT_BUYS.pop(symbol, None)
+            return False
+
+        step_size = float(filters.get("LOT_SIZE", {}).get("stepSize", "1"))
+        sell_qty = math.floor(sell_qty / step_size) * step_size
+
+        print(f"[{time.strftime('%H:%M:%S')}] Placed SELL order for {symbol} @ {sell_qty:.4f}")
+        params = {
+            'symbol': symbol,
+            'side': side,
+            'type': Client.ORDER_TYPE_MARKET,
+            'quantity': sell_qty
+        }
+
+    try:
+        order = client.create_order(**params)
+    except BinanceAPIException as e:
+        error_msg = f"❌ Order FAILED for {symbol} ({side}): {e}"
+        send_telegram(error_msg)
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS.pop(symbol, None)
+        try: ACTIVE_TRADE.clear()
+        except Exception: pass
+        return False
+    except Exception as e:
+        error_msg = f"❌ Order FAILED for {symbol} ({side}): {e}"
+        send_telegram(error_msg)
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
         try: ACTIVE_TRADE.clear()
         except Exception: pass
         return False
 
-    try:
-        if BUY_BY_QUOTE and BUY_USDT_AMOUNT > 0:
-            order = place_market_buy_by_quote(symbol, BUY_USDT_AMOUNT)
-        elif not BUY_BY_QUOTE and BUY_BASE_QTY > 0:
-            order = client.order_market_buy(symbol=symbol, quantity=str(BUY_BASE_QTY))
-        else:
-            send_telegram("⚠️ Buy amount not configured. Skipping trade.")
+    if side == Client.SIDE_SELL:
+        executed_qty, avg_price = parse_market_fill(order)
+
+        if executed_qty <= 0:
+            send_telegram(f"⚠️ Sell executed but no fill qty for {symbol}. Raw: {order}")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
             try: ACTIVE_TRADE.clear()
             except Exception: pass
             return False
 
-        executed_qty, avg_price = parse_market_fill(order)
-        if executed_qty <= 0:
+        send_telegram(f"✅ SELL {symbol} Success! Qty: {executed_qty:.4f}, Price: {avg_price:.4f}")
+        
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS.pop(symbol, None)
+        try: ACTIVE_TRADE.clear()
+        except Exception: pass
+        return True
 
-        # --- patched: initialize RECENT_BUYS fields after successful buy ---
+    else:
+        executed_qty, avg_price = parse_market_fill(order)
+
+        if executed_qty <= 0:
+            send_telegram(f"⚠️ Buy executed but no fill qty for {symbol}. Raw: {order}")
+            with RECENT_BUYS_LOCK:
+                RECENT_BUYS.pop(symbol, None)
+            try: ACTIVE_TRADE.clear()
+            except Exception: pass
+            return False
+        
         try:
             high_price = float(avg_price) if avg_price else 0.0
         except Exception:
@@ -1353,129 +1452,10 @@ def execute_trade(chosen):
                 "original_sell_price": 0.0,
                 "sell_order_id": None
             })
-        # --- end patched init ---
-
-            send_telegram(f"⚠️ Buy executed but no fill qty for {symbol}. Raw: {order}")
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(symbol, None)
-            try: ACTIVE_TRADE.clear()
-            except Exception: pass
-            return False
+            
+        send_telegram(f"💰 BUY {symbol} Success! Qty: {executed_qty:.4f}, Price: {avg_price:.4f}")
+        return True
         
-        # Initialize high_price with buy_price
-        high_price = avg_price
-
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS[symbol].update({
-                "qty": executed_qty, 
-                "buy_price": avg_price, 
-                "ts": now, 
-                "processing": False, 
-                "high_price": high_price # ADDED: Initial high price tracking
-            })
-
-        try:
-            ACTIVE_TRADE.set()
-        except Exception:
-            pass
-
-        send_telegram(f"💸 Imenunuliwa `{symbol}` kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
-
-        time.sleep(SHORT_BUY_SELL_DELAY)
-
-        sell_price = avg_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
-        sell_resp = place_limit_sell_strict(symbol, executed_qty, sell_price)
-        if sell_resp:
-            sell_order_id = None
-            try:
-                if isinstance(sell_resp, dict):
-                    sell_order_id = sell_resp.get("orderId") or sell_resp.get("order_id") or sell_resp.get("clientOrderId")
-                else:
-                    sell_order_id = getattr(sell_resp, "orderId", None) or getattr(sell_resp, "order_id", None) or getattr(sell_resp, "clientOrderId", None)
-            except Exception:
-                sell_order_id = None
-
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS[symbol].update({
-                    "sell_price": sell_price,
-                    "original_sell_price": sell_price, # ADDED: Store original limit sell price
-                    "sell_resp": sell_resp,
-                    "sell_order_id": sell_order_id,
-                    "sell_ts": time.time(),
-                    "closed": False,
-                    "processing": False,
-                })
-
-            send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
-
-            # short poll for immediate fills
-            try:
-                if sell_order_id:
-                    filled_order = wait_for_order_fill(client, symbol, sell_order_id, timeout=8, poll=1.0)
-                    if filled_order:
-                        st = (filled_order.get("status") or "").upper()
-                        if st == "FILLED":
-                            filled_qty = 0.0
-                            avg_price_fill = 0.0
-                            try:
-                                fills = filled_order.get("fills") or []
-                                if fills:
-                                    tq = 0.0; tq_quote = 0.0
-                                    for f in fills:
-                                        q = float(f.get("qty", 0)); p = float(f.get("price", 0))
-                                        tq += q; tq_quote += q * p
-                                    filled_qty = tq
-                                    avg_price_fill = (tq_quote / tq) if tq else 0.0
-                                else:
-                                    filled_qty = float(filled_order.get("executedQty") or 0.0)
-                                    cquote = float(filled_order.get("cummulativeQuoteQty") or 0.0)
-                                    avg_price_fill = (cquote / filled_qty) if filled_qty else 0.0
-                            except Exception:
-                                filled_qty = executed_qty
-                                avg_price_fill = sell_price
-
-                            add_blacklist(symbol)
-                            finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
-                            send_telegram(f"✔️ Coin ya `{symbol}` imeuzwa — {filled_qty} @ {avg_price} (limit)")
-                            return True
-            except Exception:
-                pass
-
-            return True
-        else:
-            notify(f"⚠️ limit sell placement failed for {symbol}, attempting market sell fallback.")
-            fallback = cancel_then_market_sell(symbol, executed_qty)
-            with RECENT_BUYS_LOCK:
-                if fallback:
-                    add_blacklist(symbol)
-                    finalize_close(symbol, {"closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
-                else:
-                    if symbol in RECENT_BUYS:
-                        RECENT_BUYS.pop(symbol, None)
-                    try:
-                        ACTIVE_TRADE.clear()
-                    except Exception:
-                        pass
-            if fallback:
-                send_telegram(f"ℹ️ Market fallback sold {symbol}.")
-            else:
-                send_telegram(f"❌ Both limit and market sell failed for {symbol}. Entry removed to avoid blocking.")
-            return False
-    except BinanceAPIException as e:
-        send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
-        return False
-    except Exception as e:
-        send_telegram(f"‼️ Unexpected error during trade {symbol}: {e}")
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
-        return False
-
 # -------------------------
 # wait_for_order_fill
 # -------------------------
