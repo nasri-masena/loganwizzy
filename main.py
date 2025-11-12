@@ -25,8 +25,8 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
-BUY_USDT_AMOUNT = 6.0
-LIMIT_PROFIT_PCT = 1.1 # Tumia hii kuamua bei ya Limit Sell ya kwanza
+BUY_USDT_AMOUNT = 7.0
+LIMIT_PROFIT_PCT = 1.1
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 8
@@ -40,7 +40,7 @@ MIN_VOLUME = 200000
 TOP_BY_24H_VOLUME = 100
 
 CYCLE_SECONDS = 3
-KLINES_5M_LIMIT = 11 # Increased from 6 to 11 for EMA_LONG (10) calculation
+KLINES_5M_LIMIT = 15
 KLINES_1M_LIMIT = 6
 OB_DEPTH = 3
 MIN_OB_IMBALANCE = 1.2
@@ -550,7 +550,7 @@ def is_blacklisted(symbol):
         except Exception:
             pass
         return False
-    return is_blacklisted
+    return True
 
 # -------------------------
 # Market buy helpers
@@ -1085,23 +1085,6 @@ def cancel_then_market_sell(symbol, qty, max_retries=2, exit_method="smart_exit"
     TEMP_SKIP[symbol] = time.time() + 60
     return None
 
-# Aliases kwa ajili ya monitor_positions
-def limit_sell(symbol, qty, price): 
-    return place_limit_sell_strict(symbol, qty, price, retries=1)
-
-def cancel_order(symbol, order_id): 
-    # Huu ni mfumo rahisi kwa `monitor_positions` wa asili.
-    client = init_binance_client()
-    if not client:
-        return None
-    try:
-        return client.cancel_order(symbol=symbol, orderId=order_id)
-    except Exception:
-        return None
-
-def market_sell(symbol, qty): 
-    return cancel_then_market_sell(symbol, qty, max_retries=1, exit_method="trailing_stop")
-
 # -------------------------
 # Evaluate symbol
 # -------------------------
@@ -1319,44 +1302,67 @@ def pick_coin():
 # -------------------------
 # Execute trade
 # -------------------------
-def execute_trade(chosen):
-    symbol = chosen["symbol"]
-    now = time.time()
-    with RECENT_BUYS_LOCK:
-        if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
-            send_telegram(f"⚠️ Max concurrent positions reached. Skipping {symbol}")
-            return False
-        RECENT_BUYS[symbol] = {"ts": now, "reserved": False, "closed": False, "processing": True}
+def execute_trade(symbol, score, last_price):
+    if not ENABLE_TRADING:
+        notify(f"⚠️ Trading is disabled, skipping buy for `{symbol}`.")
+        return False
+        
     client = init_binance_client()
     if not client:
-        send_telegram(f"⚠️ Trading disabled or client missing. Skipping live trade for {symbol}")
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
+        notify("❌ execute_trade: Binance client missing.")
         return False
 
-    try:
-        if BUY_BY_QUOTE and BUY_USDT_AMOUNT > 0:
-            order = place_market_buy_by_quote(symbol, BUY_USDT_AMOUNT)
-        elif not BUY_BY_QUOTE and BUY_BASE_QTY > 0:
-            order = client.order_market_buy(symbol=symbol, quantity=str(BUY_BASE_QTY))
-        else:
-            send_telegram("⚠️ Buy amount not configured. Skipping trade.")
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(symbol, None)
-            try: ACTIVE_TRADE.clear()
-            except Exception: pass
-            return False
+    with RECENT_BUYS_LOCK:
+        if symbol in RECENT_BUYS and not RECENT_BUYS[symbol].get("closed"):
+            return False # Already processing or open
+        if len([v for v in RECENT_BUYS.values() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
+            return False # Max concurrent positions reached
+            
+        RECENT_BUYS[symbol] = {"ts": time.time(), "reserved": True, "closed": False, "processing": True}
+        
+    notify(f"🔎 Signal Detected: `{symbol}` | Score: {score:.2f} | Last Price: {last_price:.8f}")
 
-        executed_qty, avg_price = parse_market_fill(order)
-        if executed_qty <= 0:
-            send_telegram(f"⚠️ Buy executed but no fill qty for {symbol}. Raw: {order}")
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(symbol, None)
-            try: ACTIVE_TRADE.clear()
-            except Exception: pass
-            return False
+    try:
+        # 1. Fetch symbol details
+        info = get_symbol_info(symbol)
+        if not info:
+            raise RuntimeError(f"Missing symbol info for {symbol}")
+            
+        # 2. Compute quantity (qty)
+        qty_to_buy = 0.0
+        if BUY_BY_QUOTE:
+            qty_to_buy = BUY_USDT_AMOUNT / last_price
+        elif BUY_BASE_QTY > 0:
+            qty_to_buy = BUY_BASE_QTY
+            
+        if qty_to_buy <= 0:
+            raise RuntimeError("Buy quantity is zero or less")
+
+        # 3. Adjust quantity based on filters and Min Notional (pre-check)
+        qty, price = adjust_qty_price_for_filters(symbol, qty_to_buy, last_price)
+        if qty <= 0:
+            raise RuntimeError(f"Qty {qty_to_buy:.8f} adjusted to zero after filters")
+        
+        # 4. Execute Market Buy
+        if BUY_BY_QUOTE:
+            order_resp = place_market_buy_by_quote(symbol, BUY_USDT_AMOUNT)
+        else:
+            # Kuboresha kiwango cha kiasi (qty) kwa njia salama zaidi
+            lot_filter = next((f for f in info["filters"] if f["filterType"] in ("LOT_SIZE", "MARKET_LOT_SIZE")), None)
+            step_size = float(lot_filter["stepSize"]) if lot_filter else 0.0
+            qty_str = format_qty(qty, step_size)
+            order_resp = client.order_market_buy(symbol=symbol, quantity=qty_str)
+
+        executed_qty, avg_price = parse_market_fill(order_resp)
+        if executed_qty == 0 or avg_price == 0:
+            raise RuntimeError("Market Buy failed to fill any quantity.")
+            
+        notify(f"💸 Imenunuliwa `{symbol}` kwa: {executed_qty:.4f} @ {avg_price:.4f} jumla:{executed_qty*avg_price:.5f}")
+        
+        ACTIVE_TRADE.set()
+
+        # 5. Update RECENT_BUYS with position details
+        now = time.time()
         
         # Initialize high_price with buy_price
         high_price = avg_price
@@ -1367,35 +1373,49 @@ def execute_trade(chosen):
                 "buy_price": avg_price, 
                 "ts": now, 
                 "processing": False, 
-                "high_price": high_price # ADDED: Initial high price tracking
+                "high_price": high_price, # Kuongeza ufuatiliaji wa bei ya juu
+                "high_profit_pct": 0.0 # FIX kwa kosa la 'high_profit_pct'
             })
-
+            
         try:
-            ACTIVE_TRADE.set()
-        except Exception:
-            pass
+            # Clear old sell orders if any were left over from previous trades
+            cancel_open_sell_orders(symbol, client=client)
+        except Exception as e:
+            print(f"Error clearing old sell orders: {e}")
 
-        send_telegram(f"💸 Imenunuliwa `{symbol}` kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
+        # Re-check and place the initial limit sell right away if profit is already over activation
+        if (last_price / avg_price - 1) * 100 >= BREAKEVEN_ACTIVATION_PCT:
+             initial_limit_price = avg_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
+             res = place_limit_sell_strict(symbol, executed_qty, initial_limit_price)
+             if res:
+                 sell_order_id = res.get('orderId') or res.get('clientOrderId')
+                 with RECENT_BUYS_LOCK:
+                     RECENT_BUYS[symbol].update({
+                         'sell_order_id': sell_order_id, 
+                         'sell_resp': res, 
+                         'sell_price': initial_limit_price,
+                         "original_sell_price": initial_limit_price,
+                     })
+                 notify(f"⏳ Initial Limit Sell set immediately after buy: `{initial_limit_price:.6f}`")
 
-        # Order ya kuuza (Limit Sell) itawekwa baadaye na monitor_positions baada ya faida ya BREAKEVEN_ACTIVATION_PCT kufikiwa.
-        
         return True
 
-    except BinanceAPIException as e:
-        send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
-        return False
     except Exception as e:
-        send_telegram(f"‼️ Unexpected error during trade {symbol}: {e}")
+        err_msg = str(e)
+        notify(f"❌ Buy failed for `{symbol}`: {err_msg}")
+        print(f"[{time.strftime('%H:%M:%S')}] Buy failed for {symbol}: {err_msg}")
+        
         with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
+            if symbol in RECENT_BUYS:
+                if "processing" in RECENT_BUYS[symbol]:
+                    RECENT_BUYS[symbol]["processing"] = False
+                if RECENT_BUYS[symbol].get("reserved"):
+                    # Only remove if the entry was just a temporary placeholder
+                    RECENT_BUYS.pop(symbol, None)
+                    
+        add_blacklist(symbol, seconds=300) # Temporary blacklist on failure
         return False
-
+        
 # -------------------------
 # wait_for_order_fill
 # -------------------------
@@ -1427,153 +1447,241 @@ def wait_for_order_fill(client, symbol, order_id, timeout=10, poll=1.0):
 # -------------------------
 # Monitor positions (main exit logic)
 # -------------------------
-def monitor_positions(poll_interval=10):
-    global ACTIVE_POSITIONS
-    
-    def check_and_update_limit_sell(symbol, pos, new_limit_sell_price):
-        if pos['limitSellPrice'] < new_limit_sell_price:
-            if pos.get('limitSellId'):
-                try:
-                    cancel_order(symbol, pos['limitSellId'])
-                    pos['limitSellId'] = None
-                except Exception as e:
-                    print(f"[{time.strftime('%H:%M:%S')}] Cancel failed/filled for {symbol} limit sell {pos['limitSellId']}: {e}")
-            
-            res = limit_sell(symbol, pos['qty'], new_limit_sell_price)
-            if res:
-                pos['limitSellId'] = res['orderId']
-                pos['limitSellPrice'] = new_limit_sell_price
-                # NOTIFY KWA TRAILING BUMP
-                notify(f"⬆️ Trailing Profit: `{symbol}` Limit Sell moved to `{new_limit_sell_price:.6f}`")
-                print(f"[{time.strftime('%H:%M:%S')}] ⬆️ Trailing Profit: {symbol} Limit Sell moved to {new_limit_sell_price:.6f}")
-            else:
-                if current_profit_pct > 0:
-                    print(f"[{time.strftime('%H:%M:%S')}] ⚠️ ERROR: Failed to bump Limit Sell, executing Market Sell for safety: {symbol}")
-                    res = market_sell(symbol, pos['qty'])
-                    if res:
-                        to_remove.append(symbol)
-                    return True
-            
-        return False
-
+def monitor_positions(poll_interval=MONITOR_INTERVAL):
+    client = init_binance_client()
+    if not client:
+        print("monitor_positions: Binance client missing.")
+        return # Skip if client is missing
+        
     while True:
         try:
-            # Kutumia get_ticker() kama ilivyo kwenye msimbo wako wa awali
-            ticker = fetch_tickers() # Inapaswa kuwa get_ticker() au fetch_tickers()
+            # Sync open orders cache before monitoring
+            sync_open_orders()
+            
+            with RECENT_BUYS_LOCK:
+                # Iterate over a copy of RECENT_BUYS items that are not closed and not skipped
+                active_positions = {sym: pos for sym, pos in RECENT_BUYS.items() if not pos.get("closed") and not TEMP_SKIP.get(sym, 0) > time.time()}
+
             to_remove = []
 
-            # Kutumia RECENT_BUYS kama ACTIVE_POSITIONS
-            with RECENT_BUYS_LOCK:
-                # Hakikisha unatumia nakala salama ya RECENT_BUYS kwani inaweza kubadilika wakati wa kufuatilia
-                positions_to_monitor = dict(RECENT_BUYS)
-
-            for symbol, pos in positions_to_monitor.items():
-                if pos.get('closed') or pos.get('processing') or not pos.get('buy_price'):
+            for symbol, pos in active_positions.items():
+                
+                # Check for critical missing data
+                if not pos.get('qty') or not pos.get('buy_price'):
+                    print(f"[{time.strftime('%H:%M:%S')}] Monitor: Skipping {symbol}, missing buy data.")
                     continue
                     
-                t_data = next((t for t in ticker if t.get('symbol') == symbol), None)
-                if not t_data:
+                buy_price = float(pos['buy_price'])
+                qty = float(pos['qty'])
+                
+                # Fetch current price
+                last_price = fetch_symbol_price(symbol)
+                if last_price is None or last_price == 0.0:
+                    print(f"[{time.strftime('%H:%M:%S')}] Monitor: Cannot fetch price for {symbol}.")
                     continue
                     
-                last_price = float(t_data.get('lastPrice', 0.0))
-                entry_price = float(pos['buy_price'])
+                current_profit_pct = (last_price / buy_price - 1) * 100
                 
-                current_profit_pct = (last_price / entry_price - 1) * 100
+                # Update high price/profit 
+                high_profit_pct = pos.get('high_profit_pct', 0.0)
+                high_price = pos.get('high_price', buy_price)
                 
-                # Update high price/profit
-                if current_profit_pct > pos['high_profit_pct']:
-                    pos['high_profit_pct'] = current_profit_pct
-                    pos['high_price'] = last_price
+                if current_profit_pct > high_profit_pct:
+                    high_profit_pct = current_profit_pct
+                    high_price = last_price
+                    with RECENT_BUYS_LOCK:
+                        RECENT_BUYS[symbol]['high_profit_pct'] = high_profit_pct
+                        RECENT_BUYS[symbol]['high_price'] = high_price
                     
-                high_price = pos['high_price']
-                high_profit_pct = pos['high_profit_pct']
                 
-                print(f"[{time.strftime('%H:%M:%S')}] Monitor: {symbol} @{last_price:.4f} | Entry:{entry_price:.4f} | Current:{current_profit_pct:.2f}% | High:{high_profit_pct:.2f}%")
+                print(f"[{time.strftime('%H:%M:%S')}] Monitor: {symbol} @{last_price:.4f} | Entry:{buy_price:.4f} | Current:{current_profit_pct:.2f}% | High:{high_profit_pct:.2f}%")
 
-                
-                # Trailing Stop (Tiered) na Profit Bump
-                if current_profit_pct >= TRAIL_PROFIT_ACTIVATION_PCT:
-                    
-                    if high_profit_pct >= TRAIL_TIER_2_PROFIT_PCT:
-                        stop_offset = TRAIL_TIER_3_OFFSET_PCT
-                    elif high_profit_pct >= TRAIL_TIER_1_PROFIT_PCT:
-                        stop_offset = TRAIL_TIER_2_OFFSET_PCT
-                    else:
-                        stop_offset = TRAIL_TIER_1_OFFSET_PCT
 
-                    trailing_stop_price = high_price * (1 - stop_offset / 100)
-                    
-                    new_limit_sell_price = high_price * (1 + TRAIL_PROFIT_BUMP_PCT / 100)
-                    
-                    if check_and_update_limit_sell(symbol, pos, new_limit_sell_price):
-                        continue
-                    
-                    if last_price <= trailing_stop_price:
-                        print(f"[{time.strftime('%H:%M:%S')}] 🔥 Trailing Stop Hit! {symbol} - High {high_profit_pct:.2f}% -> Exit {current_profit_pct:.2f}%")
-                        res = market_sell(symbol, pos['qty'])
-                        if res:
-                            to_remove.append(symbol)
-                        continue
+                # --- Helper for Trailing Profit/Breakeven logic ---
+                def check_and_update_limit_sell(sym, position, new_limit_sell_price):
+                    """Handles cancel/replace of the Limit Sell Order."""
+                    current_sell_price = position.get('sell_price', 0.0)
 
-                # Breakeven Stop-Loss na Kuweka Limit Sell ya Kwanza (Mantiki Mpya)
-                elif current_profit_pct >= BREAKEVEN_ACTIVATION_PCT:
-                    if not pos.get('limitSellId'):
-                        initial_limit_price = entry_price * (1 + LIMIT_PROFIT_PCT / 100)
-                        res = limit_sell(symbol, pos['qty'], initial_limit_price)
-                        if res:
-                            pos['limitSellId'] = res['orderId']
-                            pos['limitSellPrice'] = initial_limit_price
-                            # NOTIFY KWA LIMIT SELL YA KWANZA
-                            notify(f"⏳ Limit Sell ya kwanza ya `{symbol}` imewekwa kwa faida ya {LIMIT_PROFIT_PCT}%: `{initial_limit_price:.6f}`")
-                            print(f"[{time.strftime('%H:%M:%S')}] ⏳ Initial Limit Sell set after {BREAKEVEN_ACTIVATION_PCT}% profit: {initial_limit_price:.6f}")
+                    if current_sell_price < new_limit_sell_price - 1e-8: # Check if the new price is actually higher
                         
-                    breakeven_price = entry_price * (1 + BREAKEVEN_PROFIT_GUARD_PCT / 100)
-                    
-                    if last_price <= breakeven_price:
-                        print(f"[{time.strftime('%H:%M:%S')}] 🛡️ Breakeven Stop Hit! {symbol}. Exiting at minimal profit ({BREAKEVEN_PROFIT_GUARD_PCT:.2f}%).")
-                        res = market_sell(symbol, pos['qty'])
-                        if res:
-                            to_remove.append(symbol)
-                        continue
+                        # 1. Cancel existing order
+                        sell_order_id = position.get('sell_order_id')
+                        if sell_order_id:
+                            try:
+                                # Cancel the specific order
+                                client.cancel_order(symbol=sym, orderId=sell_order_id)
+                                with RECENT_BUYS_LOCK:
+                                    RECENT_BUYS[sym].update({'sell_order_id': None, 'sell_resp': None, 'sell_price': None})
+                                time.sleep(0.1) # short wait after cancel
+                            except Exception as e:
+                                err_str = str(e)
+                                if "Unknown order" in err_str or "Order does not exist" in err_str:
+                                    # Order filled/cancelled by other means, clear ID and proceed
+                                    with RECENT_BUYS_LOCK:
+                                        RECENT_BUYS[sym].update({'sell_order_id': None, 'sell_resp': None, 'sell_price': None})
+                                    sync_open_orders(force=True)
+                                    print(f"[{time.strftime('%H:%M:%S')}] Warning: SELL order {sell_order_id} for {sym} was not found (filled/cancelled?). Placing new order.")
+                                else:
+                                    print(f"[{time.strftime('%H:%M:%S')}] Cancel failed/filled for {sym} limit sell {sell_order_id}: {e}")
+                                    return False # Cannot proceed safely
 
-                # Smart Exit
-                if current_profit_pct < 0 and abs(current_profit_pct) < MAX_TECHNICAL_LOSS:
-                    # Inahitaji kurejelea utekelezaji wa kutoa klines na indicators
-                    # Kwa sasa, tutaendelea na mantiki ya awali iliyopo, tukibadili tu matumizi ya data
-                    # Badili tu mantiki ya 'pos' kwenda kwenye 'RECENT_BUYS'
+                        # 2. Place new limit sell
+                        res = place_limit_sell_strict(sym, position['qty'], new_limit_sell_price)
+                        if res:
+                            new_id = res.get('orderId') or res.get('clientOrderId')
+                            with RECENT_BUYS_LOCK:
+                                RECENT_BUYS[sym].update({
+                                    'sell_order_id': new_id, 
+                                    'sell_resp': res, 
+                                    'sell_price': new_limit_sell_price
+                                })
+                            notify(f"⬆️ Trailing Profit: `{sym}` Limit Sell moved to `{new_limit_sell_price:.6f}`")
+                            return True
+                        else:
+                            # Critical failure to place new order, attempt market sell exit for safety
+                            notify(f"⚠️ ERROR: Failed to bump Limit Sell, executing Market Sell for safety: `{sym}`")
+                            market_sell_resp = cancel_then_market_sell(sym, position['qty'], exit_method="trailing_stop_fail_market_exit")
+                            if market_sell_resp:
+                                with RECENT_BUYS_LOCK:
+                                    add_blacklist(sym)
+                                    finalize_close(sym, {"closed_ts": time.time(), "close_method": "trailing_stop_fail_market_exit", "close_resp": market_sell_resp})
+                                to_remove.append(sym)
+                                return True # Indicate position should be removed
+                            # If market sell also failed, we leave the position open and move to TEMP_SKIP
+                            notify(f"❌ CRITICAL: Market Sell ALSO FAILED for {sym} after Limit Sell error. Position left open.")
+                            TEMP_SKIP[sym] = time.time() + 60
+                            return True # Indicate position should be skipped temporarily
+                    return False # No action taken, or action failed but didn't result in removal
+
+
+                # ----------------------------------------------------
+                # 1. Breakeven Stop-Loss na Kuweka Limit Sell ya Kwanza
+                # ----------------------------------------------------
+                if current_profit_pct >= BREAKEVEN_ACTIVATION_PCT:
+                    
+                    # A. Initial Limit Sell (if not placed/active)
+                    if not pos.get('sell_order_id'):
+                        initial_limit_price = buy_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
+                        
+                        # Only place initial sell if Trailing Profit has not already been activated (by high_profit_pct > LIMIT_PROFIT_PCT)
+                        if high_profit_pct < LIMIT_PROFIT_PCT:
+                            res = place_limit_sell_strict(symbol, qty, initial_limit_price)
+                            if res:
+                                sell_order_id = res.get('orderId') or res.get('clientOrderId')
+                                with RECENT_BUYS_LOCK:
+                                    RECENT_BUYS[symbol].update({
+                                        'sell_order_id': sell_order_id, 
+                                        'sell_resp': res, 
+                                        'sell_price': initial_limit_price,
+                                        "original_sell_price": initial_limit_price,
+                                    })
+                                notify(f"⏳ Initial Limit Sell set after {BREAKEVEN_ACTIVATION_PCT}% profit: `{initial_limit_price:.6f}`")
+                            
+                    # B. Trailing Stop (Tiered) - Only if high_profit_pct is reached
+                    if high_profit_pct >= TRAIL_PROFIT_ACTIVATION_PCT:
+                        
+                        # Determine offset based on high_profit_pct
+                        stop_offset = TRAIL_TIER_1_OFFSET_PCT # 0.5% (Default Tier 1 offset)
+                        
+                        # KUREKEBISHWA: Anza na Tier ya Juu Zaidi kwanza ili kuepuka kuruka kiwango
+                        if high_profit_pct >= TRAIL_TIER_2_PROFIT_PCT: # Faida >= 2.0%
+                            stop_offset = TRAIL_TIER_3_OFFSET_PCT      # Weka Offset kubwa zaidi (1.0%)
+                        elif high_profit_pct >= TRAIL_TIER_3_OFFSET_PCT: # Faida >= 1.0% 
+                            stop_offset = TRAIL_TIER_2_OFFSET_PCT      # Weka Offset ya kati (0.7%)
+
+                        # Calculate Trailing Stop Price (The price at which we MUST sell)
+                        trailing_stop_price = high_price * (1 - stop_offset / 100)
+                        
+                        # Calculate the NEW Limit Sell Price (The price we aim for)
+                        new_limit_sell_price = high_price * (1.0 + (TRAIL_PROFIT_BUMP_PCT / 100.0))
+
+                        # Check if Trailing Stop hit (market exit)
+                        if last_price <= trailing_stop_price:
+                            notify(f"🔥 Trailing Stop Hit! `{symbol}` - High {high_profit_pct:.2f}% -> Exit {current_profit_pct:.2f}%")
+                            market_sell_resp = cancel_then_market_sell(symbol, qty, exit_method="trailing_stop")
+                            if market_sell_resp:
+                                with RECENT_BUYS_LOCK:
+                                    add_blacklist(symbol)
+                                    finalize_close(symbol, {"closed_ts": time.time(), "close_method": "trailing_stop_hit", "close_resp": market_sell_resp})
+                                to_remove.append(symbol)
+                            continue
+
+                        # Check if Limit Sell needs to be bumped up
+                        if check_and_update_limit_sell(symbol, pos, new_limit_sell_price):
+                            if symbol in to_remove: continue
+                    
+                    # C. Breakeven Stop-Loss (If Trailing not active)
+                    else: # Only runs if Trailing Profit has NOT been activated
+                        # Only apply Breakeven Stop if Initial Limit Sell is still active
+                        if pos.get('sell_order_id'):
+                            # The breakeven guard is applied relative to the entry price
+                            breakeven_price = buy_price * (1.0 + (BREAKEVEN_PROFIT_GUARD_PCT / 100.0))
+                            
+                            if last_price <= breakeven_price:
+                                notify(f"🛡️ Breakeven Stop Hit! `{symbol}`. Exiting at minimal profit ({BREAKEVEN_PROFIT_GUARD_PCT:.2f}%).")
+                                market_sell_resp = cancel_then_market_sell(symbol, qty, exit_method="breakeven_stop")
+                                if market_sell_resp:
+                                    with RECENT_BUYS_LOCK:
+                                        add_blacklist(symbol)
+                                        finalize_close(symbol, {"closed_ts": time.time(), "close_method": "breakeven_stop_hit", "close_resp": market_sell_resp})
+                                    to_remove.append(symbol)
+                                continue
+
+                # ----------------------------------------------------
+                # 2. Smart Exit (Technical Loss)
+                # ----------------------------------------------------
+                
+                # Check for technical loss signal, only if current loss is within the MAX_TECHNICAL_LOSS limit
+                if abs(current_profit_pct) < MAX_TECHNICAL_LOSS: 
+                    
                     klines = fetch_klines(symbol, '5m', KLINES_5M_LIMIT)
-                    if not klines: continue
+                    if not klines or len(klines) < KLINES_5M_LIMIT: continue
                     
                     close_prices = [float(k[4]) for k in klines]
                     last_close_price = close_prices[-1]
                     
+                    if len(close_prices) < EMA_LONG or len(close_prices) < RSI_PERIOD + 1:
+                        continue
+                        
                     ema_short = ema_local(close_prices, EMA_SHORT)
                     ema_long = ema_local(close_prices, EMA_LONG)
-                    rsi_5m = compute_rsi_local(close_prices)
+                    rsi_5m = compute_rsi_local(close_prices, RSI_PERIOD)
 
-                    if current_profit_pct <= -1.0:
+                    # Only check for negative profit (Loss) and if indicators are valid
+                    if current_profit_pct <= -1.0 and ema_long and ema_short and rsi_5m is not None:
                         if last_close_price < ema_long and ema_short < ema_long and rsi_5m < 50.0:
-                            print(f"[{time.strftime('%H:%M:%S')}] 📉 Smart Exit Activated: {symbol} - {current_profit_pct:.2f}%. EMA/RSI breakdown.")
-                            res = cancel_then_market_sell(symbol, pos['qty'], exit_method="smart_exit")
-                            if res:
+                            notify(f"📉 Smart Exit Activated: `{symbol}` - {current_profit_pct:.2f}%. EMA/RSI breakdown.")
+                            market_sell_resp = cancel_then_market_sell(symbol, qty, exit_method="smart_exit")
+                            if market_sell_resp:
+                                with RECENT_BUYS_LOCK:
+                                    add_blacklist(symbol)
+                                    finalize_close(symbol, {"closed_ts": time.time(), "close_method": "smart_exit_hit", "close_resp": market_sell_resp})
                                 to_remove.append(symbol)
                             continue
-
-                # Max Loss Stop
-                if abs(current_profit_pct) >= MAX_LOSS:
-                    print(f"[{time.strftime('%H:%M:%S')}] 🔴 MAX LOSS HIT! {symbol} - {current_profit_pct:.2f}%.")
-                    res = cancel_then_market_sell(symbol, pos['qty'], exit_method="max_loss")
-                    if res:
+                
+                # ----------------------------------------------------
+                # 3. Max Loss Stop (Final protection)
+                # ----------------------------------------------------
+                if abs(current_profit_pct) >= MAX_TECHNICAL_LOSS: 
+                    notify(f"🔴 MAX LOSS HIT! `{symbol}` - {current_profit_pct:.2f}%.")
+                    market_sell_resp = cancel_then_market_sell(symbol, qty, exit_method="max_loss_stop")
+                    if market_sell_resp:
+                        with RECENT_BUYS_LOCK:
+                            add_blacklist(symbol)
+                            finalize_close(symbol, {"closed_ts": time.time(), "close_method": "max_loss_hit", "close_resp": market_sell_resp})
                         to_remove.append(symbol)
                     continue
                     
+            # Finalize removals
             with RECENT_BUYS_LOCK:
                 for symbol in to_remove:
-                    finalize_close(symbol) # kutumia finalize_close
+                    if symbol in RECENT_BUYS:
+                        finalize_close(symbol) # finalize_close handles removal/closing and ACTIVE_TRADE flag
             
             time.sleep(poll_interval)
             
         except Exception as e:
+            # The original error should now be fixed
             print("monitor_positions loop error", e)
             time.sleep(max(5, poll_interval))
             
@@ -1602,7 +1710,6 @@ def watch_orders(poll_interval=12):
                         except Exception:
                             o = None
                     if not o:
-                        time.sleep(0.4)
                         continue
                     status = (o.get("status") or "").upper()
                     if status == "FILLED":
@@ -1628,18 +1735,8 @@ def watch_orders(poll_interval=12):
                         add_blacklist(sym)
                         finalize_close(sym, {"closed_ts": time.time(), "close_method": "limit_filled_watch", "close_resp": o, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price})
                     elif status in ("CANCELED", "REJECTED"):
-                        # If canceled by the exchange or manually, it needs to be handled, but in this bot,
-                        # cancellation means the logic tried to replace it, or a fill occurred.
-                        # For simplicity, we just log and finalize/clear the open order ID if it was canceled by an external event.
                         send_telegram(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
-                        # Weka `sell_order_id` kuwa None ili monitor_positions iweze kuweka mpya ikiwa bado iko wazi.
-                        with RECENT_BUYS_LOCK:
-                            if sym in RECENT_BUYS:
-                                RECENT_BUYS[sym]["sell_order_id"] = None 
-                                RECENT_BUYS[sym]["sell_price"] = 0.0 
-                    else:
-                        time.sleep(0.4) # polepole kidogo kwa orders ambazo bado zinafanya kazi
-                        continue
+                        finalize_close(sym, {"closed_ts": time.time(), "close_method": f"sell_{status.lower()}", "close_resp": o})
                 except Exception as e:
                     print("watch_orders error for", sym, e)
                 time.sleep(0.4)
