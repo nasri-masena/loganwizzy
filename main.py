@@ -37,7 +37,7 @@ BINANCE_REST = "https://api.binance.com"
 PRICE_MIN = 0.1
 PRICE_MAX = 15.0
 MIN_VOLUME = 200000
-TOP_BY_24H_VOLUME = 100
+TOP_BY_24H_VOLUME = 120
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 15
@@ -1325,8 +1325,8 @@ def execute_trade(symbol, score, last_price):
     try:
         # 1. Fetch symbol details
         info = get_symbol_info(symbol)
-        if not info:
-            raise RuntimeError(f"Missing symbol info for {symbol}")
+        if not info or 'filters' not in info: # ADDED GUARD HERE
+            raise RuntimeError(f"Missing or invalid symbol info for {symbol}")
             
         # 2. Compute quantity (qty)
         qty_to_buy = 0.0
@@ -1349,6 +1349,11 @@ def execute_trade(symbol, score, last_price):
         else:
             # Kuboresha kiwango cha kiasi (qty) kwa njia salama zaidi
             lot_filter = next((f for f in info["filters"] if f["filterType"] in ("LOT_SIZE", "MARKET_LOT_SIZE")), None)
+            
+            # ADDED GUARD HERE: Check if lot_filter was found
+            if not lot_filter:
+                raise RuntimeError(f"LOT_SIZE filter not found for {symbol}")
+                
             step_size = float(lot_filter["stepSize"]) if lot_filter else 0.0
             qty_str = format_qty(qty, step_size)
             order_resp = client.order_market_buy(symbol=symbol, quantity=qty_str)
@@ -1373,8 +1378,8 @@ def execute_trade(symbol, score, last_price):
                 "buy_price": avg_price, 
                 "ts": now, 
                 "processing": False, 
-                "high_price": high_price, # Kuongeza ufuatiliaji wa bei ya juu
-                "high_profit_pct": 0.0 # FIX kwa kosa la 'high_profit_pct'
+                "high_price": high_price,
+                "high_profit_pct": 0.0
             })
             
         try:
@@ -1415,7 +1420,7 @@ def execute_trade(symbol, score, last_price):
                     
         add_blacklist(symbol, seconds=300) # Temporary blacklist on failure
         return False
-        
+    
 # -------------------------
 # wait_for_order_fill
 # -------------------------
