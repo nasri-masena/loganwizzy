@@ -80,7 +80,9 @@ SCAN_PAUSE_ON_OPEN = True
 
 APPROACH_PCT_BEFORE_CANCEL = 0.997
 TRAILING_INCREMENT_PCT = 0.6
-TRAILING_SELL_DROP_PCT = 0.7
+TRAILING_SELL_DROP_PCT = 1.0
+TRAILING_MIN_RISE_PCT = 0.3
+TRAILING_START_DELAY = 8
 TRAILING_POLL_INTERVAL = 1.0
 MIN_TIME_BETWEEN_TRAILING_ACTIONS = 1.5
 TRAILING_RETRY_INTERVAL = 20.0
@@ -1189,16 +1191,17 @@ def trailing_monitor(symbol):
                 pos = RECENT_BUYS.get(symbol)
                 if not pos or pos.get("closed"):
                     break
-                qty = pos.get("qty") or 0.0
-                buy_price = pos.get("buy_price") or 0.0
-                current_sell_price = pos.get("sell_price") or 0.0
-                highest = pos.get("highest_price") or 0.0
+                qty = float(pos.get("qty") or 0.0)
+                buy_price = float(pos.get("buy_price") or 0.0)
+                current_sell_price = float(pos.get("sell_price") or 0.0)
+                highest = float(pos.get("highest_price") or 0.0)
+                buy_ts = float(pos.get("ts") or 0.0)
+                trailing_retries = int(pos.get("trailing_retries") or 0)
 
             if qty <= 0:
                 time.sleep(TRAILING_POLL_INTERVAL)
                 continue
 
-            # throttle global actions
             if time.time() - last_action_ts < MIN_TIME_BETWEEN_TRAILING_ACTIONS:
                 time.sleep(TRAILING_POLL_INTERVAL)
                 continue
@@ -1212,6 +1215,15 @@ def trailing_monitor(symbol):
                 time.sleep(TRAILING_POLL_INTERVAL)
                 continue
 
+            # enforce a short start delay after buy to avoid immediate reactions
+            try:
+                if 'TRAILING_START_DELAY' in globals() and TRAILING_START_DELAY:
+                    if time.time() - buy_ts < float(TRAILING_START_DELAY):
+                        time.sleep(TRAILING_POLL_INTERVAL)
+                        continue
+            except Exception:
+                pass
+
             # update highest safely
             with RECENT_BUYS_LOCK:
                 stored = RECENT_BUYS.get(symbol, {})
@@ -1219,11 +1231,28 @@ def trailing_monitor(symbol):
                     RECENT_BUYS[symbol]["highest_price"] = last_price
                     highest = last_price
 
+            # require a minimum rise from buy before enabling trailing actions
+            try:
+                if buy_price > 0 and 'TRAILING_MIN_RISE_PCT' in globals() and TRAILING_MIN_RISE_PCT:
+                    required = buy_price * (1.0 + (float(TRAILING_MIN_RISE_PCT) / 100.0))
+                    if highest < required:
+                        time.sleep(TRAILING_POLL_INTERVAL)
+                        continue
+            except Exception:
+                pass
+
             # 1) approach -> move sell up
             try:
-                if current_sell_price and last_price >= (float(current_sell_price) * APPROACH_PCT_BEFORE_CANCEL):
+                if current_sell_price and last_price >= (float(current_sell_price) * float(APPROACH_PCT_BEFORE_CANCEL)):
+                    # if we've exhausted retries, back off for a bit
+                    if trailing_retries >= (MAX_TRAILING_RETRIES or 0):
+                        if should_notify(symbol, "trailing_fail"):
+                            notify(f"⚠️ Trailing retries exhausted for {symbol}; skipping further immediate trailing attempts.")
+                        time.sleep(TRAILING_RETRY_INTERVAL)
+                        last_action_ts = time.time()
+                        continue
+
                     base_for_new = max(last_price, current_sell_price)
-                    # ensure we don't spam: allow set_new only if not currently retrying too often
                     set_new_limit_sell_for_position(symbol, qty, base_for_new, reason="approach_and_raise")
                     last_action_ts = time.time()
                     time.sleep(TRAILING_POLL_INTERVAL)
@@ -1233,7 +1262,7 @@ def trailing_monitor(symbol):
 
             # 2) drop from peak -> market sell fallback
             try:
-                if highest and (last_price <= (float(highest) * (1.0 - (TRAILING_SELL_DROP_PCT / 100.0)))):
+                if highest and (last_price <= (float(highest) * (1.0 - (float(TRAILING_SELL_DROP_PCT) / 100.0)))):
                     if should_notify(symbol, "trailing_drop"):
                         notify(f"⚠️ Trailing detected drop for {symbol}: last={last_price} highest={highest} -> executing market sell fallback.")
                     log_csv("TRAIL_DROP", symbol, qty, price=last_price, highest=highest, sell_price=current_sell_price, note="drop_from_peak")
@@ -1245,7 +1274,6 @@ def trailing_monitor(symbol):
                         log_csv("SOLD_MARKET", symbol, qty, price=last_price, highest=highest, sell_price=current_sell_price, note="sold_on_drop")
                         break
                     else:
-                        # failed -> only notify once per interval
                         if should_notify(symbol, "trailing_fail"):
                             notify(f"⚠️ Trailing: market sell failed for {symbol}. Will retry later.")
                         time.sleep(TRAILING_RETRY_INTERVAL)
@@ -1263,7 +1291,7 @@ def trailing_monitor(symbol):
             if symbol in RECENT_BUYS:
                 RECENT_BUYS[symbol].pop("trailing_thread", None)
         return
-    
+
 # -------------------------
 # Evaluate symbol
 # -------------------------
