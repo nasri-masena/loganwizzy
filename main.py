@@ -1095,8 +1095,8 @@ def place_limit_sell_strict(
     except Exception as e:
         notify(f"⚠️ place_limit_sell_strict unexpected error for {symbol}: {e}")
         return None
- 
- def safe_create_limit_sell(client, symbol, target_price, intended_qty, max_attempts=3, sleep_base=0.5):
+
+def safe_create_limit_sell(client, symbol, target_price, intended_qty, max_attempts=3, sleep_base=0.5):
     try:
         info = client.get_symbol_info(symbol)
         if not info:
@@ -1148,7 +1148,7 @@ def place_limit_sell_strict(
         except Exception as e:
             last_err = str(e)
             time.sleep(sleep_base * (2 ** (attempt - 1)))
-    return False, f"failed_after_{max_attempts}: {last_err}"    
+    return False, f"failed_after_{max_attempts}: {last_err}" 
     
 # -------------------------
 # Cancel open SELL orders for a symbol (safe)
