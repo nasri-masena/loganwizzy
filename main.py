@@ -63,7 +63,7 @@ RECENT_BUYS = {}
 BUY_LOCK_SECONDS = 120
 REMOVE_AFTER_CLOSE = True
 
-SHORT_BUY_SELL_DELAY = 1.0  # patched: increased delay to allow trailing activation
+SHORT_BUY_SELL_DELAY = 1.0
 MONITOR_INTERVAL = 6.0
 LIMIT_SELL_RETRIES = 2
 VOL_1M_THRESHOLD = 0.004
@@ -77,14 +77,7 @@ MAX_TECHNICAL_LOSS = 4.0 # Technical stop-loss (Smart Exit)
 
 TRAIL_PROFIT_ACTIVATION_PCT = 0.8  
 TRAIL_PROFIT_BUMP_PCT = 0.8        
-TRAIL_STOP_OFFSET_PCT = 0.5
-# --- SMART quick market-sell settings (patched) ---
-SMART_MARKET_SELL_ENABLED = True       # enable immediate market-sell when quick drop / drawdown detected
-SMART_MARKET_SELL_PCT = 0.5            # absolute drop from buy (%) to trigger immediate market sell (e.g., 0.5%)
-SMART_MOMENTUM_WINDOW_SEC = 3.0        # approximate time window for momentum check (used via prev_price)
-SMART_MOMENTUM_PCT = 0.4               # drop (%) between monitoring cycles to trigger quick market sell
-# ------------------------------------------------
-        
+TRAIL_STOP_OFFSET_PCT = 0.5        
 
 SCAN_PAUSE_ON_OPEN = True
 
@@ -1302,131 +1295,37 @@ def pick_coin():
 # -------------------------
 # Execute trade
 # -------------------------
-def execute_trade(symbol, is_sell=False, force_qty=None, original_buy_price=None, profit_factor=None):
-    if not ENABLE_TRADING:
-        send_telegram(f"⚠️ Trading DISABLED: Skipped {symbol} {'SELL' if is_sell else 'BUY'}")
-        return True
-
-    side = Client.SIDE_SELL if is_sell else Client.SIDE_BUY
-
+def execute_trade(chosen):
+    symbol = chosen["symbol"]
+    now = time.time()
     with RECENT_BUYS_LOCK:
-        if side == Client.SIDE_BUY:
-            if symbol in RECENT_BUYS and RECENT_BUYS[symbol].get("processing"):
-                print(f"[{time.strftime('%H:%M:%S')}] Already processing a buy for {symbol}. Skipping.")
-                return False
-            RECENT_BUYS[symbol] = {"processing": True}
-
-    client = get_client()
+        if len([k for k, v in RECENT_BUYS.items() if not v.get("closed")]) >= MAX_CONCURRENT_POS:
+            send_telegram(f"⚠️ Max concurrent positions reached. Skipping {symbol}")
+            return False
+        RECENT_BUYS[symbol] = {"ts": now, "reserved": False, "closed": False, "processing": True}
+    client = init_binance_client()
     if not client:
-        print("Binance client not initialized. Cannot execute trade.")
-        return False
-
-    if side == Client.SIDE_BUY:
-        if BUY_BY_QUOTE:
-            buy_qty = BUY_USDT_AMOUNT
-        else:
-            buy_qty = BUY_BASE_QTY
-    else:
+        send_telegram(f"⚠️ Trading disabled or client missing. Skipping live trade for {symbol}")
         with RECENT_BUYS_LOCK:
-            if symbol not in RECENT_BUYS:
-                print(f"Cannot sell {symbol}: Not in RECENT_BUYS.")
-                return False
-            sell_qty = RECENT_BUYS[symbol]["qty"]
-        
-        if force_qty:
-            sell_qty = force_qty
-
-    filters = get_exchange_info(symbol)
-    if not filters: return False
-
-    price = get_ticker(symbol)
-    if not price: return False
-
-    if side == Client.SIDE_BUY:
-        base_qty = buy_qty / price
-        step_size = float(filters.get("LOT_SIZE", {}).get("stepSize", "1"))
-        base_qty = math.floor(base_qty / step_size) * step_size
-        
-        min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional", "10.0"))
-        if base_qty * price < min_notional:
-            send_telegram(f"⚠️ Buy {symbol} failed: Notional ({base_qty * price:.2f}) too small.")
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(symbol, None)
-            return False
-
-        if base_qty <= 0:
-            send_telegram(f"⚠️ Buy {symbol} failed: Calculated base quantity is zero.")
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(symbol, None)
-            return False
-
-        print(f"[{time.strftime('%H:%M:%S')}] Placed BUY order for {symbol} @ {base_qty:.4f}")
-        params = {
-            'symbol': symbol,
-            'side': side,
-            'type': Client.ORDER_TYPE_MARKET,
-            'quantity': base_qty
-        }
-    
-    else:
-        if sell_qty <= 0:
-            send_telegram(f"⚠️ Sell {symbol} failed: Quantity is zero.")
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.pop(symbol, None)
-            return False
-
-        step_size = float(filters.get("LOT_SIZE", {}).get("stepSize", "1"))
-        sell_qty = math.floor(sell_qty / step_size) * step_size
-
-        print(f"[{time.strftime('%H:%M:%S')}] Placed SELL order for {symbol} @ {sell_qty:.4f}")
-        params = {
-            'symbol': symbol,
-            'side': side,
-            'type': Client.ORDER_TYPE_MARKET,
-            'quantity': sell_qty
-        }
+            RECENT_BUYS.pop(symbol, None)
+        try: ACTIVE_TRADE.clear()
+        except Exception: pass
+        return False
 
     try:
-        order = client.create_order(**params)
-    except BinanceAPIException as e:
-        error_msg = f"❌ Order FAILED for {symbol} ({side}): {e}"
-        send_telegram(error_msg)
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
-        return False
-    except Exception as e:
-        error_msg = f"❌ Order FAILED for {symbol} ({side}): {e}"
-        send_telegram(error_msg)
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
-        return False
-
-    if side == Client.SIDE_SELL:
-        executed_qty, avg_price = parse_market_fill(order)
-
-        if executed_qty <= 0:
-            send_telegram(f"⚠️ Sell executed but no fill qty for {symbol}. Raw: {order}")
+        if BUY_BY_QUOTE and BUY_USDT_AMOUNT > 0:
+            order = place_market_buy_by_quote(symbol, BUY_USDT_AMOUNT)
+        elif not BUY_BY_QUOTE and BUY_BASE_QTY > 0:
+            order = client.order_market_buy(symbol=symbol, quantity=str(BUY_BASE_QTY))
+        else:
+            send_telegram("⚠️ Buy amount not configured. Skipping trade.")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
             try: ACTIVE_TRADE.clear()
             except Exception: pass
             return False
 
-        send_telegram(f"✅ SELL {symbol} Success! Qty: {executed_qty:.4f}, Price: {avg_price:.4f}")
-        
-        with RECENT_BUYS_LOCK:
-            RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
-        return True
-
-    else:
         executed_qty, avg_price = parse_market_fill(order)
-
         if executed_qty <= 0:
             send_telegram(f"⚠️ Buy executed but no fill qty for {symbol}. Raw: {order}")
             with RECENT_BUYS_LOCK:
@@ -1435,27 +1334,120 @@ def execute_trade(symbol, is_sell=False, force_qty=None, original_buy_price=None
             except Exception: pass
             return False
         
-        try:
-            high_price = float(avg_price) if avg_price else 0.0
-        except Exception:
-            high_price = 0.0
+        # Initialize high_price with buy_price
+        high_price = avg_price
 
         with RECENT_BUYS_LOCK:
             RECENT_BUYS[symbol].update({
-                "qty": executed_qty,
-                "buy_price": float(avg_price) if avg_price else 0.0,
-                "ts": now,
-                "processing": False,
-                "high_price": high_price,
-                "prev_price": high_price,
-                "sell_price": 0.0,
-                "original_sell_price": 0.0,
-                "sell_order_id": None
+                "qty": executed_qty, 
+                "buy_price": avg_price, 
+                "ts": now, 
+                "processing": False, 
+                "high_price": high_price # ADDED: Initial high price tracking
             })
-            
-        send_telegram(f"💰 BUY {symbol} Success! Qty: {executed_qty:.4f}, Price: {avg_price:.4f}")
-        return True
-        
+
+        try:
+            ACTIVE_TRADE.set()
+        except Exception:
+            pass
+
+        send_telegram(f"💸 Imenunuliwa `{symbol}` kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
+
+        time.sleep(SHORT_BUY_SELL_DELAY)
+
+        sell_price = avg_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
+        sell_resp = place_limit_sell_strict(symbol, executed_qty, sell_price)
+        if sell_resp:
+            sell_order_id = None
+            try:
+                if isinstance(sell_resp, dict):
+                    sell_order_id = sell_resp.get("orderId") or sell_resp.get("order_id") or sell_resp.get("clientOrderId")
+                else:
+                    sell_order_id = getattr(sell_resp, "orderId", None) or getattr(sell_resp, "order_id", None) or getattr(sell_resp, "clientOrderId", None)
+            except Exception:
+                sell_order_id = None
+
+            with RECENT_BUYS_LOCK:
+                RECENT_BUYS[symbol].update({
+                    "sell_price": sell_price,
+                    "original_sell_price": sell_price, # ADDED: Store original limit sell price
+                    "sell_resp": sell_resp,
+                    "sell_order_id": sell_order_id,
+                    "sell_ts": time.time(),
+                    "closed": False,
+                    "processing": False,
+                })
+
+            send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
+
+            # short poll for immediate fills
+            try:
+                if sell_order_id:
+                    filled_order = wait_for_order_fill(client, symbol, sell_order_id, timeout=8, poll=1.0)
+                    if filled_order:
+                        st = (filled_order.get("status") or "").upper()
+                        if st == "FILLED":
+                            filled_qty = 0.0
+                            avg_price_fill = 0.0
+                            try:
+                                fills = filled_order.get("fills") or []
+                                if fills:
+                                    tq = 0.0; tq_quote = 0.0
+                                    for f in fills:
+                                        q = float(f.get("qty", 0)); p = float(f.get("price", 0))
+                                        tq += q; tq_quote += q * p
+                                    filled_qty = tq
+                                    avg_price_fill = (tq_quote / tq) if tq else 0.0
+                                else:
+                                    filled_qty = float(filled_order.get("executedQty") or 0.0)
+                                    cquote = float(filled_order.get("cummulativeQuoteQty") or 0.0)
+                                    avg_price_fill = (cquote / filled_qty) if filled_qty else 0.0
+                            except Exception:
+                                filled_qty = executed_qty
+                                avg_price_fill = sell_price
+
+                            add_blacklist(symbol)
+                            finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
+                            send_telegram(f"✔️ Coin ya `{symbol}` imeuzwa — {filled_qty} @ {avg_price} (limit)")
+                            return True
+            except Exception:
+                pass
+
+            return True
+        else:
+            notify(f"⚠️ limit sell placement failed for {symbol}, attempting market sell fallback.")
+            fallback = cancel_then_market_sell(symbol, executed_qty)
+            with RECENT_BUYS_LOCK:
+                if fallback:
+                    add_blacklist(symbol)
+                    finalize_close(symbol, {"closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
+                else:
+                    if symbol in RECENT_BUYS:
+                        RECENT_BUYS.pop(symbol, None)
+                    try:
+                        ACTIVE_TRADE.clear()
+                    except Exception:
+                        pass
+            if fallback:
+                send_telegram(f"ℹ️ Market fallback sold {symbol}.")
+            else:
+                send_telegram(f"❌ Both limit and market sell failed for {symbol}. Entry removed to avoid blocking.")
+            return False
+    except BinanceAPIException as e:
+        send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS.pop(symbol, None)
+        try: ACTIVE_TRADE.clear()
+        except Exception: pass
+        return False
+    except Exception as e:
+        send_telegram(f"‼️ Unexpected error during trade {symbol}: {e}")
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS.pop(symbol, None)
+        try: ACTIVE_TRADE.clear()
+        except Exception: pass
+        return False
+
 # -------------------------
 # wait_for_order_fill
 # -------------------------
@@ -1484,39 +1476,24 @@ def wait_for_order_fill(client, symbol, order_id, timeout=10, poll=1.0):
         time.sleep(poll)
     return None
 
-# -------------------------
-# Monitor positions (main exit logic)
-# -------------------------
-
-def wait_for_cancel(client, symbol, order_id, timeout=6.0, poll=0.25):
-    """Wait for an order to be cancelled or not-existent.
-    Returns True if order is confirmed cancelled (or not found), False if it was FILLED or still appears after timeout.
-    """
+def wait_for_cancel(client, symbol, order_id, timeout=5.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            o = None
-            try:
-                o = client.get_order(symbol=symbol, orderId=order_id)
-            except Exception:
-                try:
-                    o = client.get_order(symbol=symbol, origClientOrderId=str(order_id))
-                except Exception:
-                    o = None
-            if not o:
-                # order not found — treat as cancelled/cleared
-                return True
+            o = client.get_order(symbol=symbol, orderId=order_id)
             st = (o.get("status") or "").upper()
-            if st in ("CANCELED", "REJECTED", "EXPIRED"):
+            if st in ("CANCELED","REJECTED","EXPIRED"):
                 return True
             if st == "FILLED":
-                return False
+                return False  # already filled
         except Exception:
-            # if the client call raises, assume it propagated and continue polling a couple of times
-            pass
-        time.sleep(poll)
+            return True
+        time.sleep(0.25)
     return False
-
+    
+# -------------------------
+# Monitor positions (main exit logic)
+# -------------------------
 def monitor_positions():
     while True:
         try:
@@ -1557,30 +1534,6 @@ def monitor_positions():
                             high_price = last
                     
                     pct = (last - buy_price) / buy_price * 100.0
-
-                    # --- patched quick smart-market-sell checks (momentum / absolute drawdown) ---
-                    try:
-                        prev_price = pos.get("prev_price") or last
-                        # momentum-based quick drop (between monitoring cycles)
-                        if SMART_MARKET_SELL_ENABLED:
-                            drop_since_prev = (last - prev_price) / prev_price * 100.0 if prev_price > 0 else 0.0
-                            # absolute drawdown from buy
-                            drawdown_from_buy = (last - buy_price) / buy_price * 100.0 if buy_price > 0 else 0.0
-
-                            # If price drops quickly (momentum) OR reaches drawdown threshold, trigger immediate market sell
-                            if drop_since_prev <= -abs(SMART_MOMENTUM_PCT) or drawdown_from_buy <= -abs(SMART_MARKET_SELL_PCT):
-                                RECENT_BUYS[sym]["processing"] = True
-                                to_process.append((sym, pos, "smart_exit", last, pct))
-                                notify(f"📉 QUICK SMART-SELL triggered for {sym}: drop_since_prev={drop_since_prev:.3f}%, drawdown_from_buy={drawdown_from_buy:.3f}% (will try market sell)")
-                                # update prev_price for next cycle (we'll continue)
-                                with RECENT_BUYS_LOCK:
-                                    if sym in RECENT_BUYS:
-                                        RECENT_BUYS[sym]["prev_price"] = last
-                                continue
-                    except Exception:
-                        pass
-                    # --- end patched quick checks ---
-
                     
                     # Trailing Activation Check
                     trail_active = (pct >= TRAIL_PROFIT_ACTIVATION_PCT)
@@ -1593,31 +1546,7 @@ def monitor_positions():
                         if last < trailing_stop_price:
                             # Price has dropped below the dynamic stop-loss point, trigger market sell (profit lock)
                             RECENT_BUYS[sym]["processing"] = True
-                            exit_pct = (last - buy_price) / buy_price * 100.0
-
-                    # --- patched quick smart-market-sell checks (momentum / absolute drawdown) ---
-                    try:
-                        prev_price = pos.get("prev_price") or last
-                        # momentum-based quick drop (between monitoring cycles)
-                        if SMART_MARKET_SELL_ENABLED:
-                            drop_since_prev = (last - prev_price) / prev_price * 100.0 if prev_price > 0 else 0.0
-                            # absolute drawdown from buy
-                            drawdown_from_buy = (last - buy_price) / buy_price * 100.0 if buy_price > 0 else 0.0
-
-                            # If price drops quickly (momentum) OR reaches drawdown threshold, trigger immediate market sell
-                            if drop_since_prev <= -abs(SMART_MOMENTUM_PCT) or drawdown_from_buy <= -abs(SMART_MARKET_SELL_PCT):
-                                RECENT_BUYS[sym]["processing"] = True
-                                to_process.append((sym, pos, "smart_exit", last, pct))
-                                notify(f"📉 QUICK SMART-SELL triggered for {sym}: drop_since_prev={drop_since_prev:.3f}%, drawdown_from_buy={drawdown_from_buy:.3f}% (will try market sell)")
-                                # update prev_price for next cycle (we'll continue)
-                                with RECENT_BUYS_LOCK:
-                                    if sym in RECENT_BUYS:
-                                        RECENT_BUYS[sym]["prev_price"] = last
-                                continue
-                    except Exception:
-                        pass
-                    # --- end patched quick checks ---
- 
+                            exit_pct = (last - buy_price) / buy_price * 100.0 
                             to_process.append((sym, pos, "trailing_stop", last, exit_pct))
                             notify(f"🛑 *TRAILING STOP HIT*: {sym} inauza! Faida/Hasara: {exit_pct:.2f}%.")
                             continue
@@ -1639,10 +1568,6 @@ def monitor_positions():
                     
                     # --- 3. Smart Exit Check (Technical Stop-Loss for NON-TRAILING/LOSS positions) ---
                     # Execute Smart Exit if NOT trailing (i.e., less than 2.0% profit) AND in loss (pct < 0)
-                    with RECENT_BUYS_LOCK:
-                            if sym in RECENT_BUYS:
-                                RECENT_BUYS[sym]["prev_price"] = last
-                        
                     if not trail_active and pct < 0:
                         kl5 = fetch_klines(sym, "5m", KLINES_5M_LIMIT) 
                         if len(kl5) >= EMA_LONG and len(kl5) >= RSI_PERIOD+1:
