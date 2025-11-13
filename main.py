@@ -9,9 +9,6 @@ import csv
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask
-from decimal import Decimal, ROUND_DOWN, getcontext
-getcontext().prec = 28
-
 
 # try import python-binance
 try:
@@ -28,13 +25,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
-ENABLE_TRADING = True
 
+ENABLE_TRADING = True
 BUY_USDT_AMOUNT = 6.0
-LIMIT_PROFIT_PCT = 1.1
+LIMIT_PROFIT_PCT = 1.1  # initial profit target percent
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 8
+
 QUOTE = "USDT"
 BINANCE_REST = "https://api.binance.com"
 
@@ -42,17 +40,19 @@ PRICE_MIN = 0.1
 PRICE_MAX = 15.0
 MIN_VOLUME = 200000
 TOP_BY_24H_VOLUME = 100
-CYCLE_SECONDS = 3
 
+CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
 KLINES_1M_LIMIT = 6
 OB_DEPTH = 3
 MIN_OB_IMBALANCE = 1.2
 MAX_OB_SPREAD_PCT = 1.0
+
 CACHE_TTL = 1.0
 REQUEST_TIMEOUT = 6.0
 PUBLIC_CONCURRENCY = 12
 MAX_WORKERS = 20
+
 MIN_1M_PCT = 0.3
 MIN_5M_PCT = 0.3
 VOL_5M_MIN = 0.0002
@@ -60,17 +60,21 @@ RSI_PERIOD = 14
 EMA_SHORT = 3
 EMA_LONG = 10
 MIN_SCORE = 12
+
 RECENT_BUYS = {}
 BUY_LOCK_SECONDS = 120
 REMOVE_AFTER_CLOSE = True
+
 SHORT_BUY_SELL_DELAY = 0.06
 HOLD_THRESHOLD_HOURS = 5.0
 MONITOR_INTERVAL = 6.0
 LIMIT_SELL_RETRIES = 2
 VOL_1M_THRESHOLD = 0.005
+
 BLACKLIST_HOURS = 1.0
 BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
 BLACKLIST = {}
+
 SELL_DRAWDOWN_PCT = 80.0
 SCAN_PAUSE_ON_OPEN = True
 
@@ -89,9 +93,9 @@ NOTIFY_ON_TRAILING_FIRST = True
 NOTIFY_ON_TRAILING_EVERY = False
 NOTIFY_ON_TRAILING_FAIL = True
 NOTIFY_MIN_INTERVAL_SEC = 60
+
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
 RECENT_BUYS_LOCK = threading.Lock()
-
 _cache = {}
 _cache_lock = threading.Lock()
 OPEN_ORDERS_CACHE = {"data": None, "ts": 0}
@@ -99,6 +103,7 @@ OPEN_ORDERS_LOCK = threading.Lock()
 TEMP_SKIP = {}
 RATE_LIMIT_BACKOFF = None
 ACTIVE_TRADE = threading.Event()
+
 LOG_CSV = os.getenv("LOG_CSV", "coin_log.csv")
 CSV_LOCK = threading.Lock()
 _NOTIFY_STATE = {}
@@ -114,46 +119,7 @@ def should_notify(symbol, key="trailing_fail", min_interval=NOTIFY_MIN_INTERVAL_
         st[key] = now
         _NOTIFY_STATE[symbol] = st
         return True
-
-def _parse_symbol_filters(symbol_info):
-    filters = {f['filterType']: f for f in symbol_info.get('filters', [])}
-    price_f = filters.get('PRICE_FILTER', {})
-    lot_f = filters.get('LOT_SIZE', {}) or filters.get('MARKET_LOT_SIZE', {})
-    min_notional_f = filters.get('MIN_NOTIONAL', {})
-    return {
-        'tickSize': Decimal(price_f.get('tickSize', '0') or '0'),
-        'minPrice': Decimal(price_f.get('minPrice', '0') or '0'),
-        'maxPrice': Decimal(price_f.get('maxPrice', '0') or '0'),
-        'stepSize': Decimal(lot_f.get('stepSize', '0') or '0'),
-        'minQty': Decimal(lot_f.get('minQty', '0') or '0'),
-        'maxQty': Decimal(lot_f.get('maxQty', '0') or '0'),
-        'minNotional': Decimal(min_notional_f.get('minNotional', '0') or '0'),
-        'baseAsset': symbol_info.get('baseAsset'),
-        'quoteAsset': symbol_info.get('quoteAsset'),
-    }
-
-def round_price_down(price, tick):
-    p = Decimal(price)
-    if not tick or tick == 0:
-        return p
-    return p.quantize(tick, rounding=ROUND_DOWN)
-
-def round_qty_down(qty, step):
-    q = Decimal(qty)
-    if not step or step == 0:
-        return q
-    return q.quantize(step, rounding=ROUND_DOWN)
-
-def can_place_order(price: Decimal, qty: Decimal, filters: dict):
-    if qty <= 0:
-        return False, "qty<=0"
-    if filters.get('minQty') and qty < filters.get('minQty'):
-        return False, f"qty<{filters.get('minQty')}"
-    notional = (price * qty).normalize()
-    if filters.get('minNotional') and notional < filters.get('minNotional'):
-        return False, f"notional {notional}<{filters.get('minNotional')}"
-    return True, ""
-    
+        
 # -------------------------
 # CSV logging helper
 # -------------------------
@@ -561,42 +527,6 @@ def get_free_asset(asset):
         pass
     return 0.0
 
-def compute_remaining_qty_from_buy(client, symbol, buy_order_id, sold_qty_so_far_str='0'):
-    try:
-        order = client.get_order(symbol=symbol, orderId=buy_order_id)
-    except Exception as e:
-        try:
-            trades = client.get_my_trades(symbol=symbol)
-            executed = Decimal('0')
-            for t in trades:
-                if str(t.get('orderId')) == str(buy_order_id):
-                    executed += Decimal(str(t.get('qty', '0')))
-        except Exception:
-            return Decimal('0'), f"get_order_failed: {e}"
-    else:
-        fills = order.get('fills') or []
-        if fills:
-            executed = sum(Decimal(str(f.get('qty', '0'))) for f in fills)
-        else:
-            executed = Decimal(order.get('executedQty', '0') or '0')
-
-    sold = Decimal(str(sold_qty_so_far_str or '0'))
-    remaining = executed - sold
-    if remaining <= 0:
-        return Decimal('0'), "no_remaining"
-
-    try:
-        info = client.get_symbol_info(symbol)
-        filters = _parse_symbol_filters(info)
-        step = filters.get('stepSize', Decimal('0'))
-        remaining = round_qty_down(remaining, step) if step else remaining
-    except Exception:
-        pass
-
-    if remaining <= 0:
-        return Decimal('0'), "remaining_zero_after_round"
-    return remaining, ""
-    
 # -------------------------
 # Finalize close (clears ACTIVE_TRADE)
 # -------------------------
@@ -743,110 +673,6 @@ def place_market_sell_fallback(symbol, qty, f=None):
         notify(f"❌ Market sell fallback failed for {symbol}: {e}")
         return None
 
-def replace_order_with_higher_limit(
-    client,
-    symbol: str,
-    existing_order_id: int,
-    base_target_price,
-    increase_pct: float = TRAILING_INCREMENT_PCT,
-    max_cancel_attempts: int = 3,
-    cancel_sleep_base: float = 0.4,
-    create_sleep_base: float = 0.4,
-    max_price_attempts: int = 6
-):
-    try:
-        info = client.get_symbol_info(symbol)
-        if not info:
-            return False, "symbol_info_missing", None
-        filters = _parse_symbol_filters(info)
-    except Exception as e:
-        return False, f"failed_get_symbol_info: {e}", None
-
-    def _get_order(order_id):
-        try:
-            return client.get_order(symbol=symbol, orderId=order_id)
-        except Exception:
-            return None
-
-    remaining_qty = None
-    existing_order = _get_order(existing_order_id)
-    if existing_order:
-        try:
-            orig_qty = Decimal(existing_order.get('origQty', '0'))
-            executed_qty = Decimal(existing_order.get('executedQty', '0'))
-            remaining_qty = orig_qty - executed_qty
-        except Exception:
-            remaining_qty = None
-
-    if (remaining_qty is None) or (remaining_qty <= 0):
-        try:
-            base_asset = filters.get('baseAsset')
-            acct = client.get_account()
-            balances = {b['asset']: Decimal(b['free']) + Decimal(b['locked']) for b in acct.get('balances', [])}
-            have = balances.get(base_asset, Decimal('0'))
-            remaining_qty = have
-        except Exception:
-            return False, "could_not_determine_remaining_qty", None
-
-    step = filters.get('stepSize', Decimal('0'))
-    remaining_qty = round_qty_down(remaining_qty, step) if step else remaining_qty
-    if remaining_qty <= 0:
-        return False, "remaining_qty_zero_after_round", None
-
-    cancel_attempt = 0
-    last_cancel_err = None
-    cancel_succeeded = False
-    while cancel_attempt < max_cancel_attempts:
-        cancel_attempt += 1
-        try:
-            client.cancel_order(symbol=symbol, orderId=existing_order_id)
-            cancel_succeeded = True
-            break
-        except Exception as e:
-            last_cancel_err = str(e)
-            errl = last_cancel_err.lower()
-            if 'order does not exist' in errl or 'unknown order' in errl or 'order not found' in errl or 'is not found' in errl:
-                cancel_succeeded = True
-                break
-            time.sleep(cancel_sleep_base * (2 ** (cancel_attempt - 1)))
-    if not cancel_succeeded:
-        return False, f"cancel_failed_after_{max_cancel_attempts}: {last_cancel_err}", None
-
-    time.sleep(0.05)
-    try:
-        open_orders = client.get_open_orders(symbol=symbol)
-    except Exception:
-        open_orders = []
-    for o in open_orders:
-        if o.get('side') == 'SELL':
-            return False, f"open_sell_order_exists_after_cancel: orderId={o.get('orderId')}", None
-
-    base_price = Decimal(str(base_target_price))
-    inc_fraction = Decimal(str(increase_pct)) / Decimal('100')
-
-    last_create_err = None
-    for attempt in range(1, max_price_attempts + 1):
-        factor = (Decimal('1') + inc_fraction * Decimal(attempt))
-        target_price = base_price * factor
-
-        tick = filters.get('tickSize', Decimal('0'))
-        step = filters.get('stepSize', Decimal('0'))
-        price_rounded = round_price_down(target_price, tick) if tick else target_price
-        qty_rounded = round_qty_down(remaining_qty, step) if step else remaining_qty
-
-        ok, reason = can_place_order(price_rounded, qty_rounded, filters)
-        if not ok:
-            return False, f"validation_failed_before_create: {reason} (price={price_rounded}, qty={qty_rounded})", None
-
-        okc, resp_or_err = safe_create_limit_sell(client, symbol, price_rounded, qty_rounded, max_attempts=2, sleep_base=create_sleep_base)
-        if okc:
-            return True, f"new_limit_placed_attempt{attempt}", resp_or_err
-        else:
-            last_create_err = resp_or_err
-            time.sleep(create_sleep_base * (2 ** (attempt - 1)))
-
-    return False, f"failed_to_create_after_{max_price_attempts}: {last_create_err}", None
-    
 # -------------------------
 # Limit sell strict
 # -------------------------
@@ -1095,61 +921,7 @@ def place_limit_sell_strict(
     except Exception as e:
         notify(f"⚠️ place_limit_sell_strict unexpected error for {symbol}: {e}")
         return None
-
-def safe_create_limit_sell(client, symbol, target_price, intended_qty, max_attempts=3, sleep_base=0.5):
-    try:
-        info = client.get_symbol_info(symbol)
-        if not info:
-            return False, "missing_symbol_info"
-        filters = _parse_symbol_filters(info)
-    except Exception as e:
-        return False, f"failed_get_symbol_info: {e}"
-
-    price = Decimal(str(target_price))
-    qty = Decimal(str(intended_qty))
-
-    tick = filters.get('tickSize', Decimal('0'))
-    step = filters.get('stepSize', Decimal('0'))
-
-    price = round_price_down(price, tick) if tick else price
-    qty = round_qty_down(qty, step) if step else qty
-
-    ok, reason = can_place_order(price, qty, filters)
-    if not ok:
-        return False, f"validation_failed: {reason} (price={price}, qty={qty})"
-
-    try:
-        acct = client.get_account()
-        balances = {b['asset']: Decimal(b['free']) + Decimal(b['locked']) for b in acct.get('balances', [])}
-        base = filters.get('baseAsset')
-        have = balances.get(base, Decimal('0'))
-        if qty > have:
-            qty_adj = round_qty_down(have, step) if step else have
-            if qty_adj <= 0 or (filters.get('minQty') and qty_adj < filters.get('minQty')):
-                return False, f"insufficient_balance: have {have}, needed {qty}"
-            qty = qty_adj
-    except Exception:
-        pass
-
-    attempt = 0
-    last_err = None
-    while attempt < max_attempts:
-        attempt += 1
-        try:
-            resp = client.create_order(
-                symbol=symbol,
-                side='SELL',
-                type='LIMIT',
-                timeInForce='GTC',
-                quantity=str(qty.normalize()),
-                price=str(price.normalize())
-            )
-            return True, resp
-        except Exception as e:
-            last_err = str(e)
-            time.sleep(sleep_base * (2 ** (attempt - 1)))
-    return False, f"failed_after_{max_attempts}: {last_err}" 
-    
+        
 # -------------------------
 # Cancel open SELL orders for a symbol (safe)
 # -------------------------
@@ -1360,6 +1132,10 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
 # Trailing helpers (new)
 # -------------------------
 def set_new_limit_sell_for_position(symbol, qty, base_price, reason="trailing"):
+    """
+    Cancel existing sell(s), then place a new limit sell at base_price * (1 + TRAILING_INCREMENT_PCT/100).
+    Uses retry/backoff and notifies sparingly.
+    """
     try:
         client = init_binance_client()
         if not client:
@@ -1367,61 +1143,58 @@ def set_new_limit_sell_for_position(symbol, qty, base_price, reason="trailing"):
                 notify(f"⚠️ set_new_limit_sell_for_position: client missing for {symbol}")
             return None
 
+        # ensure we don't spam attempts: check last_trailing_action
         with RECENT_BUYS_LOCK:
             pos = RECENT_BUYS.get(symbol, {})
             last_action = pos.get("last_trailing_action", 0)
             trailing_retries = pos.get("trailing_retries", 0)
-            last_sell_order_id = pos.get("sell_order_id")
-            current_sell_price = pos.get("sell_price") or 0.0
             if time.time() - last_action < MIN_TIME_BETWEEN_TRAILING_ACTIONS and trailing_retries == 0:
+                # too soon to act (but allow if retrying)
                 return None
 
+        # cancel prior sell orders
         try:
             cancel_open_sell_orders(symbol, client=client)
         except Exception:
             pass
 
+        # compute new sell price
         target_price = float(base_price) * (1.0 + (TRAILING_INCREMENT_PCT / 100.0))
+
+        # ensure minimum step (either absolute or percent)
         min_step_by_pct = float(base_price) * (TRAILING_STEP_PCT_MIN / 100.0)
         min_step = max(TRAILING_STEP_MIN, min_step_by_pct)
+        # bump target if it is too close to current sell_price (to avoid tiny changes)
         with RECENT_BUYS_LOCK:
             current_sell_price = RECENT_BUYS.get(symbol, {}).get("sell_price") or 0.0
+
         if current_sell_price and (target_price - current_sell_price) < min_step:
             target_price = current_sell_price + min_step
 
+        # try placing with limited retries
+        attempt = 0
         order = None
-        if last_sell_order_id:
-            try:
-                ok, msg, resp = replace_order_with_higher_limit(
-                    client=client,
-                    symbol=symbol,
-                    existing_order_id=int(last_sell_order_id),
-                    base_target_price=Decimal(str(current_sell_price or base_price)),
-                    increase_pct=TRAILING_INCREMENT_PCT,
-                    max_cancel_attempts=3,
-                    cancel_sleep_base=0.05,
-                    create_sleep_base=0.2,
-                    max_price_attempts=6
-                )
-                if ok:
-                    order = resp
-            except Exception:
-                order = None
+        while attempt < MAX_TRAILING_RETRIES:
+            attempt += 1
+            order = place_limit_sell_strict(symbol, qty, target_price, retries=LIMIT_SELL_RETRIES)
+            if order:
+                break
+            # failed -> wait before next try
+            time.sleep(TRAILING_RETRY_INTERVAL)
 
         if not order:
-            order = place_limit_sell_strict(symbol, qty, target_price, retries=LIMIT_SELL_RETRIES, cancel_existing=True, existing_order_id=last_sell_order_id)
-
-        if not order:
+            # update retry count and notify once
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.setdefault(symbol, {})
                 RECENT_BUYS[symbol]["trailing_retries"] = (RECENT_BUYS[symbol].get("trailing_retries", 0) or 0) + 1
                 RECENT_BUYS[symbol]["last_trailing_action"] = time.time()
             if NOTIFY_ON_TRAILING_FAIL and should_notify(symbol, "trailing_fail"):
-                notify(f"⚠️ Failed to place new trailing limit sell for {symbol} at {target_price}")
+                notify(f"⚠️ Failed to place new trailing limit sell for {symbol} at {target_price} after {attempt} attempts")
             return None
 
+        # succeeded: reset retry counter, update RECENT_BUYS and log
         sell_order_id = None
-        placed_price = float(target_price)
+        placed_price = target_price
         try:
             if isinstance(order, dict):
                 sell_order_id = order.get("orderId") or order.get("order_id") or order.get("clientOrderId")
@@ -1442,6 +1215,7 @@ def set_new_limit_sell_for_position(symbol, qty, base_price, reason="trailing"):
             })
 
         log_csv("NEW_SELL", symbol, qty, price=None, highest=None, sell_price=placed_price, note=f"reason={reason}")
+        # only notify on first trailing set or if configured to notify every time
         notify_allowed = NOTIFY_ON_TRAILING_EVERY or (NOTIFY_ON_TRAILING_FIRST and not RECENT_BUYS[symbol].get("trailing_notified"))
         if notify_allowed:
             notify(f"📌 New trailing SELL for {symbol} set @ {placed_price} (reason={reason})")
@@ -1453,7 +1227,7 @@ def set_new_limit_sell_for_position(symbol, qty, base_price, reason="trailing"):
         if should_notify(symbol, "trailing_fail"):
             notify(f"⚠️ set_new_limit_sell_for_position error for {symbol}: {e}")
         return None
-
+        
 def trailing_monitor(symbol):
     last_action_ts = 0
     try:
@@ -1486,32 +1260,36 @@ def trailing_monitor(symbol):
                 time.sleep(TRAILING_POLL_INTERVAL)
                 continue
 
-            if TRAILING_START_DELAY and time.time() - buy_ts < float(TRAILING_START_DELAY):
-                time.sleep(TRAILING_POLL_INTERVAL)
-                continue
+            # enforce a short start delay after buy to avoid immediate reactions
+            try:
+                if 'TRAILING_START_DELAY' in globals() and TRAILING_START_DELAY:
+                    if time.time() - buy_ts < float(TRAILING_START_DELAY):
+                        time.sleep(TRAILING_POLL_INTERVAL)
+                        continue
+            except Exception:
+                pass
 
+            # update highest safely
             with RECENT_BUYS_LOCK:
                 stored = RECENT_BUYS.get(symbol, {})
                 if last_price > (stored.get("highest_price") or 0.0):
                     RECENT_BUYS[symbol]["highest_price"] = last_price
                     highest = last_price
 
-            if buy_price > 0 and TRAILING_MIN_RISE_PCT:
-                required = buy_price * (1.0 + (float(TRAILING_MIN_RISE_PCT) / 100.0))
-                if highest < required:
-                    time.sleep(TRAILING_POLL_INTERVAL)
-                    continue
-
+            # require a minimum rise from buy before enabling trailing actions
             try:
-                bid = None
-                try:
-                    ob = init_binance_client().get_order_book(symbol=symbol, limit=5)
-                    bids = ob.get('bids') or []
-                    if bids:
-                        bid = float(bids[0][0])
-                except Exception:
-                    bid = last_price
-                if current_sell_price and bid is not None and bid >= (float(current_sell_price) * float(APPROACH_PCT_BEFORE_CANCEL)):
+                if buy_price > 0 and 'TRAILING_MIN_RISE_PCT' in globals() and TRAILING_MIN_RISE_PCT:
+                    required = buy_price * (1.0 + (float(TRAILING_MIN_RISE_PCT) / 100.0))
+                    if highest < required:
+                        time.sleep(TRAILING_POLL_INTERVAL)
+                        continue
+            except Exception:
+                pass
+
+            # 1) approach -> move sell up
+            try:
+                if current_sell_price and last_price >= (float(current_sell_price) * float(APPROACH_PCT_BEFORE_CANCEL)):
+                    # if we've exhausted retries, back off for a bit
                     if trailing_retries >= (MAX_TRAILING_RETRIES or 0):
                         if should_notify(symbol, "trailing_fail"):
                             notify(f"⚠️ Trailing retries exhausted for {symbol}; skipping further immediate trailing attempts.")
@@ -1527,6 +1305,7 @@ def trailing_monitor(symbol):
             except Exception:
                 pass
 
+            # 2) drop from peak -> market sell fallback
             try:
                 if highest and (last_price <= (float(highest) * (1.0 - (float(TRAILING_SELL_DROP_PCT) / 100.0)))):
                     if should_notify(symbol, "trailing_drop"):
@@ -1557,7 +1336,7 @@ def trailing_monitor(symbol):
             if symbol in RECENT_BUYS:
                 RECENT_BUYS[symbol].pop("trailing_thread", None)
         return
-    
+
 # -------------------------
 # Evaluate symbol
 # -------------------------
@@ -1988,33 +1767,33 @@ def monitor_positions():
             to_process = []
             with RECENT_BUYS_LOCK:
                 for sym, pos in list(RECENT_BUYS.items()):
+                    if pos.get("closed"):
+                        continue
+                    ts = pos.get("ts", 0)
+                    qty = pos.get("qty") or 0.0
+                    processing = pos.get("processing", False)
+                    buy_price = pos.get("buy_price") or 0.0
+                    if qty <= 0 or processing:
+                        continue
+                    if now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
+                        RECENT_BUYS[sym]["processing"] = True
+                        to_process.append((sym, pos, "stale"))
+                        continue
                     try:
-                        if pos.get("closed"):
-                            continue
-                        ts = pos.get("ts", 0)
-                        qty = float(pos.get("qty") or 0.0)
-                        processing = pos.get("processing", False)
-                        buy_price = float(pos.get("buy_price") or 0.0)
-                        if qty <= 0 or processing:
-                            continue
-                        if now - ts >= (globals().get('HOLD_THRESHOLD_HOURS', 24) * 3600.0):
-                            RECENT_BUYS[sym]["processing"] = True
-                            to_process.append((sym, pos, "stale"))
-                            continue
                         last = fetch_symbol_price(sym)
                         if last is not None and buy_price > 0:
                             pct = (last - buy_price) / buy_price * 100.0
-                            if pct <= -abs(globals().get('SELL_DRAWDOWN_PCT', 5.0)):
+                            if pct <= -abs(SELL_DRAWDOWN_PCT):
                                 RECENT_BUYS[sym]["processing"] = True
                                 to_process.append((sym, pos, "drawdown", last, pct))
                     except Exception:
-                        continue
+                        pass
 
             for item in to_process:
                 try:
                     if item[2] == "stale":
                         sym, pos = item[0], item[1]
-                        notify(f"⚠️ Position {sym} open > threshold — executing market sell fallback to close position.")
+                        notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — executing market sell fallback to close position.")
                         qty = pos.get("qty")
                         resp = cancel_then_market_sell(sym, qty)
                         if resp:
@@ -2048,10 +1827,10 @@ def monitor_positions():
                         pass
                     notify(f"⚠️ Monitor processing failed for {item}: {e}")
 
-            time.sleep(globals().get('MONITOR_INTERVAL', 6.0))
+            time.sleep(MONITOR_INTERVAL)
         except Exception as e:
             print("monitor_positions loop error", e)
-            time.sleep(max(5, globals().get('MONITOR_INTERVAL', 6.0)))
+            time.sleep(max(5, MONITOR_INTERVAL))
 
 # -------------------------
 # Watch orders (poll for fills)
@@ -2085,12 +1864,12 @@ def watch_orders(poll_interval=12):
                         try:
                             fills = o.get("fills") or []
                             if fills:
-                                tq = Decimal('0'); tq_quote = Decimal('0')
+                                tq = 0.0; tq_quote = 0.0
                                 for f in fills:
-                                    q = Decimal(str(f.get("qty", 0))); p = Decimal(str(f.get("price", 0)))
+                                    q = float(f.get("qty", 0)); p = float(f.get("price", 0))
                                     tq += q; tq_quote += q * p
-                                filled_qty = float(tq)
-                                avg_price = float((tq_quote / tq) if tq else Decimal('0'))
+                                filled_qty = tq
+                                avg_price = (tq_quote / tq) if tq else 0.0
                             else:
                                 filled_qty = float(o.get("executedQty") or 0.0)
                                 cquote = float(o.get("cummulativeQuoteQty") or 0.0)
@@ -2109,12 +1888,12 @@ def watch_orders(poll_interval=12):
                         log_csv("SELL_CANCELLED", sym, pos.get("qty"), price=None, highest=pos.get("highest_price"), sell_price=pos.get("sell_price"), note=f"watch_status_{status.lower()}")
                 except Exception as e:
                     print("watch_orders error for", sym, e)
-                time.sleep(0.35)
+                time.sleep(0.4)
             time.sleep(poll_interval)
         except Exception as e:
             print("watch_orders loop error", e)
             time.sleep(max(5, poll_interval))
-            
+
 # -------------------------
 # Web / main loop
 # -------------------------
