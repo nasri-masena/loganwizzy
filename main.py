@@ -28,7 +28,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
 BUY_USDT_AMOUNT = 6.0
-LIMIT_PROFIT_PCT = 1.1  # initial profit target percent
+LIMIT_PROFIT_PCT = 1.2  # initial profit target percent
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 8
