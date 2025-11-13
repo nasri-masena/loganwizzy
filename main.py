@@ -39,7 +39,7 @@ BINANCE_REST = "https://api.binance.com"
 PRICE_MIN = 0.1
 PRICE_MAX = 15.0
 MIN_VOLUME = 200000
-TOP_BY_24H_VOLUME = 100
+TOP_BY_24H_VOLUME = 120
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
@@ -78,6 +78,20 @@ BLACKLIST = {}
 SELL_DRAWDOWN_PCT = 80.0
 SCAN_PAUSE_ON_OPEN = True
 
+APPROACH_PCT_BEFORE_CANCEL = 0.997
+TRAILING_INCREMENT_PCT = 0.6
+TRAILING_SELL_DROP_PCT = 0.7
+TRAILING_POLL_INTERVAL = 1.0
+MIN_TIME_BETWEEN_TRAILING_ACTIONS = 1.5
+TRAILING_RETRY_INTERVAL = 20.0
+MAX_TRAILING_RETRIES = 3
+TRAILING_STEP_MIN = 0.0005
+TRAILING_STEP_PCT_MIN = 0.12
+NOTIFY_ON_TRAILING_FIRST = True
+NOTIFY_ON_TRAILING_EVERY = False
+NOTIFY_ON_TRAILING_FAIL = True
+NOTIFY_MIN_INTERVAL_SEC = 60
+
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
 RECENT_BUYS_LOCK = threading.Lock()
 _cache = {}
@@ -88,21 +102,22 @@ TEMP_SKIP = {}
 RATE_LIMIT_BACKOFF = None
 ACTIVE_TRADE = threading.Event()
 
-# -------------------------
-# Trailing-specific params (customize)
-# -------------------------
-# When price is within this fraction of current sell price, treat as "approaching"
-# e.g. 0.995 means price >= 99.5% of current sell price triggers cancel & raise.
-APPROACH_PCT_BEFORE_CANCEL = 0.995  # 99.5%
-TRAILING_INCREMENT_PCT = 0.6       # raise sell by 0.6% when approaching
-TRAILING_SELL_DROP_PCT = 0.5       # sell when price drops 0.5% from highest
-TRAILING_POLL_INTERVAL = 1.0       # seconds between trailing checks
-MIN_TIME_BETWEEN_TRAILING_ACTIONS = 1.2  # avoid hot loops
-
-# CSV logging file
 LOG_CSV = os.getenv("LOG_CSV", "coin_log.csv")
 CSV_LOCK = threading.Lock()
+_NOTIFY_STATE = {}
+_NOTIFY_STATE_LOCK = threading.Lock()
 
+def should_notify(symbol, key="trailing_fail", min_interval=NOTIFY_MIN_INTERVAL_SEC):
+    now = time.time()
+    with _NOTIFY_STATE_LOCK:
+        st = _NOTIFY_STATE.get(symbol, {})
+        last = st.get(key)
+        if last and (now - last) < min_interval:
+            return False
+        st[key] = now
+        _NOTIFY_STATE[symbol] = st
+        return True
+        
 # -------------------------
 # CSV logging helper
 # -------------------------
@@ -1072,13 +1087,23 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
 def set_new_limit_sell_for_position(symbol, qty, base_price, reason="trailing"):
     """
     Cancel existing sell(s), then place a new limit sell at base_price * (1 + TRAILING_INCREMENT_PCT/100).
-    Update RECENT_BUYS with new sell info and log CSV.
+    Uses retry/backoff and notifies sparingly.
     """
     try:
         client = init_binance_client()
         if not client:
-            notify(f"⚠️ set_new_limit_sell_for_position: client missing for {symbol}")
+            if should_notify(symbol, "trailing_fail"):
+                notify(f"⚠️ set_new_limit_sell_for_position: client missing for {symbol}")
             return None
+
+        # ensure we don't spam attempts: check last_trailing_action
+        with RECENT_BUYS_LOCK:
+            pos = RECENT_BUYS.get(symbol, {})
+            last_action = pos.get("last_trailing_action", 0)
+            trailing_retries = pos.get("trailing_retries", 0)
+            if time.time() - last_action < MIN_TIME_BETWEEN_TRAILING_ACTIONS and trailing_retries == 0:
+                # too soon to act (but allow if retrying)
+                return None
 
         # cancel prior sell orders
         try:
@@ -1086,55 +1111,77 @@ def set_new_limit_sell_for_position(symbol, qty, base_price, reason="trailing"):
         except Exception:
             pass
 
-        # compute new sell
-        new_sell_target = float(base_price) * (1.0 + (TRAILING_INCREMENT_PCT / 100.0))
-        # place limit sell strict
-        order = place_limit_sell_strict(symbol, qty, new_sell_target)
-        sell_order_id = None
-        placed_price = None
-        if order:
-            try:
-                if isinstance(order, dict):
-                    sell_order_id = order.get("orderId") or order.get("order_id") or order.get("clientOrderId")
-                    # try to obtain price
-                    placed_price = float(order.get("price") or new_sell_target)
-                else:
-                    sell_order_id = getattr(order, "orderId", None) or getattr(order, "order_id", None) or getattr(order, "clientOrderId", None)
-                    placed_price = new_sell_target
-            except Exception:
-                sell_order_id = None
-                placed_price = new_sell_target
-        else:
-            # placing failed
-            notify(f"⚠️ Failed to place new trailing limit sell for {symbol} at {new_sell_target}")
+        # compute new sell price
+        target_price = float(base_price) * (1.0 + (TRAILING_INCREMENT_PCT / 100.0))
+
+        # ensure minimum step (either absolute or percent)
+        min_step_by_pct = float(base_price) * (TRAILING_STEP_PCT_MIN / 100.0)
+        min_step = max(TRAILING_STEP_MIN, min_step_by_pct)
+        # bump target if it is too close to current sell_price (to avoid tiny changes)
+        with RECENT_BUYS_LOCK:
+            current_sell_price = RECENT_BUYS.get(symbol, {}).get("sell_price") or 0.0
+
+        if current_sell_price and (target_price - current_sell_price) < min_step:
+            target_price = current_sell_price + min_step
+
+        # try placing with limited retries
+        attempt = 0
+        order = None
+        while attempt < MAX_TRAILING_RETRIES:
+            attempt += 1
+            order = place_limit_sell_strict(symbol, qty, target_price, retries=LIMIT_SELL_RETRIES)
+            if order:
+                break
+            # failed -> wait before next try
+            time.sleep(TRAILING_RETRY_INTERVAL)
+
+        if not order:
+            # update retry count and notify once
+            with RECENT_BUYS_LOCK:
+                RECENT_BUYS.setdefault(symbol, {})
+                RECENT_BUYS[symbol]["trailing_retries"] = (RECENT_BUYS[symbol].get("trailing_retries", 0) or 0) + 1
+                RECENT_BUYS[symbol]["last_trailing_action"] = time.time()
+            if NOTIFY_ON_TRAILING_FAIL and should_notify(symbol, "trailing_fail"):
+                notify(f"⚠️ Failed to place new trailing limit sell for {symbol} at {target_price} after {attempt} attempts")
             return None
 
-        # update RECENT_BUYS
-        with RECENT_BUYS_LOCK:
-            if symbol in RECENT_BUYS:
-                RECENT_BUYS[symbol].update({
-                    "sell_price": placed_price,
-                    "sell_order_id": sell_order_id,
-                    "sell_resp": order,
-                    "last_trailing_action": time.time()
-                })
+        # succeeded: reset retry counter, update RECENT_BUYS and log
+        sell_order_id = None
+        placed_price = target_price
+        try:
+            if isinstance(order, dict):
+                sell_order_id = order.get("orderId") or order.get("order_id") or order.get("clientOrderId")
+                placed_price = float(order.get("price") or placed_price)
             else:
-                RECENT_BUYS[symbol] = {"ts": time.time(), "qty": qty, "sell_price": placed_price, "sell_order_id": sell_order_id, "sell_resp": order, "closed": False}
+                sell_order_id = getattr(order, "orderId", None) or getattr(order, "order_id", None) or getattr(order, "clientOrderId", None)
+        except Exception:
+            pass
+
+        with RECENT_BUYS_LOCK:
+            RECENT_BUYS.setdefault(symbol, {})
+            RECENT_BUYS[symbol].update({
+                "sell_price": placed_price,
+                "sell_order_id": sell_order_id,
+                "sell_resp": order,
+                "last_trailing_action": time.time(),
+                "trailing_retries": 0
+            })
 
         log_csv("NEW_SELL", symbol, qty, price=None, highest=None, sell_price=placed_price, note=f"reason={reason}")
-        notify(f"📌 New trailing SELL for {symbol} set @ {placed_price} (reason={reason})")
+        # only notify on first trailing set or if configured to notify every time
+        notify_allowed = NOTIFY_ON_TRAILING_EVERY or (NOTIFY_ON_TRAILING_FIRST and not RECENT_BUYS[symbol].get("trailing_notified"))
+        if notify_allowed:
+            notify(f"📌 New trailing SELL for {symbol} set @ {placed_price} (reason={reason})")
+            with RECENT_BUYS_LOCK:
+                RECENT_BUYS[symbol]["trailing_notified"] = True
+
         return order
     except Exception as e:
-        notify(f"⚠️ set_new_limit_sell_for_position error for {symbol}: {e}")
+        if should_notify(symbol, "trailing_fail"):
+            notify(f"⚠️ set_new_limit_sell_for_position error for {symbol}: {e}")
         return None
-
+        
 def trailing_monitor(symbol):
-    """
-    Per-position trailing monitor running in background:
-     - track highest_price
-     - if price >= current_sell_price * APPROACH_PCT_BEFORE_CANCEL -> cancel & create new sell at +TRAILING_INCREMENT_PCT
-     - if price <= highest_price * (1 - TRAILING_SELL_DROP_PCT/100) -> cancel & market-sell (fallback)
-    """
     last_action_ts = 0
     try:
         while True:
@@ -1151,7 +1198,7 @@ def trailing_monitor(symbol):
                 time.sleep(TRAILING_POLL_INTERVAL)
                 continue
 
-            # small throttle to avoid spamming actions
+            # throttle global actions
             if time.time() - last_action_ts < MIN_TIME_BETWEEN_TRAILING_ACTIONS:
                 time.sleep(TRAILING_POLL_INTERVAL)
                 continue
@@ -1165,35 +1212,30 @@ def trailing_monitor(symbol):
                 time.sleep(TRAILING_POLL_INTERVAL)
                 continue
 
-            # update highest
-            if highest is None or last_price > (highest or 0.0):
-                highest = last_price
-                with RECENT_BUYS_LOCK:
-                    if symbol in RECENT_BUYS:
-                        RECENT_BUYS[symbol]["highest_price"] = highest
+            # update highest safely
+            with RECENT_BUYS_LOCK:
+                stored = RECENT_BUYS.get(symbol, {})
+                if last_price > (stored.get("highest_price") or 0.0):
+                    RECENT_BUYS[symbol]["highest_price"] = last_price
+                    highest = last_price
 
-            # 1) check approach to current sell -> move sell up
+            # 1) approach -> move sell up
             try:
                 if current_sell_price and last_price >= (float(current_sell_price) * APPROACH_PCT_BEFORE_CANCEL):
-                    # rise close to sell: raise sell
-                    # base for new sell: use latest price to avoid placing too low
                     base_for_new = max(last_price, current_sell_price)
+                    # ensure we don't spam: allow set_new only if not currently retrying too often
                     set_new_limit_sell_for_position(symbol, qty, base_for_new, reason="approach_and_raise")
                     last_action_ts = time.time()
-                    # update current_sell_price from RECENT_BUYS
-                    with RECENT_BUYS_LOCK:
-                        current_sell_price = RECENT_BUYS.get(symbol, {}).get("sell_price") or current_sell_price
-                    # continue monitoring
                     time.sleep(TRAILING_POLL_INTERVAL)
                     continue
             except Exception:
                 pass
 
-            # 2) check drop from peak -> market sell fallback
+            # 2) drop from peak -> market sell fallback
             try:
                 if highest and (last_price <= (float(highest) * (1.0 - (TRAILING_SELL_DROP_PCT / 100.0)))):
-                    # drop detected -> attempt cancel & market sell fallback
-                    notify(f"⚠️ Trailing detected drop for {symbol}: last={last_price} highest={highest} -> executing market sell fallback.")
+                    if should_notify(symbol, "trailing_drop"):
+                        notify(f"⚠️ Trailing detected drop for {symbol}: last={last_price} highest={highest} -> executing market sell fallback.")
                     log_csv("TRAIL_DROP", symbol, qty, price=last_price, highest=highest, sell_price=current_sell_price, note="drop_from_peak")
                     resp = cancel_then_market_sell(symbol, qty)
                     if resp:
@@ -1203,13 +1245,11 @@ def trailing_monitor(symbol):
                         log_csv("SOLD_MARKET", symbol, qty, price=last_price, highest=highest, sell_price=current_sell_price, note="sold_on_drop")
                         break
                     else:
-                        # failed; reset processing flag
-                        with RECENT_BUYS_LOCK:
-                            if symbol in RECENT_BUYS:
-                                RECENT_BUYS[symbol].update({"processing": False})
-                        notify(f"⚠️ Trailing: market sell failed for {symbol}. Will retry later.")
+                        # failed -> only notify once per interval
+                        if should_notify(symbol, "trailing_fail"):
+                            notify(f"⚠️ Trailing: market sell failed for {symbol}. Will retry later.")
+                        time.sleep(TRAILING_RETRY_INTERVAL)
                         last_action_ts = time.time()
-                        time.sleep(TRAILING_POLL_INTERVAL)
                         continue
             except Exception:
                 pass
@@ -1219,12 +1259,11 @@ def trailing_monitor(symbol):
     except Exception as e:
         notify(f"⚠️ trailing_monitor error for {symbol}: {e}")
     finally:
-        # cleanup indicator
         with RECENT_BUYS_LOCK:
             if symbol in RECENT_BUYS:
                 RECENT_BUYS[symbol].pop("trailing_thread", None)
         return
-
+    
 # -------------------------
 # Evaluate symbol
 # -------------------------
@@ -1323,7 +1362,6 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
         }
     except Exception:
         return None
-
 
 def pick_coin():
     try:
@@ -1443,13 +1481,16 @@ def execute_trade(chosen):
             send_telegram(f"⚠️ Max concurrent positions reached. Skipping {symbol}")
             return False
         RECENT_BUYS[symbol] = {"ts": now, "reserved": False, "closed": False, "processing": True}
+
     client = init_binance_client()
     if not client:
         send_telegram(f"⚠️ Trading disabled or client missing. Skipping live trade for {symbol}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
+        try:
+            ACTIVE_TRADE.clear()
+        except Exception:
+            pass
         return False
 
     try:
@@ -1461,8 +1502,10 @@ def execute_trade(chosen):
             send_telegram("⚠️ Buy amount not configured. Skipping trade.")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
-            try: ACTIVE_TRADE.clear()
-            except Exception: pass
+            try:
+                ACTIVE_TRADE.clear()
+            except Exception:
+                pass
             return False
 
         executed_qty, avg_price = parse_market_fill(order)
@@ -1470,12 +1513,22 @@ def execute_trade(chosen):
             send_telegram(f"⚠️ Buy executed but no fill qty for {symbol}. Raw: {order}")
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS.pop(symbol, None)
-            try: ACTIVE_TRADE.clear()
-            except Exception: pass
+            try:
+                ACTIVE_TRADE.clear()
+            except Exception:
+                pass
             return False
 
         with RECENT_BUYS_LOCK:
-            RECENT_BUYS[symbol].update({"qty": executed_qty, "buy_price": avg_price, "ts": now, "processing": False, "highest_price": avg_price})
+            RECENT_BUYS[symbol].update({
+                "qty": executed_qty,
+                "buy_price": avg_price,
+                "ts": now,
+                "processing": False,
+                "highest_price": avg_price,
+                "trailing_retries": 0,
+                "trailing_notified": False
+            })
 
         try:
             ACTIVE_TRADE.set()
@@ -1487,9 +1540,9 @@ def execute_trade(chosen):
 
         time.sleep(SHORT_BUY_SELL_DELAY)
 
-        # initial sell price using existing LIMIT_PROFIT_PCT
         sell_price = avg_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
         sell_resp = place_limit_sell_strict(symbol, executed_qty, sell_price)
+
         if sell_resp:
             sell_order_id = None
             placed_price = sell_price
@@ -1515,17 +1568,18 @@ def execute_trade(chosen):
                     "highest_price": avg_price
                 })
 
-            send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{placed_price}` (+{LIMIT_PROFIT_PCT}%)")
-            log_csv("INITIAL_SELL", symbol, executed_qty, price=None, highest=avg_price, sell_price=placed_price, note="initial_limit_sell")
+            with RECENT_BUYS_LOCK:
+                if not RECENT_BUYS[symbol].get("initial_sell_notified"):
+                    send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{placed_price}` (+{LIMIT_PROFIT_PCT}%)")
+                    RECENT_BUYS[symbol]["initial_sell_notified"] = True
+                    log_csv("INITIAL_SELL", symbol, executed_qty, price=None, highest=avg_price, sell_price=placed_price, note="initial_limit_sell")
 
-            # start trailing monitor thread (if not already running)
             with RECENT_BUYS_LOCK:
                 if symbol in RECENT_BUYS and not RECENT_BUYS[symbol].get("trailing_thread"):
                     th = threading.Thread(target=trailing_monitor, args=(symbol,), daemon=True)
                     RECENT_BUYS[symbol]["trailing_thread"] = th
                     th.start()
 
-            # short poll for immediate fills
             try:
                 if sell_order_id:
                     filled_order = wait_for_order_fill(client, symbol, sell_order_id, timeout=8, poll=1.0)
@@ -1560,6 +1614,7 @@ def execute_trade(chosen):
                 pass
 
             return True
+
         else:
             notify(f"⚠️ limit sell placement failed for {symbol}, attempting market sell fallback.")
             fallback = cancel_then_market_sell(symbol, executed_qty)
@@ -1580,21 +1635,27 @@ def execute_trade(chosen):
             else:
                 send_telegram(f"❌ Both limit and market sell failed for {symbol}. Entry removed to avoid blocking.")
             return False
+
     except BinanceAPIException as e:
         send_telegram(f"‼️ Binance API error during buy {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
+        try:
+            ACTIVE_TRADE.clear()
+        except Exception:
+            pass
         return False
+
     except Exception as e:
         send_telegram(f"‼️ Unexpected error during trade {symbol}: {e}")
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.pop(symbol, None)
-        try: ACTIVE_TRADE.clear()
-        except Exception: pass
+        try:
+            ACTIVE_TRADE.clear()
+        except Exception:
+            pass
         return False
-
+        
 # -------------------------
 # wait_for_order_fill
 # -------------------------
