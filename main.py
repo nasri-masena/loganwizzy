@@ -5,6 +5,8 @@ import threading
 import random
 import requests
 import statistics
+import csv
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask
 
@@ -26,7 +28,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
 BUY_USDT_AMOUNT = 6.0
-LIMIT_PROFIT_PCT = 1.1
+LIMIT_PROFIT_PCT = 1.1  # initial profit target percent
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 8
@@ -40,7 +42,7 @@ MIN_VOLUME = 200000
 TOP_BY_24H_VOLUME = 100
 
 CYCLE_SECONDS = 3
-KLINES_5M_LIMIT = 11 # CHANGED: Increased from 6 to 11 for EMA_LONG (10) calculation
+KLINES_5M_LIMIT = 6
 KLINES_1M_LIMIT = 6
 OB_DEPTH = 3
 MIN_OB_IMBALANCE = 1.2
@@ -74,7 +76,6 @@ BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
 BLACKLIST = {}
 
 SELL_DRAWDOWN_PCT = 80.0
-MAX_TECHNICAL_LOSS = 4.0 # ADDED: New config for technical stop-loss (Smart Exit)
 SCAN_PAUSE_ON_OPEN = True
 
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
@@ -86,6 +87,37 @@ OPEN_ORDERS_LOCK = threading.Lock()
 TEMP_SKIP = {}
 RATE_LIMIT_BACKOFF = None
 ACTIVE_TRADE = threading.Event()
+
+# -------------------------
+# Trailing-specific params (customize)
+# -------------------------
+# When price is within this fraction of current sell price, treat as "approaching"
+# e.g. 0.995 means price >= 99.5% of current sell price triggers cancel & raise.
+APPROACH_PCT_BEFORE_CANCEL = 0.995  # 99.5%
+TRAILING_INCREMENT_PCT = 0.6       # raise sell by 0.6% when approaching
+TRAILING_SELL_DROP_PCT = 0.5       # sell when price drops 0.5% from highest
+TRAILING_POLL_INTERVAL = 1.0       # seconds between trailing checks
+MIN_TIME_BETWEEN_TRAILING_ACTIONS = 1.2  # avoid hot loops
+
+# CSV logging file
+LOG_CSV = os.getenv("LOG_CSV", "coin_log.csv")
+CSV_LOCK = threading.Lock()
+
+# -------------------------
+# CSV logging helper
+# -------------------------
+def log_csv(action, symbol, qty=None, price=None, highest=None, sell_price=None, note=""):
+    """Append a CSV line. action = e.g. BUY, NEW_SELL, CANCEL_SELL, SOLD_MARKET, SOLD_LIMIT"""
+    try:
+        with CSV_LOCK:
+            file_exists = os.path.isfile(LOG_CSV)
+            with open(LOG_CSV, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if not file_exists:
+                    w.writerow(["timestamp", "action", "symbol", "qty", "price", "highest_price", "sell_price", "note"])
+                w.writerow([datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), action, symbol, qty or "", price or "", highest or "", sell_price or "", note])
+    except Exception as e:
+        print("log_csv error", e)
 
 # -------------------------
 # Cache helpers
@@ -134,9 +166,9 @@ def sync_open_orders(force=False):
             try:
                 order_id = o.get("orderId") or o.get("clientOrderId")
                 if side == "SELL":
-                    RECENT_BUYS[sym].update({"sell_order_id": order_id, "sell_resp": o})
+                    RECENT_BUYS[sym].update({"sell_order_id": order_id, "sell_resp": o, "sell_price": float(o.get("price") or 0.0)})
                 else:
-                    RECENT_BUENT_BUYS[sym].update({"open_buy_order": o})
+                    RECENT_BUYS[sym].update({"open_buy_order": o})
             except Exception:
                 pass
 
@@ -170,7 +202,6 @@ def send_telegram(message):
 
 notify = send_telegram
 
-
 # -------------------------
 # Math / indicators
 # -------------------------
@@ -196,37 +227,16 @@ def compute_rsi_local(closes, period=14):
         return None
     gains = []
     losses = []
-    # Ensure there are enough data points for the first calculation
-    if len(closes) < period + 1:
-        return None
-    
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i-1]
         gains.append(max(0.0, diff))
         losses.append(max(0.0, -diff))
-    
-    # Check if we have enough points for the initial average calculation
-    if len(gains) < period:
-        return None
-        
     avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period 
-    
-    # Handle initial avg_loss being zero to avoid division by zero
-    if avg_loss == 0.0:
-        avg_loss = 1e-9
-
-    # Use Wilder's smoothing for subsequent periods
+    avg_loss = sum(losses[:period]) / period if sum(losses[:period]) != 0 else 1e-9
     for i in range(period, len(gains)):
-        # Recalculate based on previous averages
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        
-    # Recalculate avg_loss for final check
-    if avg_loss == 0.0:
-        avg_loss = 1e-9
-        
-    rs = avg_gain / avg_loss
+    rs = avg_gain / (avg_loss if avg_loss > 0 else 1e-9)
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
@@ -943,10 +953,7 @@ def compute_market_sell_qty(symbol, desired_qty, client=None):
             qty = math.floor(qty / step) * step
 
         # ensure min notional
-        # if qty*approx_price < min_notional we might still try (market sell), but often fails.
-        # To be safe, if we can't meet min_notional with available qty, return 0.
         if min_notional and qty > 0:
-            # try to estimate price quickly from last ticker
             last_price = fetch_symbol_price(symbol) or 0.0
             if last_price > 0 and (qty * last_price) + 1e-12 < min_notional:
                 return 0.0, f"below_min_notional (need {min_notional}, have {qty*last_price:.8f})"
@@ -976,7 +983,6 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
         ccount, cancelled = cancel_open_sell_orders(symbol, client=client)
         if ccount:
             pass
-    # notify(f"ℹ️ Cancelled {ccount} existing SELL order(s) for {symbol} before market-sell.")
     except Exception as e:
         notify(f"⚠️ cancel_then_market_sell: cancel step failed for {symbol}: {e}")
 
@@ -1004,36 +1010,30 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
     while attempt < max_retries:
         attempt += 1
         try:
-            # notify(f"⚠️ Attempting MARKET sell fallback for {symbol}: qty={qty_str} (attempt {attempt})")
             resp = client.order_market_sell(symbol=symbol, quantity=qty_str)
-            # clear open orders cache
             try:
                 with OPEN_ORDERS_LOCK:
                     OPEN_ORDERS_CACHE['data'] = None
                     OPEN_ORDERS_CACHE['ts'] = 0
             except Exception:
                 pass
-            # Changed notification to be more descriptive
-            notify(f"⭕ Coin ya {symbol} imeuzwa kwa hasara")
+            notify(f"⭕ Coin ya {symbol} imeuzwa kwa hasara/market")
+            log_csv("SOLD_MARKET", symbol, qty_str, price=None, highest=None, sell_price=None, note="monitor/force_sell")
             return resp
         except Exception as e:
             last_err = str(e)
-            # detect common errors
             if 'NOTIONAL' in last_err or '-1013' in last_err:
                 notify(f"🚫 Market sell for {symbol} failed: position below minNotional or filter error: {last_err}. Suppressing future attempts for 24 hours.")
                 TEMP_SKIP[symbol] = time.time() + 24*60*60
                 return None
             if '-2010' in last_err or 'insufficient balance' in last_err.lower():
-                # maybe exchange hasn't released reserved funds yet; wait short then retry
                 notify(f"⚠️ Market sell insufficient balance for {symbol}: {last_err}. Retrying after short wait.")
                 time.sleep(0.6 * attempt)
-                # refresh balances and recompute qty
                 qty_adj, reason = compute_market_sell_qty(symbol, qty, client=client)
                 if qty_adj <= 0:
                     notify(f"🚫 After retry, cannot sell {symbol}: {reason}")
                     return None
                 try:
-                    # recompute qty_str
                     info = get_symbol_info(symbol) or {}
                     step = 0.0
                     for fil in info.get("filters", []):
@@ -1044,7 +1044,6 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
                 except Exception:
                     qty_str = str(qty_adj)
                 continue
-            # last resort try create_order
             try:
                 notify(f"⚠️ order_market_sell failed for {symbol} (attempt {attempt}): {last_err}. Trying create_order fallback.")
                 resp = client.create_order(symbol=symbol, side='SELL', type='MARKET', quantity=qty_str)
@@ -1055,6 +1054,7 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
                 except Exception:
                     pass
                 notify(f"✅ Market sell executed (via create_order) for {symbol}")
+                log_csv("SOLD_MARKET", symbol, qty_str, price=None, highest=None, sell_price=None, note="create_order_fallback")
                 return resp
             except Exception as e2:
                 last_err = str(e2)
@@ -1063,9 +1063,167 @@ def cancel_then_market_sell(symbol, qty, max_retries=2):
                 continue
 
     notify(f"❌ cancel_then_market_sell: all attempts failed for {symbol}. last_err={last_err}")
-    # if persistent failure, set a short TEMP_SKIP to avoid hot-loop retries
     TEMP_SKIP[symbol] = time.time() + 60
     return None
+
+# -------------------------
+# Trailing helpers (new)
+# -------------------------
+def set_new_limit_sell_for_position(symbol, qty, base_price, reason="trailing"):
+    """
+    Cancel existing sell(s), then place a new limit sell at base_price * (1 + TRAILING_INCREMENT_PCT/100).
+    Update RECENT_BUYS with new sell info and log CSV.
+    """
+    try:
+        client = init_binance_client()
+        if not client:
+            notify(f"⚠️ set_new_limit_sell_for_position: client missing for {symbol}")
+            return None
+
+        # cancel prior sell orders
+        try:
+            cancel_open_sell_orders(symbol, client=client)
+        except Exception:
+            pass
+
+        # compute new sell
+        new_sell_target = float(base_price) * (1.0 + (TRAILING_INCREMENT_PCT / 100.0))
+        # place limit sell strict
+        order = place_limit_sell_strict(symbol, qty, new_sell_target)
+        sell_order_id = None
+        placed_price = None
+        if order:
+            try:
+                if isinstance(order, dict):
+                    sell_order_id = order.get("orderId") or order.get("order_id") or order.get("clientOrderId")
+                    # try to obtain price
+                    placed_price = float(order.get("price") or new_sell_target)
+                else:
+                    sell_order_id = getattr(order, "orderId", None) or getattr(order, "order_id", None) or getattr(order, "clientOrderId", None)
+                    placed_price = new_sell_target
+            except Exception:
+                sell_order_id = None
+                placed_price = new_sell_target
+        else:
+            # placing failed
+            notify(f"⚠️ Failed to place new trailing limit sell for {symbol} at {new_sell_target}")
+            return None
+
+        # update RECENT_BUYS
+        with RECENT_BUYS_LOCK:
+            if symbol in RECENT_BUYS:
+                RECENT_BUYS[symbol].update({
+                    "sell_price": placed_price,
+                    "sell_order_id": sell_order_id,
+                    "sell_resp": order,
+                    "last_trailing_action": time.time()
+                })
+            else:
+                RECENT_BUYS[symbol] = {"ts": time.time(), "qty": qty, "sell_price": placed_price, "sell_order_id": sell_order_id, "sell_resp": order, "closed": False}
+
+        log_csv("NEW_SELL", symbol, qty, price=None, highest=None, sell_price=placed_price, note=f"reason={reason}")
+        notify(f"📌 New trailing SELL for {symbol} set @ {placed_price} (reason={reason})")
+        return order
+    except Exception as e:
+        notify(f"⚠️ set_new_limit_sell_for_position error for {symbol}: {e}")
+        return None
+
+def trailing_monitor(symbol):
+    """
+    Per-position trailing monitor running in background:
+     - track highest_price
+     - if price >= current_sell_price * APPROACH_PCT_BEFORE_CANCEL -> cancel & create new sell at +TRAILING_INCREMENT_PCT
+     - if price <= highest_price * (1 - TRAILING_SELL_DROP_PCT/100) -> cancel & market-sell (fallback)
+    """
+    last_action_ts = 0
+    try:
+        while True:
+            with RECENT_BUYS_LOCK:
+                pos = RECENT_BUYS.get(symbol)
+                if not pos or pos.get("closed"):
+                    break
+                qty = pos.get("qty") or 0.0
+                buy_price = pos.get("buy_price") or 0.0
+                current_sell_price = pos.get("sell_price") or 0.0
+                highest = pos.get("highest_price") or 0.0
+
+            if qty <= 0:
+                time.sleep(TRAILING_POLL_INTERVAL)
+                continue
+
+            # small throttle to avoid spamming actions
+            if time.time() - last_action_ts < MIN_TIME_BETWEEN_TRAILING_ACTIONS:
+                time.sleep(TRAILING_POLL_INTERVAL)
+                continue
+
+            try:
+                last_price = fetch_symbol_price(symbol)
+            except Exception:
+                last_price = None
+
+            if last_price is None:
+                time.sleep(TRAILING_POLL_INTERVAL)
+                continue
+
+            # update highest
+            if highest is None or last_price > (highest or 0.0):
+                highest = last_price
+                with RECENT_BUYS_LOCK:
+                    if symbol in RECENT_BUYS:
+                        RECENT_BUYS[symbol]["highest_price"] = highest
+
+            # 1) check approach to current sell -> move sell up
+            try:
+                if current_sell_price and last_price >= (float(current_sell_price) * APPROACH_PCT_BEFORE_CANCEL):
+                    # rise close to sell: raise sell
+                    # base for new sell: use latest price to avoid placing too low
+                    base_for_new = max(last_price, current_sell_price)
+                    set_new_limit_sell_for_position(symbol, qty, base_for_new, reason="approach_and_raise")
+                    last_action_ts = time.time()
+                    # update current_sell_price from RECENT_BUYS
+                    with RECENT_BUYS_LOCK:
+                        current_sell_price = RECENT_BUYS.get(symbol, {}).get("sell_price") or current_sell_price
+                    # continue monitoring
+                    time.sleep(TRAILING_POLL_INTERVAL)
+                    continue
+            except Exception:
+                pass
+
+            # 2) check drop from peak -> market sell fallback
+            try:
+                if highest and (last_price <= (float(highest) * (1.0 - (TRAILING_SELL_DROP_PCT / 100.0)))):
+                    # drop detected -> attempt cancel & market sell fallback
+                    notify(f"⚠️ Trailing detected drop for {symbol}: last={last_price} highest={highest} -> executing market sell fallback.")
+                    log_csv("TRAIL_DROP", symbol, qty, price=last_price, highest=highest, sell_price=current_sell_price, note="drop_from_peak")
+                    resp = cancel_then_market_sell(symbol, qty)
+                    if resp:
+                        add_blacklist(symbol)
+                        finalize_close(symbol, {"closed_ts": time.time(), "close_method": "trailing_drop_market", "close_resp": resp})
+                        notify(f"✅ Trailing sold {symbol} due to drop from peak.")
+                        log_csv("SOLD_MARKET", symbol, qty, price=last_price, highest=highest, sell_price=current_sell_price, note="sold_on_drop")
+                        break
+                    else:
+                        # failed; reset processing flag
+                        with RECENT_BUYS_LOCK:
+                            if symbol in RECENT_BUYS:
+                                RECENT_BUYS[symbol].update({"processing": False})
+                        notify(f"⚠️ Trailing: market sell failed for {symbol}. Will retry later.")
+                        last_action_ts = time.time()
+                        time.sleep(TRAILING_POLL_INTERVAL)
+                        continue
+            except Exception:
+                pass
+
+            time.sleep(TRAILING_POLL_INTERVAL)
+
+    except Exception as e:
+        notify(f"⚠️ trailing_monitor error for {symbol}: {e}")
+    finally:
+        # cleanup indicator
+        with RECENT_BUYS_LOCK:
+            if symbol in RECENT_BUYS:
+                RECENT_BUYS[symbol].pop("trailing_thread", None)
+        return
 
 # -------------------------
 # Evaluate symbol
@@ -1109,20 +1267,14 @@ def evaluate_symbol(sym, last_price, qvol, change_24h):
             return None
 
         # EMAs / RSI
-        # Check against KLINES_5M_LIMIT (now 11) to ensure enough data for EMA_LONG (10) and RSI_PERIOD (14)
-        if len(closes_5m) >= EMA_LONG:
-            short_ema = ema_local(closes_5m, EMA_SHORT)
-            long_ema = ema_local(closes_5m, EMA_LONG)
-        else:
-            short_ema = None
-            long_ema = None
-        
+        short_ema = ema_local(closes_5m[-EMA_SHORT:], EMA_SHORT) if len(closes_5m) >= EMA_SHORT else None
+        long_ema = ema_local(closes_5m[-EMA_LONG:], EMA_LONG) if len(closes_5m) >= EMA_LONG else None
         ema_uplift = 0.0
         if short_ema and long_ema and long_ema != 0:
             ema_uplift = max(0.0, (short_ema - long_ema) / (long_ema + 1e-12))
 
-        rsi_val = compute_rsi_local(closes_5m, RSI_PERIOD)
-        
+        rsi_val = compute_rsi_local(closes_5m[-(RSI_PERIOD+1):], RSI_PERIOD) if len(closes_5m) >= RSI_PERIOD+1 else None
+
         ob_bull = orderbook_bullish(ob, depth=OB_DEPTH, min_imbalance=MIN_OB_IMBALANCE, max_spread_pct=MAX_OB_SPREAD_PCT)
 
         # scoring (added a small weight for vol_1m to prefer higher 1m activity)
@@ -1281,7 +1433,7 @@ def pick_coin():
         return None
         
 # -------------------------
-# Execute trade
+# Execute trade (with trailing start)
 # -------------------------
 def execute_trade(chosen):
     symbol = chosen["symbol"]
@@ -1323,7 +1475,7 @@ def execute_trade(chosen):
             return False
 
         with RECENT_BUYS_LOCK:
-            RECENT_BUYS[symbol].update({"qty": executed_qty, "buy_price": avg_price, "ts": now, "processing": False})
+            RECENT_BUYS[symbol].update({"qty": executed_qty, "buy_price": avg_price, "ts": now, "processing": False, "highest_price": avg_price})
 
         try:
             ACTIVE_TRADE.set()
@@ -1331,32 +1483,47 @@ def execute_trade(chosen):
             pass
 
         send_telegram(f"💸 Imenunuliwa `{symbol}` kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
+        log_csv("BUY", symbol, executed_qty, avg_price, highest=avg_price, sell_price=None, note="buy_executed")
 
         time.sleep(SHORT_BUY_SELL_DELAY)
 
+        # initial sell price using existing LIMIT_PROFIT_PCT
         sell_price = avg_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
         sell_resp = place_limit_sell_strict(symbol, executed_qty, sell_price)
         if sell_resp:
             sell_order_id = None
+            placed_price = sell_price
             try:
                 if isinstance(sell_resp, dict):
                     sell_order_id = sell_resp.get("orderId") or sell_resp.get("order_id") or sell_resp.get("clientOrderId")
+                    placed_price = float(sell_resp.get("price") or sell_price)
                 else:
                     sell_order_id = getattr(sell_resp, "orderId", None) or getattr(sell_resp, "order_id", None) or getattr(sell_resp, "clientOrderId", None)
+                    placed_price = sell_price
             except Exception:
                 sell_order_id = None
+                placed_price = sell_price
 
             with RECENT_BUYS_LOCK:
                 RECENT_BUYS[symbol].update({
-                    "sell_price": sell_price,
+                    "sell_price": placed_price,
                     "sell_resp": sell_resp,
                     "sell_order_id": sell_order_id,
                     "sell_ts": time.time(),
                     "closed": False,
                     "processing": False,
+                    "highest_price": avg_price
                 })
 
-            send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{sell_price}` (+{LIMIT_PROFIT_PCT}%)")
+            send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{placed_price}` (+{LIMIT_PROFIT_PCT}%)")
+            log_csv("INITIAL_SELL", symbol, executed_qty, price=None, highest=avg_price, sell_price=placed_price, note="initial_limit_sell")
+
+            # start trailing monitor thread (if not already running)
+            with RECENT_BUYS_LOCK:
+                if symbol in RECENT_BUYS and not RECENT_BUYS[symbol].get("trailing_thread"):
+                    th = threading.Thread(target=trailing_monitor, args=(symbol,), daemon=True)
+                    RECENT_BUYS[symbol]["trailing_thread"] = th
+                    th.start()
 
             # short poll for immediate fills
             try:
@@ -1382,11 +1549,12 @@ def execute_trade(chosen):
                                     avg_price_fill = (cquote / filled_qty) if filled_qty else 0.0
                             except Exception:
                                 filled_qty = executed_qty
-                                avg_price_fill = sell_price
+                                avg_price_fill = placed_price
 
                             add_blacklist(symbol)
                             finalize_close(symbol, {"closed_ts": time.time(), "close_method": "limit_filled_immediate", "close_resp": filled_order, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price_fill})
-                            send_telegram(f"✔️ Coin ya `{symbol}` imeuzwa — {filled_qty} @ {avg_price} (limit)")
+                            send_telegram(f"✔️ Coin ya `{symbol}` imeuzwa — {filled_qty} @ {avg_price_fill} (limit)")
+                            log_csv("SOLD_LIMIT", symbol, filled_qty, avg_price_fill, highest=None, sell_price=placed_price, note="immediate_fill")
                             return True
             except Exception:
                 pass
@@ -1399,6 +1567,7 @@ def execute_trade(chosen):
                 if fallback:
                     add_blacklist(symbol)
                     finalize_close(symbol, {"closed_ts": time.time(), "close_method": "market_fallback", "close_resp": fallback})
+                    log_csv("SOLD_MARKET", symbol, executed_qty, price=None, highest=None, sell_price=None, note="fallback_after_limit_fail")
                 else:
                     if symbol in RECENT_BUYS:
                         RECENT_BUYS.pop(symbol, None)
@@ -1462,69 +1631,29 @@ def monitor_positions():
         try:
             now = time.time()
             to_process = []
-            to_process_candidates = [] # ADDED: List to hold open positions for technical checks
-            
             with RECENT_BUYS_LOCK:
                 for sym, pos in list(RECENT_BUYS.items()):
-                    if pos.get("closed") or pos.get("processing", False) or (pos.get("qty") or 0.0) <= 0:
+                    if pos.get("closed"):
                         continue
-                        
-                    # 1. Stale Check (Original logic)
-                    if now - pos.get("ts", 0) >= (HOLD_THRESHOLD_HOURS * 3600.0):
+                    ts = pos.get("ts", 0)
+                    qty = pos.get("qty") or 0.0
+                    processing = pos.get("processing", False)
+                    buy_price = pos.get("buy_price") or 0.0
+                    if qty <= 0 or processing:
+                        continue
+                    if now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
                         RECENT_BUYS[sym]["processing"] = True
                         to_process.append((sym, pos, "stale"))
                         continue
-                        
-                    to_process_candidates.append((sym, pos)) # Collect for other checks
-
-            # Evaluate candidates for Smart Exit and Drawdown
-            for sym, pos in to_process_candidates:
-                if RECENT_BUYS.get(sym, {}).get("processing", False):
-                    continue # Already marked for processing (e.g., stale)
-
-                buy_price = pos.get("buy_price") or 0.0
-                qty = pos.get("qty") or 0.0
-                if buy_price <= 0 or qty <= 0: continue
-
-                try:
-                    # Fetch data needed for technical analysis
-                    kl5 = fetch_klines(sym, "5m", KLINES_5M_LIMIT) # KLINES_5M_LIMIT is 11
-                    last = fetch_symbol_price(sym)
-                    
-                    if last is None:
-                        continue
-                    
-                    pct = (last - buy_price) / buy_price * 100.0
-                    
-                    # --- 2. Hard Drawdown Check (80.0%) ---
-                    if pct <= -abs(SELL_DRAWDOWN_PCT):
-                        RECENT_BUYS[sym]["processing"] = True
-                        to_process.append((sym, pos, "drawdown", last, pct))
-                        continue # Skip smart exit if hard drawdown hit
-
-                    # --- 3. Smart Exit Check (Technical Stop-Loss) ---
-                    # Only check if position is currently at a loss AND we have enough data
-                    if pct < 0 and len(kl5) >= EMA_LONG and len(kl5) >= RSI_PERIOD+1: 
-                        closes_5m = [float(k[4]) for k in kl5]
-                        
-                        # Calculate Indicators
-                        short_ema = ema_local(closes_5m, EMA_SHORT)
-                        long_ema = ema_local(closes_5m, EMA_LONG)
-                        rsi_val = compute_rsi_local(closes_5m, RSI_PERIOD)
-
-                        # Check for Technical Breakdown: EMA cross down AND RSI weakness AND price below long EMA
-                        ema_breakdown = (short_ema is not None and long_ema is not None and short_ema < long_ema and last < long_ema)
-                        rsi_weakness = (rsi_val is not None and rsi_val < 50.0)
-                        
-                        # Execute Smart Exit if conditions are met and loss is acceptable (e.g., within 4.0%)
-                        if ema_breakdown and rsi_weakness and pct >= -abs(MAX_TECHNICAL_LOSS):
-                            RECENT_BUYS[sym]["processing"] = True
-                            to_process.append((sym, pos, "smart_exit", last, pct))
-                            notify(f"📉 *SMART EXIT*: {sym} inauza mapema! Hasara: {pct:.2f}%. EMA-Down na RSI<50.")
-                            continue 
-                            
-                except Exception:
-                    pass
+                    try:
+                        last = fetch_symbol_price(sym)
+                        if last is not None and buy_price > 0:
+                            pct = (last - buy_price) / buy_price * 100.0
+                            if pct <= -abs(SELL_DRAWDOWN_PCT):
+                                RECENT_BUYS[sym]["processing"] = True
+                                to_process.append((sym, pos, "drawdown", last, pct))
+                    except Exception:
+                        pass
 
             for item in to_process:
                 try:
@@ -1544,33 +1673,16 @@ def monitor_positions():
                             notify(f"⚠️ Monitor failed to market-sell {sym}. Will retry later.")
                     elif item[2] == "drawdown":
                         sym, pos, _, last, pct = item[0], item[1], item[2], item[3], item[4]
-                        # notify(f"⚠️ Position {sym} drawdown detected {pct:.2f}% (last={last}, buy={pos.get('buy_price')}). Selling to limit loss.")
                         qty = pos.get("qty")
                         resp = cancel_then_market_sell(sym, qty)
                         if resp:
                             add_blacklist(sym)
-                            # notify(f"ℹ️ Position {sym} sold due to drawdown ({pct:.2f}%).")
                             finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_drawdown_market", "close_resp": resp})
                         else:
                             with RECENT_BUYS_LOCK:
                                 if sym in RECENT_BUYS:
                                     RECENT_BUYS[sym].update({"processing": False})
                             notify(f"⚠️ Monitor failed to market-sell {sym} for drawdown. Will retry later.")
-                    # --- NEW SMART EXIT PROCESSING ---
-                    elif item[2] == "smart_exit":
-                        sym, pos, _, last, pct = item[0], item[1], item[2], item[3], item[4]
-                        qty = pos.get("qty")
-                        notify(f"📉 *SMART EXIT* kwa {sym} ({pct:.2f}%) — Inauza kutokana na udhaifu wa kiufundi.")
-                        resp = cancel_then_market_sell(sym, qty)
-                        if resp:
-                            add_blacklist(sym)
-                            finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_smart_exit", "close_resp": resp})
-                        else:
-                            with RECENT_BUYS_LOCK:
-                                if sym in RECENT_BUYS:
-                                    RECENT_BUYS[sym].update({"processing": False})
-                            notify(f"⚠️ Smart Exit ilishindwa kuuza {sym}. Itajaribu tena baadaye.")
-                            
                 except Exception as e:
                     try:
                         sym = item[0]
@@ -1635,9 +1747,11 @@ def watch_orders(poll_interval=12):
                         send_telegram(f"✅ Trade ya `{sym}` imefungwa — {filled_qty} @ {avg_price} (limit)")
                         add_blacklist(sym)
                         finalize_close(sym, {"closed_ts": time.time(), "close_method": "limit_filled_watch", "close_resp": o, "sell_fill_qty": filled_qty, "sell_fill_price": avg_price})
+                        log_csv("SOLD_LIMIT", sym, filled_qty, avg_price, highest=None, sell_price=pos.get("sell_price"), note="filled_watch")
                     elif status in ("CANCELED", "REJECTED"):
                         send_telegram(f"⚠️ SELL order {status} for {sym}. orderId={order_id}")
                         finalize_close(sym, {"closed_ts": time.time(), "close_method": f"sell_{status.lower()}", "close_resp": o})
+                        log_csv("SELL_CANCELLED", sym, pos.get("qty"), price=None, highest=pos.get("highest_price"), sell_price=pos.get("sell_price"), note=f"watch_status_{status.lower()}")
                 except Exception as e:
                     print("watch_orders error for", sym, e)
                 time.sleep(0.4)
