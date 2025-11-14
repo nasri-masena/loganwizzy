@@ -788,6 +788,7 @@ def execute_smart_sell_if_needed(symbol, pos, last_price):
 def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
     if retries is None:
         retries = max(1, int(LIMIT_SELL_RETRIES))
+
     try:
         client = init_binance_client()
         if not client:
@@ -800,7 +801,8 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
             return None
 
         filters = {f["filterType"]: f for f in info.get("filters", [])}
-        step = float(filters.get("LOT_SIZE", {}).get("stepSize") or filters.get("MARKET_LOT_SIZE", {}).get("stepSize") or 0.0)
+        step = float(filters.get("LOT_SIZE", {}).get("stepSize") or
+                      filters.get("MARKET_LOT_SIZE", {}).get("stepSize") or 0.0)
         tick = float(filters.get("PRICE_FILTER", {}).get("tickSize") or 0.0)
         min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional") or 0.0)
 
@@ -831,16 +833,14 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
                 return True
             return (q * p) >= (min_notional - 1e-12)
 
-        # If minNotional not met, attempt to raise price (ceil to tick) up to TRAILING_MAX_BUMP_PCT to meet minNotional.
+        # Try bumping price to meet minNotional if needed (bounded by TRAILING_MAX_BUMP_PCT)
         if min_notional and not _meets_min_notional(qty, sell_price):
-            # try increasing price (bumping) to satisfy minNotional
             attempts_bump = 0
             max_bump = float(TRAILING_MAX_BUMP_PCT or 0.0) / 100.0
             base_price = sell_price
             while not _meets_min_notional(qty, sell_price) and attempts_bump < 80:
                 attempts_bump += 1
                 sell_price = _ceil_to_tick(sell_price * (1.0 + max(1e-6, 0.001)), tick)
-                # safety: if we've bumped more than allowed percent, break
                 if (sell_price / (base_price + 1e-12) - 1.0) > max_bump:
                     break
 
@@ -853,7 +853,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
         qty_str = format_qty(qty, step)
         price_str = format_price_for_symbol(sell_price, symbol)
 
-        # ensure free balance is enough, cancel/adjust open sells if necessary
+        # helper to read free balance robustly
         def _get_free_asset(a):
             try:
                 bal = client.get_asset_balance(asset=a)
@@ -875,7 +875,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
             free = _get_free_asset(asset)
             if free + 1e-12 < qty:
                 # try to free reserved SELL orders
-                reserved, open_orders = 0.0, []
+                reserved = 0.0
                 try:
                     open_orders = client.get_open_orders(symbol=symbol) or []
                     for o in open_orders:
@@ -884,8 +884,9 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
                             executed = float(o.get("executedQty") or 0.0)
                             reserved += max(0.0, orig - executed)
                 except Exception:
-                    pass
-                # re-calc free
+                    open_orders = []
+
+                # re-check free
                 free = _get_free_asset(asset)
                 if free + 1e-12 < qty:
                     new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
@@ -910,16 +911,19 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
                 except Exception:
                     pass
                 return order
+
             except BinanceAPIException as e:
-                err = str(e)
-                last_err = err
+                err_text = str(e) or ""
+                last_err = err_text
+
+                # Normalize to lower for some checks
+                lerr = err_text.lower()
+
                 # handle minNotional / filter error by trying to bump price further and retry
-                if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err:
-                    notify(f"⚠️ Limit sell attempt {attempt} hit minNotional/filter error: {err}. Trying to adjust.")
-                    # try bumping price before next attempt
+                if 'notional' in lerr or 'minnotional' in lerr or '-1013' in lerr:
+                    notify(f"⚠️ Limit sell attempt {attempt} hit minNotional/filter error: {err_text}. Trying to adjust.")
                     try:
                         base_price = sell_price
-                        # bump up to TRAILING_MAX_BUMP_PCT in small steps
                         max_bump = float(TRAILING_MAX_BUMP_PCT or 0.0) / 100.0
                         bumped = False
                         for i in range(1, 40):
@@ -932,7 +936,7 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
                                 bumped = True
                                 break
                         if not bumped:
-                            # as a last resort increase qty if free balance allows
+                            # as last resort try to increase qty if free allows
                             try:
                                 if asset:
                                     free = _get_free_asset(asset)
@@ -945,20 +949,41 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
                                             continue
                             except Exception:
                                 pass
-                            # if we can't meet minNotional, try next retry (may still fail)
                         time.sleep(0.2)
                         continue
-                if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
+                    except Exception as inner:
+                        # If our adjustment logic fails, log and continue to retry normally
+                        notify(f"⚠️ Error while trying to adjust for minNotional: {inner}")
+                        time.sleep(delay * attempt)
+                        continue
+
+                # Rate-limit / request weight handling (case-insensitive, multiple variants)
+                rate_limit_signatures = [
+                    '-1003',
+                    'too much request weight',
+                    'request has been rejected',
+                    'too many requests',
+                    'rate limit',
+                    'request rate is too high'
+                ]
+                if any(sig in lerr for sig in rate_limit_signatures):
                     notify("❗ Rate-limit detected placing limit sell — backing off and skipping symbol for a bit.")
-                    TEMP_SKIP[symbol] = time.time() + 60
+                    try:
+                        TEMP_SKIP[symbol] = time.time() + 60
+                    except Exception:
+                        pass
                     return None
+
                 # insufficient balance
-                if '-2010' in err or 'insufficient balance' in err.lower():
-                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err}. Refreshing balance & retrying.")
+                if '-2010' in lerr or 'insufficient balance' in lerr:
+                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err_text}. Refreshing balance & retrying.")
                     time.sleep(min(1.0 * attempt, 3.0))
                     continue
-                notify(f"⚠️ Limit sell attempt {attempt} failed: {err}. Retrying (delay {delay*attempt}s).")
+
+                # generic retryable error
+                notify(f"⚠️ Limit sell attempt {attempt} failed: {err_text}. Retrying (delay {delay*attempt}s).")
                 time.sleep(delay * attempt)
+
             except Exception as e:
                 last_err = str(e)
                 notify(f"⚠️ Unexpected error placing limit sell (attempt {attempt}): {e}")
@@ -973,7 +998,10 @@ def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
             notify(f"❌ Final LIMIT_MAKER attempt failed: {e}")
 
         notify(f"❌ place_limit_sell_strict: all attempts failed for {symbol}. last_err={last_err}")
-        TEMP_SKIP[symbol] = time.time() + 60
+        try:
+            TEMP_SKIP[symbol] = time.time() + 60
+        except Exception:
+            pass
         return None
 
     except Exception as e:
