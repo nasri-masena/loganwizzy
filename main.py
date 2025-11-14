@@ -28,7 +28,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
 BUY_USDT_AMOUNT = 5.5
-LIMIT_PROFIT_PCT = 1.0 
+LIMIT_PROFIT_PCT = 1.0
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 8
@@ -77,35 +77,34 @@ BLACKLIST = {}
 
 SELL_DRAWDOWN_PCT = 3.0
 SCAN_PAUSE_ON_OPEN = True
-LIMIT_SELL_RETRIES = 5
 
 APPROACH_PCT_BEFORE_CANCEL = 0.998
 TRAILING_INCREMENT_PCT = 0.8
-TRAILING_SHELL_DROP_PCT = 1.5
+TRAILING_SELL_DROP_PCT = 1.1
 TRAILING_MIN_RISE_PCT = 0.20
 TRAILING_START_DELAY = 0.8
 TRAILING_POLL_INTERVAL = 1.0
 MIN_TIME_BETWEEN_TRAILING_ACTIONS = 1.0
-TRAILING_RETRY_INTERVAL = 20.0
-MAX_TRAILING_RETRIES = 3
-TRAILING_STEP_MIN = 0.0005
+TRAILING_RETRY_INTERVAL = 10.0
+MAX_TRAILING_RETRIES = 5
+TRAILING_STEP_MIN = 0.0002
 TRAILING_STEP_PCT_MIN = 0.12
-
-TRAILING_MAX_ORDERS = 10
-TRAILING_MAX_BUMP_PCT = 5.0
-TRAILING_LADDER_GAP_PCT = 0.4
-
 NOTIFY_ON_TRAILING_FIRST = True
 NOTIFY_ON_TRAILING_EVERY = False
 NOTIFY_ON_TRAILING_FAIL = True
 NOTIFY_MIN_INTERVAL_SEC = 60
 
+# new configs
+TRAILING_MAX_ORDERS = 10
+TRAILING_MAX_BUMP_PCT = 5.0
+TRAILING_LADDER_GAP_PCT = 0.4
+
 SMART_SELL_ENABLED = True
-SMART_SELL_CONSECUTIVE_DOWN = 2
+SMART_SELL_CONSECUTIVE_DOWN = 3
 SMART_SELL_MIN_CUM_DROP_PCT = 0.8
 SMART_SELL_VOL_MULTIPLIER = 1.2
 SMART_SELL_OB_ASKS_OVER_BIDS = 1.12
-SMART_SELL_MIN_LAST_DROP_FROM_BUY = 0.7
+SMART_SELL_MIN_LAST_DROP_FROM_BUY = 0.8
 SMART_SELL_LOG_DECISIONS = True
 
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
@@ -786,18 +785,9 @@ def execute_smart_sell_if_needed(symbol, pos, last_price):
 # -------------------------
 # Limit sell strict
 # -------------------------
-def place_limit_sell_strict(
-    symbol,
-    qty,
-    sell_price,
-    retries=None,
-    delay=0.8,
-    cancel_existing=True,
-    existing_order_id=None,
-    cancel_before_place_sleep=0.12
-):
+def place_limit_sell_strict(symbol, qty, sell_price, retries=None, delay=0.8):
     if retries is None:
-        retries = max(1, int(LIMIT_SELL_RETRIES or 1))
+        retries = max(1, int(LIMIT_SELL_RETRIES))
     try:
         client = init_binance_client()
         if not client:
@@ -809,6 +799,11 @@ def place_limit_sell_strict(
             notify(f"⚠️ place_limit_sell_strict: missing symbol info for {symbol}")
             return None
 
+        filters = {f["filterType"]: f for f in info.get("filters", [])}
+        step = float(filters.get("LOT_SIZE", {}).get("stepSize") or filters.get("MARKET_LOT_SIZE", {}).get("stepSize") or 0.0)
+        tick = float(filters.get("PRICE_FILTER", {}).get("tickSize") or 0.0)
+        min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional") or 0.0)
+
         def _floor_to_step(v, step):
             if not step or step == 0:
                 return float(v)
@@ -817,17 +812,48 @@ def place_limit_sell_strict(
         def _ceil_to_tick(v, tick):
             if not tick or tick == 0:
                 return float(v)
-            # avoid floating rounding issues
-            prec = int(round(-math.log10(tick))) if tick < 1 else 0
-            return float(("{:0." + str(prec) + "f}").format(math.ceil(float(v) / tick) * tick))
+            return math.ceil(float(v) / tick) * tick
 
-        filters = {f["filterType"]: f for f in info.get("filters", [])}
-        step = float(filters.get("LOT_SIZE", {}).get("stepSize") or filters.get("MARKET_LOT_SIZE", {}).get("stepSize") or 0.0)
-        tick = float(filters.get("PRICE_FILTER", {}).get("tickSize") or 0.0)
-        min_notional = float(filters.get("MIN_NOTIONAL", {}).get("minNotional") or 0.0)
+        qty = float(qty)
+        sell_price = float(sell_price)
 
-        asset = symbol[:-len(QUOTE)] if QUOTE and symbol.endswith(QUOTE) else None
+        if step and step > 0:
+            qty = _floor_to_step(qty, step)
+        if tick and tick > 0:
+            sell_price = _ceil_to_tick(sell_price, tick)
 
+        if qty <= 0:
+            notify("❌ place_limit_sell_strict: qty zero after clipping")
+            return None
+
+        def _meets_min_notional(q, p):
+            if not min_notional or min_notional == 0:
+                return True
+            return (q * p) >= (min_notional - 1e-12)
+
+        # If minNotional not met, attempt to raise price (ceil to tick) up to TRAILING_MAX_BUMP_PCT to meet minNotional.
+        if min_notional and not _meets_min_notional(qty, sell_price):
+            # try increasing price (bumping) to satisfy minNotional
+            attempts_bump = 0
+            max_bump = float(TRAILING_MAX_BUMP_PCT or 0.0) / 100.0
+            base_price = sell_price
+            while not _meets_min_notional(qty, sell_price) and attempts_bump < 80:
+                attempts_bump += 1
+                sell_price = _ceil_to_tick(sell_price * (1.0 + max(1e-6, 0.001)), tick)
+                # safety: if we've bumped more than allowed percent, break
+                if (sell_price / (base_price + 1e-12) - 1.0) > max_bump:
+                    break
+
+        # final rounding
+        if step and step > 0:
+            qty = _floor_to_step(qty, step)
+        if tick and tick > 0:
+            sell_price = _ceil_to_tick(sell_price, tick)
+
+        qty_str = format_qty(qty, step)
+        price_str = format_price_for_symbol(sell_price, symbol)
+
+        # ensure free balance is enough, cancel/adjust open sells if necessary
         def _get_free_asset(a):
             try:
                 bal = client.get_asset_balance(asset=a)
@@ -844,157 +870,30 @@ def place_limit_sell_strict(
                 pass
             return 0.0
 
-        def _free_reserved_qty_and_open_orders():
-            reserved = 0.0
-            try:
-                open_orders = client.get_open_orders(symbol=symbol) or []
-                for o in open_orders:
-                    if (o.get('side') or "").upper() == 'SELL':
-                        orig = float(o.get('origQty') or 0.0)
-                        executed = float(o.get('executedQty') or 0.0)
-                        reserved += max(0.0, orig - executed)
-                return reserved, open_orders
-            except Exception:
-                return 0.0, []
-
-        qty = float(qty)
-        sell_price = float(sell_price)
-
-        # clamp qty and price to filters
-        if step and step > 0:
-            qty = _floor_to_step(qty, step)
-        if tick and tick > 0:
-            sell_price = _ceil_to_tick(sell_price, tick)
-
-        if qty <= 0:
-            notify("❌ place_limit_sell_strict: qty zero after clipping")
-            return None
-
-        def _meets_min_notional(q, p):
-            if not min_notional or min_notional == 0:
-                return True
-            return (q * p) >= (min_notional - 1e-12)
-
-        # If minNotional not met *compute* direct required price or qty
-        bumped_price_used = False
-        base_price = sell_price
-        if min_notional and not _meets_min_notional(qty, sell_price):
-            # compute price needed to meet minNotional with current qty
-            try:
-                required_price = (min_notional / (qty + 1e-12))
-                required_price = _ceil_to_tick(required_price, tick)
-            except Exception:
-                required_price = sell_price
-
-            # if required_price is reasonable within bump cap, use it
-            try:
-                max_bump_pct = float(TRAILING_MAX_BUMP_PCT or 0.0) / 100.0
-            except Exception:
-                max_bump_pct = 0.0
-
-            if required_price <= base_price * (1.0 + max_bump_pct) and required_price > sell_price:
-                sell_price = required_price
-                bumped_price_used = True
-            else:
-                # otherwise try to increase qty if free balance allows (more robust)
-                free = _get_free_asset(asset) if asset else 0.0
-                if free and free > qty + (step or 0):
-                    # compute needed qty to meet minNotional at current sell_price
-                    needed_qty = math.ceil((min_notional / float(sell_price)) / (step or 1)) * (step or 1)
-                    if needed_qty <= free + 1e-12:
-                        qty = _floor_to_step(needed_qty, step)
-                        qty = max(qty, 0.0)
-                        notify(f"ℹ️ Increased qty to meet minNotional: qty={qty}")
-                    else:
-                        # try bumping price up to cap as last resort
-                        if max_bump_pct > 0:
-                            candidate = _ceil_to_tick(base_price * (1.0 + max_bump_pct), tick)
-                            if _meets_min_notional(qty, candidate):
-                                sell_price = candidate
-                                bumped_price_used = True
-
-            # final check: if still not meeting minNotional, we'll proceed but expect API error and handle below
-            if not _meets_min_notional(qty, sell_price):
-                notify(f"⚠️ Cannot meet minNotional for {symbol} after adjustments (qty*price={qty*sell_price:.8f} < {min_notional}). Will attempt but may fail.")
-
-        # final rounding before placement
-        if step and step > 0:
-            qty = _floor_to_step(qty, step)
-        if tick and tick > 0:
-            sell_price = _ceil_to_tick(sell_price, tick)
-
-        qty_str = format_qty(qty, step)
-        price_str = format_price_for_symbol(sell_price, symbol)
-
-        # optionally cancel existing sells to free qty
-        if cancel_existing:
-            try:
-                if existing_order_id:
-                    try:
-                        client.cancel_order(symbol=symbol, orderId=existing_order_id)
-                        notify(f"ℹ️ Cancelled existing SELL order {existing_order_id} before placing new limit.")
-                    except Exception as e:
-                        err = str(e).lower()
-                        if any(x in err for x in ('order does not exist', 'unknown order', 'order not found', 'is not found')):
-                            notify(f"ℹ️ existing order {existing_order_id} not found (may be filled). Proceeding.")
-                        else:
-                            notify(f"⚠️ Could not cancel existing order {existing_order_id}: {e}. Will continue and attempt to place if possible.")
-                else:
-                    reserved, open_orders = _free_reserved_qty_and_open_orders()
-                    if reserved > 0:
-                        sells = []
-                        for o in open_orders:
-                            if (o.get("side") or "").upper() == "SELL":
-                                reserved_qty = max(0.0, float(o.get("origQty") or 0.0) - float(o.get("executedQty") or 0.0))
-                                sells.append((reserved_qty, o))
-                        sells.sort(key=lambda x: x[0])
-                        for rqty, o in sells:
-                            try:
-                                client.cancel_order(symbol=symbol, orderId=o.get("orderId"))
-                                notify(f"ℹ️ Cancelled open SELL order {o.get('orderId')} to free {rqty:.8f} {asset}")
-                                time.sleep(0.06)
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-
-            # give time for exchange to release reserved funds
-            try:
-                time.sleep(cancel_before_place_sleep)
-            except Exception:
-                pass
-
-        # re-check free balance, try to reduce qty if necessary
-        free = _get_free_asset(asset) if asset else 0.0
-        if free + 1e-12 < qty:
-            # attempt to cancel open sell orders again quickly
-            try:
-                reserved, open_orders = _free_reserved_qty_and_open_orders()
-                if reserved > 0:
-                    sells = []
+        asset = symbol[:-len(QUOTE)] if QUOTE and symbol.endswith(QUOTE) else None
+        if asset:
+            free = _get_free_asset(asset)
+            if free + 1e-12 < qty:
+                # try to free reserved SELL orders
+                reserved, open_orders = 0.0, []
+                try:
+                    open_orders = client.get_open_orders(symbol=symbol) or []
                     for o in open_orders:
                         if (o.get("side") or "").upper() == "SELL":
-                            reserved_qty = max(0.0, float(o.get("origQty") or 0.0) - float(o.get("executedQty") or 0.0))
-                            sells.append((reserved_qty, o))
-                    sells.sort(key=lambda x: x[0])
-                    for rqty, o in sells:
-                        try:
-                            client.cancel_order(symbol=symbol, orderId=o.get("orderId"))
-                            notify(f"ℹ️ Cancelled open SELL order {o.get('orderId')} to free {rqty:.8f} {asset}")
-                            time.sleep(0.06)
-                        except Exception:
-                            pass
-                    free = _get_free_asset(asset)
-            except Exception:
+                            orig = float(o.get("origQty") or 0.0)
+                            executed = float(o.get("executedQty") or 0.0)
+                            reserved += max(0.0, orig - executed)
+                except Exception:
+                    pass
+                # re-calc free
                 free = _get_free_asset(asset)
-
-            if free + 1e-12 < qty:
-                new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
-                if new_qty <= 0:
-                    notify(f"❌ place_limit_sell_strict: insufficient free {asset} (free={free:.8f}, req={qty:.8f})")
-                    return None
-                qty = new_qty
-                qty_str = format_qty(qty, step)
+                if free + 1e-12 < qty:
+                    new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
+                    if new_qty <= 0:
+                        notify(f"❌ place_limit_sell_strict: insufficient free {asset} (free={free:.8f}, req={qty:.8f})")
+                        return None
+                    qty = new_qty
+                    qty_str = format_qty(qty, step)
 
         attempt = 0
         last_err = None
@@ -1004,7 +903,6 @@ def place_limit_sell_strict(
                 jitter = random.uniform(0.03, 0.12)
                 time.sleep(min(0.2, SHORT_BUY_SELL_DELAY + jitter))
                 order = client.order_limit_sell(symbol=symbol, quantity=qty_str, price=price_str, timeInForce='GTC')
-                # clear open orders cache
                 try:
                     with OPEN_ORDERS_LOCK:
                         OPEN_ORDERS_CACHE['data'] = None
@@ -1015,57 +913,50 @@ def place_limit_sell_strict(
             except BinanceAPIException as e:
                 err = str(e)
                 last_err = err
-                # insufficient balance -> try to refresh and reduce qty
-                if '-2010' in err or 'insufficient balance' in err.lower():
-                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err}. Refreshing balance & retrying.")
-                    time.sleep(min(0.6 * attempt, 2.0))
-                    free = _get_free_asset(asset)
-                    if free + 1e-12 < qty:
-                        new_qty = _floor_to_step(max(0.0, free - (step or 0)), step)
-                        if new_qty <= 0:
-                            notify("❌ After refresh, no available qty to place limit sell.")
-                            return None
-                        qty = new_qty
-                        qty_str = format_qty(qty, step)
-                        notify(f"ℹ️ Reduced qty to {qty_str} and retrying.")
-                        continue
-                    continue
-
-                # handle minNotional / filter error with targeted approach
-                if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err or 'Filter failure' in err:
-                    notify(f"⚠️ Limit sell attempt {attempt} hit minNotional/filter error: {err}. Trying targeted adjust.")
-                    # recompute required price for current qty
+                # handle minNotional / filter error by trying to bump price further and retry
+                if 'NOTIONAL' in err or 'minNotional' in err or '-1013' in err:
+                    notify(f"⚠️ Limit sell attempt {attempt} hit minNotional/filter error: {err}. Trying to adjust.")
+                    # try bumping price before next attempt
                     try:
-                        required_price = _ceil_to_tick((min_notional / (qty + 1e-12)), tick)
-                    except Exception:
-                        required_price = sell_price
-                    max_bump_pct = float(TRAILING_MAX_BUMP_PCT or 0.0) / 100.0
-                    # if required price within allowed bump, use it and retry
-                    if required_price <= base_price * (1.0 + max_bump_pct):
-                        sell_price = required_price
-                        price_str = format_price_for_symbol(sell_price, symbol)
-                        notify(f"ℹ️ Bumping price to {sell_price} to meet minNotional and retry.")
-                        time.sleep(0.18)
+                        base_price = sell_price
+                        # bump up to TRAILING_MAX_BUMP_PCT in small steps
+                        max_bump = float(TRAILING_MAX_BUMP_PCT or 0.0) / 100.0
+                        bumped = False
+                        for i in range(1, 40):
+                            candidate = _ceil_to_tick(base_price * (1.0 + (i * 0.001)), tick)
+                            if (candidate / (base_price + 1e-12) - 1.0) > max_bump:
+                                break
+                            if _meets_min_notional(qty, candidate):
+                                sell_price = candidate
+                                price_str = format_price_for_symbol(sell_price, symbol)
+                                bumped = True
+                                break
+                        if not bumped:
+                            # as a last resort increase qty if free balance allows
+                            try:
+                                if asset:
+                                    free = _get_free_asset(asset)
+                                    if free > qty + (step or 0):
+                                        new_qty = _floor_to_step(free, step)
+                                        if new_qty > qty:
+                                            qty = new_qty
+                                            qty_str = format_qty(qty, step)
+                                            notify(f"ℹ️ Increased qty to {qty_str} to try meet minNotional; retrying.")
+                                            continue
+                            except Exception:
+                                pass
+                            # if we can't meet minNotional, try next retry (may still fail)
+                        time.sleep(0.2)
                         continue
-                    # else try increasing qty if free allows
-                    free = _get_free_asset(asset)
-                    needed_qty = math.ceil((min_notional / float(sell_price)) / (step or 1)) * (step or 1)
-                    if free and needed_qty <= free + 1e-12 and needed_qty > qty:
-                        qty = _floor_to_step(needed_qty, step)
-                        qty_str = format_qty(qty, step)
-                        notify(f"ℹ️ Increased qty to {qty_str} to meet minNotional; retrying.")
-                        time.sleep(0.12)
-                        continue
-                    # nothing workable -> short backoff and continue
-                    time.sleep(0.18)
-                    continue
-
-                # rate-limit handling
                 if '-1003' in err or 'Too much request weight' in err or 'Request has been rejected' in err:
                     notify("❗ Rate-limit detected placing limit sell — backing off and skipping symbol for a bit.")
                     TEMP_SKIP[symbol] = time.time() + 60
                     return None
-
+                # insufficient balance
+                if '-2010' in err or 'insufficient balance' in err.lower():
+                    notify(f"⚠️ Limit sell attempt {attempt} insufficient balance: {err}. Refreshing balance & retrying.")
+                    time.sleep(min(1.0 * attempt, 3.0))
+                    continue
                 notify(f"⚠️ Limit sell attempt {attempt} failed: {err}. Retrying (delay {delay*attempt}s).")
                 time.sleep(delay * attempt)
             except Exception as e:
@@ -1073,17 +964,10 @@ def place_limit_sell_strict(
                 notify(f"⚠️ Unexpected error placing limit sell (attempt {attempt}): {e}")
                 time.sleep(delay * attempt)
 
-        # final fallback: try LIMIT_MAKER as last attempt
+        # final fallback: try LIMIT_MAKER (post-only) once
         try:
             notify("⚠️ All limit attempts failed — trying LIMIT_MAKER as last attempt.")
             lm = client.create_order(symbol=symbol, side='SELL', type='LIMIT_MAKER', quantity=qty_str, price=price_str)
-            # clear open orders cache
-            try:
-                with OPEN_ORDERS_LOCK:
-                    OPEN_ORDERS_CACHE['data'] = None
-                    OPEN_ORDERS_CACHE['ts'] = 0
-            except Exception:
-                pass
             return lm
         except Exception as e:
             notify(f"❌ Final LIMIT_MAKER attempt failed: {e}")
