@@ -28,7 +28,7 @@ BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
 BUY_USDT_AMOUNT = 6.0
-LIMIT_PROFIT_PCT = 1.2  # initial profit target percent
+LIMIT_PROFIT_PCT = 1.0 
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
 MAX_CONCURRENT_POS = 8
@@ -39,7 +39,7 @@ BINANCE_REST = "https://api.binance.com"
 PRICE_MIN = 0.1
 PRICE_MAX = 15.0
 MIN_VOLUME = 200000
-TOP_BY_24H_VOLUME = 100
+TOP_BY_24H_VOLUME = 90
 
 CYCLE_SECONDS = 3
 KLINES_5M_LIMIT = 6
@@ -75,24 +75,32 @@ BLACKLIST_HOURS = 1.0
 BLACKLIST_SECONDS = int(BLACKLIST_HOURS * 3600)
 BLACKLIST = {}
 
-SELL_DRAWDOWN_PCT = 80.0
+SELL_DRAWDOWN_PCT = 3.0
 SCAN_PAUSE_ON_OPEN = True
 
-APPROACH_PCT_BEFORE_CANCEL = 0.999
+APPROACH_PCT_BEFORE_CANCEL = 0.998
 TRAILING_INCREMENT_PCT = 0.8
-TRAILING_SELL_DROP_PCT = 1.5
-TRAILING_MIN_RISE_PCT = 0.6
-TRAILING_START_DELAY = 10
+TRAILING_SELL_DROP_PCT = 1.1
+TRAILING_MIN_RISE_PCT = 0.20
+TRAILING_START_DELAY = 0.8
 TRAILING_POLL_INTERVAL = 1.0
-MIN_TIME_BETWEEN_TRAILING_ACTIONS = 1.5
-TRAILING_RETRY_INTERVAL = 20.0
+MIN_TIME_BETWEEN_TRAILING_ACTIONS = 1.0
+TRAILING_RETRY_INTERVAL = 10.0
 MAX_TRAILING_RETRIES = 3
-TRAILING_STEP_MIN = 0.0005
+TRAILING_STEP_MIN = 0.0002
 TRAILING_STEP_PCT_MIN = 0.12
 NOTIFY_ON_TRAILING_FIRST = True
 NOTIFY_ON_TRAILING_EVERY = False
 NOTIFY_ON_TRAILING_FAIL = True
 NOTIFY_MIN_INTERVAL_SEC = 60
+
+SMART_SELL_ENABLED = True
+SMART_SELL_CONSECUTIVE_DOWN = 2
+SMART_SELL_MIN_CUM_DROP_PCT = 0.8
+SMART_SELL_VOL_MULTIPLIER = 1.2
+SMART_SELL_OB_ASKS_OVER_BIDS = 1.12
+SMART_SELL_MIN_LAST_DROP_FROM_BUY = 0.5
+SMART_SELL_LOG_DECISIONS = True
 
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
 RECENT_BUYS_LOCK = threading.Lock()
@@ -673,6 +681,102 @@ def place_market_sell_fallback(symbol, qty, f=None):
         notify(f"❌ Market sell fallback failed for {symbol}: {e}")
         return None
 
+def should_smart_sell(symbol, pos, last_price):
+    """
+    Return (True, reason_str) if we should force-sell based on momentum/vol/orderbook.
+    """
+    try:
+        if not SMART_SELL_ENABLED:
+            return False, "smart_disabled"
+        buy_price = float(pos.get("buy_price") or 0.0)
+        if buy_price <= 0:
+            return False, "no_buy_price"
+
+        # quick last-drop-from-buy guard (optional small threshold)
+        try:
+            if SMART_SELL_MIN_LAST_DROP_FROM_BUY and last_price <= buy_price * (1.0 - float(SMART_SELL_MIN_LAST_DROP_FROM_BUY) / 100.0):
+                return True, f"last_below_buy_threshold ({last_price:.6f} <= {buy_price*(1.0 - SMART_SELL_MIN_LAST_DROP_FROM_BUY/100.0):.6f})"
+        except Exception:
+            pass
+
+        # 1) fetch recent 1m klines
+        kl = fetch_klines(symbol, "1m", max(5, SMART_SELL_CONSECUTIVE_DOWN + 2))
+        if not kl or len(kl) < SMART_SELL_CONSECUTIVE_DOWN + 1:
+            return False, "no_klines"
+
+        # compute consecutive down candles and cumulative drop
+        closes = [float(k[4]) for k in kl]
+        # consider last SMART_SELL_CONSECUTIVE_DOWN candles
+        recent = closes[-SMART_SELL_CONSECUTIVE_DOWN-1:]  # include one before for pct calc
+        downs = 0
+        cum_drop = 0.0
+        for i in range(1, len(recent)):
+            p0 = recent[i-1]; p1 = recent[i]
+            if p1 < p0:
+                downs += 1
+                cum_drop += (p0 - p1) / (p0 + 1e-12) * 100.0
+            else:
+                # reset if any up candle in sequence (we only care fully consecutive)
+                downs = 0
+                cum_drop = 0.0
+
+        if downs >= SMART_SELL_CONSECUTIVE_DOWN and cum_drop >= SMART_SELL_MIN_CUM_DROP_PCT:
+            # 2) volatility check
+            vol_1m = compute_recent_volatility(closes, lookback=SMART_SELL_CONSECUTIVE_DOWN+1) or 0.0
+            vol_ok = (VOL_1M_THRESHOLD and vol_1m >= (VOL_1M_THRESHOLD * SMART_SELL_VOL_MULTIPLIER))
+
+            # 3) orderbook bearish?
+            ob = fetch_order_book(symbol, limit=OB_DEPTH)
+            asks = ob.get("asks") or []
+            bids = ob.get("bids") or []
+            ask_quote = sum(float(a[0]) * float(a[1]) for a in asks[:OB_DEPTH]) + 1e-12
+            bid_quote = sum(float(b[0]) * float(b[1]) for b in bids[:OB_DEPTH]) + 1e-12
+            ob_ratio = (ask_quote / (bid_quote + 1e-12))
+
+            if vol_ok and ob_ratio >= SMART_SELL_OB_ASKS_OVER_BIDS:
+                return True, f"momentum_down downs={downs} cum_drop={cum_drop:.3f}% vol={vol_1m:.6f} ob_ratio={ob_ratio:.3f}"
+            # if momentum strong alone, still may sell (less strict)
+            if downs >= SMART_SELL_CONSECUTIVE_DOWN and cum_drop >= (SMART_SELL_MIN_CUM_DROP_PCT * 1.8):
+                return True, f"strong_momentum_only downs={downs} cum_drop={cum_drop:.3f}%"
+
+        return False, "no_signal"
+    except Exception as e:
+        return False, f"error:{e}"
+
+def execute_smart_sell_if_needed(symbol, pos, last_price):
+    # wrapper used inside monitor_positions/trailing_monitor before forcing fallback
+    try:
+        do_sell, reason = should_smart_sell(symbol, pos, last_price)
+        if not do_sell:
+            if SMART_SELL_LOG_DECISIONS:
+                log_csv("SMART_SELL_CHECK", symbol, pos.get("qty"), last_price, highest=pos.get("highest_price"), sell_price=pos.get("sell_price"), note=reason)
+            return False
+        # log and attempt soft fallback first
+        log_csv("SMART_SELL_TRIGGER", symbol, pos.get("qty"), last_price, highest=pos.get("highest_price"), sell_price=pos.get("sell_price"), note=reason)
+        if should_notify(symbol, "smart_sell") :
+            notify(f"⚠️ SMART-SELL triggered for {symbol}: {reason} (last={last_price})")
+        # try soft fallback then market fallback
+        resp = None
+        try:
+            resp = soft_fallback_sell(symbol, pos.get("qty"), last_price)
+        except Exception:
+            resp = cancel_then_market_sell(symbol, pos.get("qty"))
+        if resp:
+            add_blacklist(symbol)
+            finalize_close(symbol, {"closed_ts": time.time(), "close_method": "smart_sell", "close_resp": resp, "note": reason})
+            if should_notify(symbol, "smart_sell_done"):
+                notify(f"✅ SMART-SELL executed for {symbol} ({reason})")
+            log_csv("SOLD_SMART", symbol, pos.get("qty"), last_price, highest=pos.get("highest_price"), sell_price=None, note=reason)
+            return True
+        else:
+            if should_notify(symbol, "smart_sell_fail"):
+                notify(f"⚠️ SMART-SELL failed for {symbol} ({reason}), will retry later")
+            return False
+    except Exception as e:
+        if should_notify(symbol, "smart_sell_error"):
+            notify(f"⚠️ SMART-SELL error for {symbol}: {e}")
+        return False
+        
 # -------------------------
 # Limit sell strict
 # -------------------------
@@ -1680,8 +1784,17 @@ def execute_trade(chosen):
         send_telegram(f"💸 Imenunuliwa `{symbol}` kwa:`{executed_qty}` @ `{avg_price}` jumla:`{round(executed_qty*avg_price,6)}`")
         log_csv("BUY", symbol, executed_qty, avg_price, highest=avg_price, sell_price=None, note="buy_executed")
 
+        # start trailing monitor immediately to give it a head-start before placing initial sell
+        with RECENT_BUYS_LOCK:
+            if symbol in RECENT_BUYS and not RECENT_BUYS[symbol].get("trailing_thread"):
+                th = threading.Thread(target=trailing_monitor, args=(symbol,), daemon=True)
+                RECENT_BUYS[symbol]["trailing_thread"] = th
+                th.start()
+
+        # wait before placing initial limit sell so trailing can observe & react
         time.sleep(SHORT_BUY_SELL_DELAY)
 
+        # initial sell price using configured LIMIT_PROFIT_PCT
         sell_price = avg_price * (1.0 + (LIMIT_PROFIT_PCT / 100.0))
         sell_resp = place_limit_sell_strict(symbol, executed_qty, sell_price)
 
@@ -1710,18 +1823,14 @@ def execute_trade(chosen):
                     "highest_price": avg_price
                 })
 
+            # notify about initial sell once
             with RECENT_BUYS_LOCK:
                 if not RECENT_BUYS[symbol].get("initial_sell_notified"):
                     send_telegram(f"📌 Order ya kuuzwa `{symbol}` imewekwa kwa `{executed_qty}` @ `{placed_price}` (+{LIMIT_PROFIT_PCT}%)")
                     RECENT_BUYS[symbol]["initial_sell_notified"] = True
                     log_csv("INITIAL_SELL", symbol, executed_qty, price=None, highest=avg_price, sell_price=placed_price, note="initial_limit_sell")
 
-            with RECENT_BUYS_LOCK:
-                if symbol in RECENT_BUYS and not RECENT_BUYS[symbol].get("trailing_thread"):
-                    th = threading.Thread(target=trailing_monitor, args=(symbol,), daemon=True)
-                    RECENT_BUYS[symbol]["trailing_thread"] = th
-                    th.start()
-
+            # short poll for immediate fills
             try:
                 if sell_order_id:
                     filled_order = wait_for_order_fill(client, symbol, sell_order_id, timeout=8, poll=1.0)
@@ -1834,64 +1943,145 @@ def monitor_positions():
         try:
             now = time.time()
             to_process = []
+
             with RECENT_BUYS_LOCK:
-                for sym, pos in list(RECENT_BUYS.items()):
+                snapshot = list(RECENT_BUYS.items())
+
+            # scan positions and optionally trigger smart-sell immediately
+            for sym, pos in snapshot:
+                try:
                     if pos.get("closed"):
                         continue
                     ts = pos.get("ts", 0)
-                    qty = pos.get("qty") or 0.0
+                    qty = float(pos.get("qty") or 0.0)
                     processing = pos.get("processing", False)
-                    buy_price = pos.get("buy_price") or 0.0
+                    buy_price = float(pos.get("buy_price") or 0.0)
+
                     if qty <= 0 or processing:
                         continue
-                    if now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
-                        RECENT_BUYS[sym]["processing"] = True
-                        to_process.append((sym, pos, "stale"))
-                        continue
+
+                    # fetch latest price (best-effort)
+                    last = None
                     try:
                         last = fetch_symbol_price(sym)
-                        if last is not None and buy_price > 0:
-                            pct = (last - buy_price) / buy_price * 100.0
-                            if pct <= -abs(SELL_DRAWDOWN_PCT):
-                                RECENT_BUYS[sym]["processing"] = True
-                                to_process.append((sym, pos, "drawdown", last, pct))
                     except Exception:
-                        pass
+                        last = None
 
+                    # 1) Smart-sell check: if triggered, execute immediately
+                    if last is not None:
+                        try:
+                            executed = execute_smart_sell_if_needed(sym, pos, last)
+                            if executed:
+                                # position closed by smart-sell; skip further checks
+                                continue
+                        except Exception:
+                            # don't crash the monitor if smart-sell fails
+                            pass
+
+                    # 2) stale check (held too long)
+                    if now - ts >= (HOLD_THRESHOLD_HOURS * 3600.0):
+                        with RECENT_BUYS_LOCK:
+                            # mark processing so other loops skip it
+                            if sym in RECENT_BUYS:
+                                RECENT_BUYS[sym]["processing"] = True
+                        to_process.append((sym, pos, "stale"))
+                        continue
+
+                    # 3) drawdown check
+                    if last is not None and buy_price > 0:
+                        pct = (last - buy_price) / buy_price * 100.0
+                        if pct <= -abs(SELL_DRAWDOWN_PCT):
+                            with RECENT_BUYS_LOCK:
+                                if sym in RECENT_BUYS:
+                                    RECENT_BUYS[sym]["processing"] = True
+                            to_process.append((sym, pos, "drawdown", last, pct))
+                            continue
+                except Exception as e:
+                    # ensure single pos failure won't break scanner
+                    notify(f"⚠️ monitor_positions scan error for {sym}: {e}")
+
+            # process queued actions
             for item in to_process:
                 try:
                     if item[2] == "stale":
                         sym, pos = item[0], item[1]
-                        notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — executing market sell fallback to close position.")
-                        qty = pos.get("qty")
-                        resp = cancel_then_market_sell(sym, qty)
-                        if resp:
-                            add_blacklist(sym)
-                            notify(f"ℹ️ Position {sym} force-sold by monitor.")
-                            finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_market_fallback", "close_resp": resp})
-                        else:
+                        qty = float(pos.get("qty") or 0.0)
+                        if should_notify(sym, "monitor_stale"):
+                            notify(f"⚠️ Position {sym} open > {HOLD_THRESHOLD_HOURS}h — attempting soft-fallback then market to close.")
+                        log_csv("MONITOR_STALE", sym, qty, price=None, highest=pos.get("highest_price"), sell_price=pos.get("sell_price"), note="stale_hold")
+
+                        # try soft fallback first (less slippage), then market fallback
+                        try:
+                            resp = None
+                            try:
+                                resp = soft_fallback_sell(sym, qty, fetch_symbol_price(sym) or pos.get("buy_price"))
+                            except Exception:
+                                resp = cancel_then_market_sell(sym, qty)
+
+                            if resp:
+                                add_blacklist(sym)
+                                finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_market_fallback", "close_resp": resp})
+                                if should_notify(sym, "monitor_closed"):
+                                    notify(f"ℹ️ Position {sym} force-sold by monitor.")
+                                log_csv("SOLD_MONITOR", sym, qty, price=None, highest=pos.get("highest_price"), sell_price=None, note="stale_sold")
+                                continue
+                            else:
+                                with RECENT_BUYS_LOCK:
+                                    if sym in RECENT_BUYS:
+                                        RECENT_BUYS[sym]["processing"] = False
+                                if should_notify(sym, "monitor_failed"):
+                                    notify(f"⚠️ Monitor failed to sell {sym} (stale). Will retry later.")
+                                continue
+                        except Exception as e:
                             with RECENT_BUYS_LOCK:
                                 if sym in RECENT_BUYS:
-                                    RECENT_BUYS[sym].update({"processing": False})
-                            notify(f"⚠️ Monitor failed to market-sell {sym}. Will retry later.")
+                                    RECENT_BUYS[sym]["processing"] = False
+                            notify(f"⚠️ Monitor stale handling error for {sym}: {e}")
+                            continue
+
                     elif item[2] == "drawdown":
                         sym, pos, _, last, pct = item[0], item[1], item[2], item[3], item[4]
-                        qty = pos.get("qty")
-                        resp = cancel_then_market_sell(sym, qty)
-                        if resp:
-                            add_blacklist(sym)
-                            finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_drawdown_market", "close_resp": resp})
-                        else:
+                        qty = float(pos.get("qty") or 0.0)
+                        # log and notify (rate-limited)
+                        log_csv("MONITOR_DRAWDOWN", sym, qty, price=last, highest=pos.get("highest_price"), sell_price=pos.get("sell_price"), note=f"drawdown_pct={pct:.3f}")
+                        if should_notify(sym, "monitor_drawdown"):
+                            notify(f"⚠️ Position {sym} drawdown detected {pct:.2f}% (last={last}, buy={pos.get('buy_price')}). Attempting soft-fallback then market.")
+
+                        # try soft fallback first, then market fallback
+                        try:
+                            resp = None
+                            try:
+                                resp = soft_fallback_sell(sym, qty, last)
+                            except Exception:
+                                resp = cancel_then_market_sell(sym, qty)
+
+                            if resp:
+                                add_blacklist(sym)
+                                finalize_close(sym, {"closed_ts": time.time(), "close_method": "monitor_drawdown_market", "close_resp": resp})
+                                if should_notify(sym, "monitor_closed"):
+                                    notify(f"✅ Position {sym} sold due to drawdown ({pct:.2f}%).")
+                                log_csv("SOLD_MONITOR_DRAWDOWN", sym, qty, price=last, highest=pos.get("highest_price"), sell_price=None, note="drawdown_sold")
+                                continue
+                            else:
+                                with RECENT_BUYS_LOCK:
+                                    if sym in RECENT_BUYS:
+                                        RECENT_BUYS[sym]["processing"] = False
+                                if should_notify(sym, "monitor_failed"):
+                                    notify(f"⚠️ Monitor failed to market-sell {sym} for drawdown. Will retry later.")
+                                continue
+                        except Exception as e:
                             with RECENT_BUYS_LOCK:
                                 if sym in RECENT_BUYS:
-                                    RECENT_BUYS[sym].update({"processing": False})
-                            notify(f"⚠️ Monitor failed to market-sell {sym} for drawdown. Will retry later.")
+                                    RECENT_BUYS[sym]["processing"] = False
+                            notify(f"⚠️ Monitor drawdown handling error for {sym}: {e}")
+                            continue
+
                 except Exception as e:
                     try:
                         sym = item[0]
                         with RECENT_BUYS_LOCK:
                             if sym in RECENT_BUYS:
-                                RECENT_BUYS[sym].update({"processing": False})
+                                RECENT_BUYS[sym]["processing"] = False
                     except Exception:
                         pass
                     notify(f"⚠️ Monitor processing failed for {item}: {e}")
@@ -1900,7 +2090,7 @@ def monitor_positions():
         except Exception as e:
             print("monitor_positions loop error", e)
             time.sleep(max(5, MONITOR_INTERVAL))
-
+            
 # -------------------------
 # Watch orders (poll for fills)
 # -------------------------
