@@ -27,7 +27,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
 ENABLE_TRADING = True
-BUY_USDT_AMOUNT = 5.5
+BUY_USDT_AMOUNT = 5.2
 LIMIT_PROFIT_PCT = 1.0
 BUY_BY_QUOTE = True
 BUY_BASE_QTY = 0.0
@@ -80,7 +80,7 @@ SCAN_PAUSE_ON_OPEN = True
 
 APPROACH_PCT_BEFORE_CANCEL = 0.998
 TRAILING_INCREMENT_PCT = 0.6
-TRAILING_SELL_DROP_PCT = 0.8
+TRAILING_SELL_DROP_PCT = 0.5
 TRAILING_MIN_RISE_PCT = 0.20
 TRAILING_START_DELAY = 0.8
 TRAILING_POLL_INTERVAL = 1.0
@@ -104,7 +104,7 @@ SMART_SELL_CONSECUTIVE_DOWN = 3
 SMART_SELL_MIN_CUM_DROP_PCT = 0.8
 SMART_SELL_VOL_MULTIPLIER = 1.2
 SMART_SELL_OB_ASKS_OVER_BIDS = 1.12
-SMART_SELL_MIN_LAST_DROP_FROM_BUY = 0.6
+SMART_SELL_MIN_LAST_DROP_FROM_BUY = 0.5
 SMART_SELL_LOG_DECISIONS = True
 
 REQUESTS_SEMAPHORE = threading.BoundedSemaphore(value=PUBLIC_CONCURRENCY)
@@ -1030,7 +1030,7 @@ def place_limit_sell_strict(
     except Exception as e:
         notify(f"⚠️ place_limit_sell_strict unexpected error for {symbol}: {e}")
         return None
-        
+
 # -------------------------
 # Cancel open SELL orders for a symbol (safe)
 # -------------------------
@@ -1285,83 +1285,120 @@ def set_new_limit_sell_for_position(symbol, qty, base_price, reason="trailing"):
             pos = RECENT_BUYS.get(symbol)
             if not pos or pos.get("closed"):
                 return None
-            # enforce max placements
-            placed_count = pos.get("trailing_placed_count", 0) or 0
-            if placed_count >= (TRAILING_MAX_ORDERS or 10):
-                if should_notify(symbol, "trailing_limit_reached"):
-                    notify(f"⚠️ Trailing max orders reached for {symbol} ({placed_count}). Skipping further trailing.")
-                return None
+            # small defensive reads
+            current_sell_price = float(pos.get("sell_price") or 0.0)
+            buy_price = float(pos.get("buy_price") or 0.0)
 
-        # ensure we have fresh open-orders state
+        # ensure open orders state is fresh (so we don't try to trail a filled pos)
         try:
             sync_open_orders(force=True)
         except Exception:
             pass
-
         with RECENT_BUYS_LOCK:
             pos = RECENT_BUYS.get(symbol)
             if not pos or pos.get("closed"):
                 return None
-            current_sell_price = float(pos.get("sell_price") or 0.0)
-            highest_price = float(pos.get("highest_price") or pos.get("buy_price") or 0.0)
+            # if sell already filled/closed, bail
+            if pos.get("sell_order_id") and pos.get("closed"):
+                return None
 
-        # compute candidate target
-        raw_target = float(base_price) * (1.0 + float(TRAILING_INCREMENT_PCT) / 100.0)
+        # compute raw target price using configured increment
+        raw_target = float(base_price) * (1.0 + (float(TRAILING_INCREMENT_PCT) / 100.0))
 
-        # enforce minimum bump (absolute or pct)
-        min_step_by_pct = float(base_price) * (float(TRAILING_STEP_PCT_MIN or 0.0) / 100.0)
+        # ensure minimum bump relative to current sell price to avoid tiny micro-steps
+        try:
+            min_step_pct = float(TRAILING_STEP_PCT_MIN) / 100.0
+        except Exception:
+            min_step_pct = 0.0
+        min_step_by_pct = float(base_price) * min_step_pct
         min_step = max(float(TRAILING_STEP_MIN or 0.0), min_step_by_pct)
+
+        # if there's a current sell price, ensure we raise by at least min_step
         if current_sell_price and (raw_target - current_sell_price) < (min_step - 1e-12):
             raw_target = float(current_sell_price) + min_step
 
-        # round up to tick
+        # round/ceil to symbol tick using your helper
         try:
             target_price_str = format_price_for_symbol(raw_target, symbol)
             target_price = float(target_price_str)
         except Exception:
-            target_price = raw_target
+            # best-effort: ceil to 1e-8
+            target_price = math.ceil(raw_target * 1e8) / 1e8
 
-        # attempt to place using place_limit_sell_strict (which itself will bump if minNotional)
-        order = place_limit_sell_strict(symbol, qty, target_price, retries=MAX_TRAILING_RETRIES, delay=0.2)
-        if order:
+        # adjust qty/price to pass symbol filters (LOT_SIZE, MIN_NOTIONAL)
+        adj_qty, adj_price = adjust_qty_price_for_filters(symbol, qty, target_price)
+        if adj_qty <= 0:
+            # cannot sell after filters (likely minNotional). notify once and bail.
+            if should_notify(symbol, "trailing_fail"):
+                notify(f"⚠️ Trailing: cannot place sell for {symbol} after filters (qty too small or minNotional).")
+            return None
+
+        # if adj_price got changed by filters, re-round to tick
+        try:
+            adj_price = float(format_price_for_symbol(adj_price, symbol))
+        except Exception:
+            pass
+
+        # cancel existing SELL orders first to free balance (safe cancel)
+        try:
+            cancel_open_sell_orders(symbol)
+        except Exception:
+            pass
+
+        # attempt to place with retries/backoff
+        attempt = 0
+        last_err = None
+        while attempt < (MAX_TRAILING_RETRIES or 1):
+            attempt += 1
             try:
-                if isinstance(order, dict):
-                    placed_price = float(order.get("price") or target_price)
-                    order_id = order.get("orderId") or order.get("clientOrderId")
-                else:
-                    placed_price = target_price
-                    order_id = getattr(order, "orderId", None) or getattr(order, "clientOrderId", None)
-            except Exception:
-                placed_price = target_price
-                order_id = None
+                order = place_limit_sell_strict(symbol, adj_qty, adj_price)
+                if order:
+                    # success: update RECENT_BUYS and notify (rate-limited)
+                    sell_order_id = None
+                    placed_price = adj_price
+                    try:
+                        if isinstance(order, dict):
+                            sell_order_id = order.get("orderId") or order.get("order_id") or order.get("clientOrderId")
+                            placed_price = float(order.get("price") or placed_price)
+                        else:
+                            sell_order_id = getattr(order, "orderId", None) or getattr(order, "order_id", None) or getattr(order, "clientOrderId", None)
+                    except Exception:
+                        pass
 
-            with RECENT_BUYS_LOCK:
-                RECENT_BUYS.setdefault(symbol, {})
-                RECENT_BUYS[symbol].update({
-                    "sell_price": placed_price,
-                    "sell_order_id": order_id,
-                    "sell_resp": order,
-                    "sell_ts": time.time(),
-                    "trailing_placed_count": int(RECENT_BUYS[symbol].get("trailing_placed_count", 0) or 0) + 1,
-                    "last_trailing_action": time.time()
-                })
+                    with RECENT_BUYS_LOCK:
+                        RECENT_BUYS.setdefault(symbol, {})
+                        RECENT_BUYS[symbol].update({
+                            "sell_price": placed_price,
+                            "sell_order_id": sell_order_id,
+                            "sell_resp": order,
+                            "last_trailing_action": time.time(),
+                            "trailing_retries": 0
+                        })
 
-            log_csv("NEW_SELL", symbol, qty, price=None, highest=highest_price, sell_price=placed_price, note=reason)
-            notify_allowed = NOTIFY_ON_TRAILING_EVERY or (NOTIFY_ON_TRAILING_FIRST and not RECENT_BUYS[symbol].get("trailing_notified"))
-            if notify_allowed:
-                notify(f"📌 New trailing SELL for {symbol} set @ {placed_price} (reason={reason})")
-                with RECENT_BUYS_LOCK:
-                    RECENT_BUYS[symbol]["trailing_notified"] = True
-            return order
+                    log_csv("NEW_SELL", symbol, adj_qty, price=None, highest=pos.get("highest_price"), sell_price=placed_price, note=f"reason={reason}")
+                    notify_allowed = NOTIFY_ON_TRAILING_EVERY or (NOTIFY_ON_TRAILING_FIRST and not RECENT_BUYS[symbol].get("trailing_notified"))
+                    if notify_allowed:
+                        notify(f"📌 New trailing SELL for {symbol} set @ {placed_price} (reason={reason})")
+                        with RECENT_BUYS_LOCK:
+                            RECENT_BUYS[symbol]["trailing_notified"] = True
+                    return order
 
-        # failed to place new sell
+                # if place_limit_sell_strict returned None, we'll retry after sleep
+                last_err = "place_limit_sell_strict returned None"
+            except Exception as e:
+                last_err = str(e)
+
+            # backoff before next attempt
+            time.sleep(float(TRAILING_RETRY_INTERVAL or 5.0))
+
+        # all attempts failed
         with RECENT_BUYS_LOCK:
             RECENT_BUYS.setdefault(symbol, {})
             RECENT_BUYS[symbol]["trailing_retries"] = int(RECENT_BUYS[symbol].get("trailing_retries", 0) or 0) + 1
             RECENT_BUYS[symbol]["last_trailing_action"] = time.time()
 
         if should_notify(symbol, "trailing_fail"):
-            notify(f"⚠️ Failed to place new trailing limit sell for {symbol} at {raw_target} after attempts.")
+            notify(f"⚠️ Failed to place new trailing limit sell for {symbol} at {raw_target} after {attempt} attempts; last_err={last_err}")
         return None
 
     except Exception as e:
